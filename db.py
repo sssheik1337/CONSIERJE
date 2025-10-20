@@ -1,6 +1,7 @@
 import aiosqlite
+import json
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -75,17 +76,82 @@ class DB:
             await db.execute("UPDATE users SET auto_renew=? WHERE user_id=?", (1 if flag else 0, user_id))
             await db.commit()
 
-    async def set_trial_days_global(self, days: int):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute("INSERT INTO settings(key, value) VALUES('trial_days', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(days),))
-            await db.commit()
-
-    async def get_trial_days_global(self, default_days: int) -> int:
+    async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Универсальный геттер настроек."""
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT value FROM settings WHERE key='trial_days'")
+            cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
             row = await cur.fetchone()
-            return int(row["value"]) if row else default_days
+        if row:
+            return row["value"]
+        if default is not None:
+            await self.set_setting(key, default)
+        return default
+
+    async def set_setting(self, key: str, value: Optional[str]):
+        """Универсальный сеттер настроек."""
+        async with aiosqlite.connect(self.path) as db:
+            if value is None:
+                await db.execute("DELETE FROM settings WHERE key=?", (key,))
+            else:
+                await db.execute(
+                    "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+            await db.commit()
+
+    async def get_target_chat_username(self) -> Optional[str]:
+        value = await self.get_setting("target_chat_username")
+        return value
+
+    async def set_target_chat_username(self, username: Optional[str]):
+        await self.set_setting("target_chat_username", username)
+
+    async def get_target_chat_id(self) -> Optional[int]:
+        value = await self.get_setting("target_chat_id")
+        return int(value) if value is not None else None
+
+    async def set_target_chat_id(self, chat_id: Optional[int]):
+        await self.set_setting("target_chat_id", str(chat_id) if chat_id is not None else None)
+
+    async def get_prices(self, default_prices: Dict[int, int]) -> Dict[int, int]:
+        """Получить прайс-лист (ключи/значения — целые числа)."""
+        default_json = json.dumps(default_prices)
+        raw = await self.get_setting("prices", default_json)
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return default_prices
+        cleaned: Dict[int, int] = {}
+        for key, value in data.items():
+            try:
+                cleaned[int(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return cleaned
+
+    async def set_prices(self, prices: Dict[int, int]):
+        await self.set_setting("prices", json.dumps(prices))
+
+    async def get_trial_days(self, default_days: int) -> int:
+        value = await self.get_setting("trial_days", str(default_days))
+        try:
+            return int(value) if value is not None else default_days
+        except (TypeError, ValueError):
+            return default_days
+
+    async def set_trial_days(self, days: int):
+        await self.set_setting("trial_days", str(days))
+
+    async def get_auto_renew_default(self, default_flag: bool) -> bool:
+        raw_default = "1" if default_flag else "0"
+        value = await self.get_setting("auto_renew_default", raw_default)
+        return str(value) in {"1", "true", "True"}
+
+    async def set_auto_renew_default(self, flag: bool):
+        await self.set_setting("auto_renew_default", "1" if flag else "0")
 
     async def extend_subscription(self, user_id: int, months: int):
         # продлить от текущего expires_at, не от now
