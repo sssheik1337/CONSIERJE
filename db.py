@@ -1,6 +1,10 @@
-import aiosqlite
+import secrets
+import sqlite3
+import string
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+
+import aiosqlite
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -17,6 +21,19 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS promo_codes (
+    code TEXT PRIMARY KEY,
+    code_type TEXT NOT NULL,
+    expires_at INTEGER,
+    usage_limit INTEGER NOT NULL DEFAULT 1,
+    used_count INTEGER NOT NULL DEFAULT 0,
+    is_used INTEGER NOT NULL DEFAULT 0,
+    extension_days INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    redeemed_by INTEGER,
+    redeemed_at INTEGER
 );
 """
 
@@ -86,6 +103,107 @@ class DB:
             cur = await db.execute("SELECT value FROM settings WHERE key='trial_days'")
             row = await cur.fetchone()
             return int(row["value"]) if row else default_days
+
+    async def generate_promo_codes(
+        self,
+        code_type: str,
+        amount: int,
+        extension_days: int,
+        expires_at: Optional[int] = None,
+        usage_limit: int = 1,
+    ) -> List[str]:
+        """Создать указанное количество промокодов и вернуть список их значений."""
+        alphabet = string.ascii_uppercase + string.digits
+        codes: List[str] = []
+        async with aiosqlite.connect(self.path) as db:
+            for _ in range(amount):
+                while True:
+                    code = "".join(secrets.choice(alphabet) for _ in range(10))
+                    try:
+                        await db.execute(
+                            """
+                            INSERT INTO promo_codes(code, code_type, expires_at, usage_limit, extension_days)
+                            VALUES(?, ?, ?, ?, ?)
+                            """,
+                            (code, code_type, expires_at, usage_limit, extension_days),
+                        )
+                        codes.append(code)
+                        break
+                    except sqlite3.IntegrityError:
+                        # Повторим генерацию, если код уже существует
+                        continue
+            await db.commit()
+        return codes
+
+    async def get_promo_code(self, code: str) -> Optional[aiosqlite.Row]:
+        """Получить промокод без проверки ограничений."""
+        normalized = code.upper()
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM promo_codes WHERE code=?", (normalized,))
+            return await cur.fetchone()
+
+    async def validate_promo_code(self, code: str, now_ts: int) -> Optional[aiosqlite.Row]:
+        """Проверить ограничения промокода и вернуть запись, если её можно использовать."""
+        promo = await self.get_promo_code(code)
+        if not promo:
+            return None
+        if promo["is_used"]:
+            return None
+        if promo["expires_at"] and promo["expires_at"] < now_ts:
+            return None
+        if promo["usage_limit"] is not None and promo["used_count"] >= promo["usage_limit"]:
+            return None
+        return promo
+
+    async def mark_promo_redeemed(self, code: str, user_id: int, now_ts: int):
+        """Отметить промокод как использованный конкретным пользователем."""
+        normalized = code.upper()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                UPDATE promo_codes
+                SET used_count = used_count + 1,
+                    is_used = CASE WHEN used_count + 1 >= usage_limit THEN 1 ELSE 0 END,
+                    redeemed_by = ?,
+                    redeemed_at = ?
+                WHERE code=?
+                """,
+                (user_id, now_ts, normalized),
+            )
+            await db.commit()
+
+    async def set_trial_period(
+        self,
+        user_id: int,
+        now_ts: int,
+        trial_days: int,
+        auto_renew_default: bool,
+    ):
+        """Назначить или обновить пробный период пользователю."""
+        expires_at = now_ts + int(timedelta(days=trial_days).total_seconds())
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+            row = await cur.fetchone()
+            if row:
+                await db.execute(
+                    """
+                    UPDATE users
+                    SET started_at=?, expires_at=?, auto_renew=?, paid_only=0
+                    WHERE user_id=?
+                    """,
+                    (now_ts, expires_at, row["auto_renew"], user_id),
+                )
+            else:
+                await db.execute(
+                    """
+                    INSERT INTO users(user_id, started_at, expires_at, auto_renew, paid_only, bypass)
+                    VALUES (?, ?, ?, ?, 0, 0)
+                    """,
+                    (user_id, now_ts, expires_at, 1 if auto_renew_default else 0),
+                )
+            await db.commit()
 
     async def extend_subscription(self, user_id: int, months: int):
         # продлить от текущего expires_at, не от now
