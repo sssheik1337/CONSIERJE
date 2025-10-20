@@ -10,11 +10,23 @@ from scheduler import setup_scheduler
 logging.basicConfig(level=logging.INFO)
 
 async def main():
-    if not config.BOT_TOKEN or not config.TARGET_CHAT_ID:
-        raise SystemExit("Заполни BOT_TOKEN и TARGET_CHAT_ID в .env")
+    if not config.BOT_TOKEN:
+        raise SystemExit("Заполни BOT_TOKEN в .env")
 
     db = DB(config.DB_PATH)
     await db.init()
+
+    # Инициализация настроек по умолчанию, если их ещё нет в базе
+    await db.get_trial_days(config.TRIAL_DAYS)
+    await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
+    await db.get_prices(config.PRICES)
+
+    target_chat_id = await db.get_target_chat_id()
+    if target_chat_id is None and config.TARGET_CHAT_ID:
+        await db.set_target_chat_id(config.TARGET_CHAT_ID)
+        target_chat_id = config.TARGET_CHAT_ID
+    if target_chat_id is None:
+        logging.warning("Чат пока не привязан. Используйте админскую команду, чтобы привязать его.")
 
     bot = Bot(config.BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
@@ -26,7 +38,7 @@ async def main():
     dp.include_router(router)
 
     # шедулер
-    setup_scheduler(bot, db, config.TARGET_CHAT_ID, tz_name=config.TIMEZONE)
+    setup_scheduler(bot, db, target_chat_id, tz_name=config.TIMEZONE)
 
     # старт
     await dp.start_polling(bot, allowed_updates=["message"])
