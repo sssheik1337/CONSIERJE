@@ -70,22 +70,72 @@ class DB:
             await db.execute("UPDATE users SET paid_only=? WHERE user_id=?", (1 if paid_only else 0, user_id))
             await db.commit()
 
+    async def get_user_auto_renew(self, user_id: int) -> Optional[bool]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT auto_renew FROM users WHERE user_id=?", (user_id,))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            return bool(row["auto_renew"])
+
     async def set_auto_renew(self, user_id: int, flag: bool):
         async with aiosqlite.connect(self.path) as db:
             await db.execute("UPDATE users SET auto_renew=? WHERE user_id=?", (1 if flag else 0, user_id))
             await db.commit()
 
-    async def set_trial_days_global(self, days: int):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute("INSERT INTO settings(key, value) VALUES('trial_days', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(days),))
-            await db.commit()
-
-    async def get_trial_days_global(self, default_days: int) -> int:
+    async def _get_setting(self, key: str) -> Optional[str]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT value FROM settings WHERE key='trial_days'")
+            cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
             row = await cur.fetchone()
-            return int(row["value"]) if row else default_days
+            return row["value"] if row else None
+
+    async def _set_setting(self, key: str, value: str):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            await db.commit()
+
+    async def set_trial_days_global(self, days: int):
+        await self._set_setting("trial_days", str(days))
+
+    async def get_trial_days_global(self, default_days: int) -> int:
+        raw = await self._get_setting("trial_days")
+        return int(raw) if raw is not None else default_days
+
+    async def get_auto_renew_default(self, fallback: bool) -> bool:
+        raw = await self._get_setting("auto_renew_default")
+        if raw is None:
+            return fallback
+        return raw.lower() in ("1", "true", "yes")
+
+    async def set_auto_renew_default(self, flag: bool):
+        await self._set_setting("auto_renew_default", "1" if flag else "0")
+
+    async def ensure_auto_renew_default(self, fallback: bool):
+        raw = await self._get_setting("auto_renew_default")
+        if raw is None:
+            await self.set_auto_renew_default(fallback)
+
+    async def get_target_chat_id(self) -> Optional[int]:
+        raw = await self._get_setting("target_chat_id")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    async def set_target_chat_id(self, chat_id: int):
+        await self._set_setting("target_chat_id", str(chat_id))
+
+    async def ensure_target_chat_id(self, chat_id: int):
+        raw = await self._get_setting("target_chat_id")
+        if raw is None and chat_id:
+            await self.set_target_chat_id(chat_id)
 
     async def extend_subscription(self, user_id: int, months: int):
         # продлить от текущего expires_at, не от now
@@ -94,12 +144,13 @@ class DB:
             cur = await db.execute("SELECT expires_at FROM users WHERE user_id=?", (user_id,))
             row = await cur.fetchone()
             if not row:
-                return
+                return None
             expires_at = row["expires_at"]
             delta = int(timedelta(days=30*months).total_seconds())
             new_exp = max(expires_at, int(datetime.utcnow().timestamp())) + delta
             await db.execute("UPDATE users SET expires_at=? WHERE user_id=?", (new_exp, user_id))
             await db.commit()
+            return new_exp
 
     async def list_expired(self, now_ts: int):
         async with aiosqlite.connect(self.path) as db:

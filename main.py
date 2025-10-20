@@ -15,6 +15,8 @@ async def main():
 
     db = DB(config.DB_PATH)
     await db.init()
+    await db.ensure_auto_renew_default(config.AUTO_RENEW_DEFAULT)
+    await db.ensure_target_chat_id(config.TARGET_CHAT_ID)
 
     bot = Bot(config.BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
@@ -26,7 +28,7 @@ async def main():
     dp.include_router(router)
 
     # шедулер
-    setup_scheduler(bot, db, config.TARGET_CHAT_ID, tz_name=config.TIMEZONE)
+    setup_scheduler(bot, db, tz_name=config.TIMEZONE)
 
     # старт
     await dp.start_polling(bot, allowed_updates=["message"])

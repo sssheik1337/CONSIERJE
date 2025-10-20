@@ -1,6 +1,7 @@
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from datetime import datetime, timedelta
 from config import config
 from db import DB
@@ -8,8 +9,40 @@ from payments import process_payment
 
 router = Router(name="core")
 
+ADMIN_HELP_TEXT = (
+    "/set_trial_days <d>\n"
+    "/set_paid_only <user_id> <on|off>\n"
+    "/set_autorenew <user_id> <on|off>\n"
+    "/bypass <user_id> <on|off>\n"
+    "/price_list\n"
+    "/invite <user_id> [hours]\n"
+)
+
 def is_super_admin(uid: int) -> bool:
     return uid in config.SUPER_ADMIN_IDS
+
+def build_user_autorenew_keyboard(enabled: bool):
+    builder = InlineKeyboardBuilder()
+    emoji = "✅" if enabled else "❌"
+    builder.button(text=f"Автопродление {emoji}", callback_data="user_toggle_autorenew")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def build_admin_keyboard(default_autorenew: bool):
+    builder = InlineKeyboardBuilder()
+    emoji = "✅" if default_autorenew else "❌"
+    builder.button(
+        text=f"Автопродление по умолчанию {emoji}",
+        callback_data="admin_toggle_autorenew_default",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+def format_status_message(row) -> str:
+    exp = datetime.utcfromtimestamp(row["expires_at"])
+    ar = "вкл" if row["auto_renew"] else "выкл"
+    po = "да" if row["paid_only"] else "нет"
+    return f"Подписка до: {exp} UTC\nАвтопродление: {ar}\nБез пробника: {po}"
 
 @router.message(CommandStart())
 async def cmd_start(m: Message, bot: Bot, db: DB):
@@ -17,7 +50,8 @@ async def cmd_start(m: Message, bot: Bot, db: DB):
     trial_days = await db.get_trial_days_global(config.TRIAL_DAYS)
     paid_only = (m.from_user.id in config.PAID_ONLY_IDS)
     bypass = (m.from_user.id in config.ADMIN_BYPASS_IDS)
-    await db.upsert_user(m.from_user.id, now_ts, trial_days, config.AUTO_RENEW_DEFAULT, paid_only, bypass)
+    auto_renew_default = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
+    await db.upsert_user(m.from_user.id, now_ts, trial_days, auto_renew_default, paid_only, bypass)
 
     # Добавить в канал, если не состоит
     try:
@@ -36,11 +70,9 @@ async def cmd_status(m: Message, db: DB):
     if not row:
         await m.answer("Вы ещё не зарегистрированы. Нажмите /start.")
         return
-    exp = row["expires_at"]
-    dt = datetime.utcfromtimestamp(exp)
-    ar = "вкл" if row["auto_renew"] else "выкл"
-    po = "да" if row["paid_only"] else "нет"
-    await m.answer(f"Подписка до: {dt} UTC\nАвтопродление: {ar}\nБез пробника: {po}")
+    text = format_status_message(row)
+    keyboard = build_user_autorenew_keyboard(bool(row["auto_renew"]))
+    await m.answer(text, reply_markup=keyboard)
 
 @router.message(Command("rejoin"))
 async def cmd_rejoin(m: Message, bot: Bot, db: DB):
@@ -69,8 +101,12 @@ async def cmd_buy(m: Message, db: DB):
     if not ok:
         await m.answer("Оплата не прошла: " + msg)
         return
-    await db.extend_subscription(m.from_user.id, months)
-    await m.answer(msg + "\nПодписка продлена.")
+    new_exp = await db.extend_subscription(m.from_user.id, months)
+    if new_exp:
+        dt = datetime.utcfromtimestamp(new_exp)
+        await m.answer(msg + f"\nПодписка продлена до: {dt} UTC.")
+    else:
+        await m.answer(msg + "\nПодписка продлена.")
 
 # ==== Админские ====
 
@@ -78,14 +114,9 @@ async def cmd_buy(m: Message, db: DB):
 async def cmd_admin_help(m: Message, db: DB):
     if not is_super_admin(m.from_user.id):
         return
-    await m.answer(
-        "/set_trial_days <d>\n"
-        "/set_paid_only <user_id> <on|off>\n"
-        "/set_autorenew <user_id> <on|off>\n"
-        "/bypass <user_id> <on|off>\n"
-        "/price_list\n"
-        "/invite <user_id> [hours]\n"
-    )
+    default_auto = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
+    keyboard = build_admin_keyboard(default_auto)
+    await m.answer(ADMIN_HELP_TEXT, reply_markup=keyboard)
 
 @router.message(Command("set_trial_days"))
 async def cmd_set_trial_days(m: Message, db: DB):
@@ -160,3 +191,34 @@ async def cmd_invite(m: Message, bot: Bot):
         await m.answer("Отправил пользователю.")
     except Exception as e:
         await m.answer("Не удалось создать/отправить ссылку.")
+
+@router.callback_query(F.data == "user_toggle_autorenew")
+async def cb_toggle_autorenew(callback: CallbackQuery, db: DB):
+    row = await db.get_user(callback.from_user.id)
+    if not row:
+        await callback.answer("Вы ещё не зарегистрированы. Нажмите /start.", show_alert=True)
+        return
+    current = bool(row["auto_renew"])
+    new_flag = not current
+    await db.set_auto_renew(callback.from_user.id, new_flag)
+    updated_row = await db.get_user(callback.from_user.id)
+    if updated_row and callback.message:
+        text = format_status_message(updated_row)
+        keyboard = build_user_autorenew_keyboard(bool(updated_row["auto_renew"]))
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    notice = "Автопродление включено" if new_flag else "Автопродление выключено"
+    await callback.answer(notice)
+
+@router.callback_query(F.data == "admin_toggle_autorenew_default")
+async def cb_admin_toggle_autorenew_default(callback: CallbackQuery, db: DB):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    current = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
+    new_flag = not current
+    await db.set_auto_renew_default(new_flag)
+    keyboard = build_admin_keyboard(new_flag)
+    if callback.message:
+        await callback.message.edit_text(ADMIN_HELP_TEXT, reply_markup=keyboard)
+    notice = "Автопродление по умолчанию включено" if new_flag else "Автопродление по умолчанию выключено"
+    await callback.answer(notice)
