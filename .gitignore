@@ -1,0 +1,15 @@
+# venv / IDE
+venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+.idea/
+*.log
+
+# OS dumps
+.DS_Store
+Thumbs.db
