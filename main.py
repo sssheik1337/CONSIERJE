@@ -22,9 +22,6 @@ async def main():
     await db.get_prices(config.PRICES)
 
     target_chat_id = await db.get_target_chat_id()
-    if target_chat_id is None and config.TARGET_CHAT_ID:
-        await db.set_target_chat_id(config.TARGET_CHAT_ID)
-        target_chat_id = config.TARGET_CHAT_ID
     if target_chat_id is None:
         logging.warning("Чат пока не привязан. Используйте админскую команду, чтобы привязать его.")
 

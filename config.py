@@ -20,7 +20,6 @@ def _parse_prices(s: str) -> dict[int, int]:
 @dataclass(frozen=True)
 class Config:
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-    TARGET_CHAT_ID: int = int(os.getenv("TARGET_CHAT_ID", "0"))
     SUPER_ADMIN_IDS: set[int] = _parse_ids(os.getenv("SUPER_ADMIN_IDS", ""))
     TRIAL_DAYS: int = int(os.getenv("TRIAL_DAYS", "3"))
     AUTO_RENEW_DEFAULT: bool = os.getenv("AUTO_RENEW_DEFAULT", "false").lower() == "true"
