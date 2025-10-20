@@ -87,6 +87,57 @@ class DB:
             row = await cur.fetchone()
             return int(row["value"]) if row else default_days
 
+    async def set_auto_renew_default(self, flag: bool):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO settings(key, value) VALUES('auto_renew_default', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("1" if flag else "0",),
+            )
+            await db.commit()
+
+    async def get_auto_renew_default(self, default_flag: bool) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT value FROM settings WHERE key='auto_renew_default'")
+            row = await cur.fetchone()
+            if not row:
+                return default_flag
+            return row["value"] in {"1", "true", "True"}
+
+    async def set_paid_only_default(self, flag: bool):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO settings(key, value) VALUES('paid_only_default', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("1" if flag else "0",),
+            )
+            await db.commit()
+
+    async def get_paid_only_default(self, default_flag: bool) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT value FROM settings WHERE key='paid_only_default'")
+            row = await cur.fetchone()
+            if not row:
+                return default_flag
+            return row["value"] in {"1", "true", "True"}
+
+    async def get_price_map(self, default_prices: dict[int, int]) -> dict[int, int]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT key, value FROM settings WHERE key LIKE 'price_%'")
+            rows = await cur.fetchall()
+        prices: dict[int, int] = {}
+        for row in rows:
+            key = row["key"]
+            if not key.startswith("price_"):
+                continue
+            try:
+                months = int(key.split("_", 1)[1])
+                prices[months] = int(row["value"])
+            except (ValueError, IndexError):
+                continue
+        return prices or dict(default_prices)
+
     async def extend_subscription(self, user_id: int, months: int):
         # продлить от текущего expires_at, не от now
         async with aiosqlite.connect(self.path) as db:
