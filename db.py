@@ -1,3 +1,4 @@
+import json
 import aiosqlite
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
@@ -60,6 +61,21 @@ class DB:
             )
             await db.commit()
 
+    async def set_setting(self, key: str, value: str):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            await db.commit()
+
+    async def get_setting(self, key: str) -> Optional[str]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
+            row = await cur.fetchone()
+            return row["value"] if row else None
+
     async def set_bypass(self, user_id: int, bypass: bool):
         async with aiosqlite.connect(self.path) as db:
             await db.execute("UPDATE users SET bypass=? WHERE user_id=?", (1 if bypass else 0, user_id))
@@ -76,16 +92,34 @@ class DB:
             await db.commit()
 
     async def set_trial_days_global(self, days: int):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute("INSERT INTO settings(key, value) VALUES('trial_days', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(days),))
-            await db.commit()
+        await self.set_setting("trial_days", str(days))
 
     async def get_trial_days_global(self, default_days: int) -> int:
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT value FROM settings WHERE key='trial_days'")
-            row = await cur.fetchone()
-            return int(row["value"]) if row else default_days
+        value = await self.get_setting("trial_days")
+        return int(value) if value is not None else default_days
+
+    async def set_prices(self, prices: dict[int, int]):
+        packed = json.dumps(prices)
+        await self.set_setting("prices", packed)
+
+    async def get_prices(self, default_prices: dict[int, int]) -> dict[int, int]:
+        value = await self.get_setting("prices")
+        if value is None:
+            return default_prices
+        try:
+            unpacked = json.loads(value)
+            return {int(k): int(v) for k, v in unpacked.items()}
+        except (ValueError, json.JSONDecodeError):
+            return default_prices
+
+    async def set_auto_renew_default(self, flag: bool):
+        await self.set_setting("auto_renew_default", "1" if flag else "0")
+
+    async def get_auto_renew_default(self, default_flag: bool) -> bool:
+        value = await self.get_setting("auto_renew_default")
+        if value is None:
+            return default_flag
+        return value == "1"
 
     async def extend_subscription(self, user_id: int, months: int):
         # продлить от текущего expires_at, не от now
