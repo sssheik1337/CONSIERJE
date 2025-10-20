@@ -38,7 +38,9 @@ async def main():
     setup_scheduler(bot, db, target_chat_id, tz_name=config.TIMEZONE)
 
     # старт
-    await dp.start_polling(bot, allowed_updates=["message"])
+    # Разрешаем получать сообщения, callback_query и обновления о статусе участников.
+    allowed_updates = ["message", "callback_query", "chat_member"]
+    await dp.start_polling(bot, allowed_updates=allowed_updates)
 
 if __name__ == "__main__":
     asyncio.run(main())

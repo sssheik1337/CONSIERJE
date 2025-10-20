@@ -2,13 +2,14 @@ from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, CallbackQuery
 from datetime import datetime, timedelta
 from config import config
 from db import DB
 from payments import process_payment
 
 router = Router(name="core")
+callback_router = Router(name="callbacks")
 
 def is_super_admin(uid: int) -> bool:
     return uid in config.SUPER_ADMIN_IDS
@@ -241,3 +242,14 @@ async def cmd_invite(m: Message, bot: Bot, db: DB):
         await m.answer("Отправил пользователю.")
     except Exception as e:
         await m.answer("Не удалось создать/отправить ссылку.")
+
+
+# ==== Callback-кнопки ====
+
+@callback_router.callback_query()
+async def handle_basic_callback(callback: CallbackQuery):
+    """Базовый обработчик для callback-кнопок."""
+    await callback.answer()
+
+
+router.include_router(callback_router)
