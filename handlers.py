@@ -30,8 +30,6 @@ class AdminStates(StatesGroup):
 class UserStates(StatesGroup):
     """Состояния пользователя для диалогов по кнопкам."""
 
-    waiting_buy_months = State()
-
 
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Привязать чат")]],
@@ -190,21 +188,6 @@ async def cmd_status(m: Message, db: DB):
 async def cmd_rejoin(m: Message, bot: Bot, db: DB):
     await send_invite_link(m, bot, db)
 
-@router.message(Command("buy"))
-async def cmd_buy(m: Message, db: DB):
-    args = (m.text or "").split()
-    if len(args) < 2 or not args[1].isdigit():
-        await m.answer("Формат: /buy <месяцев>. Пример: /buy 1")
-        return
-    months = int(args[1])
-    prices = await db.get_prices(config.PRICES)
-    ok, msg = await process_payment(m.from_user.id, months, prices)
-    if not ok:
-        await m.answer("Оплата не прошла: " + msg)
-        return
-    await db.extend_subscription(m.from_user.id, months)
-    await m.answer(msg + "\nПодписка продлена.")
-
 @router.message(F.text == "Получить ссылку")
 async def user_get_link_button(m: Message, bot: Bot, db: DB):
     await send_invite_link(m, bot, db)
@@ -216,9 +199,13 @@ async def user_status_button(m: Message, db: DB):
 
 
 @router.message(F.text == "Продлить подписку")
-async def user_buy_button(m: Message, state: FSMContext, db: DB):
-    await state.set_state(UserStates.waiting_buy_months)
-    await m.answer("На сколько месяцев продлить подписку? Укажите число или отправьте «отмена».")
+async def user_buy_button(m: Message, db: DB):
+    prices = await db.get_prices(config.PRICES)
+    if not prices:
+        await m.answer("Пока нет доступных вариантов продления. Обратитесь к администратору.")
+        return
+    kb = build_purchase_keyboard(prices)
+    await m.answer("Выберите подходящий срок продления:", reply_markup=kb)
 
 
 @router.message(F.text == "Настроить автопродление")
@@ -231,25 +218,15 @@ async def user_autorenew_menu_message(m: Message, db: DB):
     await m.answer("Выберите состояние автопродления:", reply_markup=kb)
 
 
-@router.message(UserStates.waiting_buy_months)
-async def user_buy_months_input(m: Message, state: FSMContext, db: DB):
-    text = (m.text or "").strip().lower()
-    if text in {"/cancel", "отмена"}:
-        await state.clear()
-        await m.answer("Продление отменено.", reply_markup=USER_REPLY_KEYBOARD)
-        return
-    if not text.isdigit():
-        await m.answer("Нужно отправить количество месяцев числом или «отмена».")
-        return
-    months = int(text)
-    prices = await db.get_prices(config.PRICES)
-    ok, msg = await process_payment(m.from_user.id, months, prices)
-    if not ok:
-        await m.answer("Оплата не прошла: " + msg)
-        return
-    await db.extend_subscription(m.from_user.id, months)
-    await state.clear()
-    await m.answer(msg + "\nПодписка продлена.", reply_markup=USER_REPLY_KEYBOARD)
+def build_purchase_keyboard(prices: dict[int, int]) -> InlineKeyboardMarkup:
+    """Построить клавиатуру с вариантами покупки по количеству месяцев."""
+
+    buttons = []
+    for months, _ in sorted(prices.items()):
+        text = f"Купить {months} мес"
+        callback_data = f"user:buy:{months}"
+        buttons.append([InlineKeyboardButton(text=text, callback_data=callback_data)])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ==== Админские ====
 
@@ -390,9 +367,34 @@ async def user_status_callback(callback: CallbackQuery, db: DB):
 
 
 @callback_router.callback_query(F.data == "user:buy")
-async def user_buy_callback(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(UserStates.waiting_buy_months)
-    await callback.message.answer("На сколько месяцев продлить подписку? Укажите число или отправьте «отмена».")
+async def user_buy_callback(callback: CallbackQuery, db: DB):
+    prices = await db.get_prices(config.PRICES)
+    if not prices:
+        await callback.message.answer("Пока нет доступных вариантов продления. Обратитесь к администратору.")
+        await callback.answer()
+        return
+    kb = build_purchase_keyboard(prices)
+    await callback.message.answer("Выберите подходящий срок продления:", reply_markup=kb)
+    await callback.answer()
+
+
+@callback_router.callback_query(F.data.startswith("user:buy:"))
+async def user_buy_months_callback(callback: CallbackQuery, db: DB):
+    """Обработать выбор срока продления из инлайн-клавиатуры."""
+
+    try:
+        months = int(callback.data.split(":")[-1])
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректный выбор.", show_alert=True)
+        return
+    prices = await db.get_prices(config.PRICES)
+    ok, msg = await process_payment(callback.from_user.id, months, prices)
+    if not ok:
+        await callback.message.answer("Оплата не прошла: " + msg)
+        await callback.answer()
+        return
+    await db.extend_subscription(callback.from_user.id, months)
+    await callback.message.answer(msg + "\nПодписка продлена.")
     await callback.answer()
 
 
