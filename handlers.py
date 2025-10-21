@@ -48,9 +48,17 @@ class BindChat(StatesGroup):
 class Admin(StatesGroup):
     """Состояния администратора для ввода параметров."""
 
-    WaitPrices = State()
     WaitTrialDays = State()
     WaitCustomCode = State()
+
+
+class AdminPrice(StatesGroup):
+    """Состояния администратора для управления тарифами."""
+
+    AddMonths = State()
+    AddPrice = State()
+    EditMonths = State()
+    EditPrice = State()
 
 
 class User(StatesGroup):
@@ -102,13 +110,17 @@ async def has_trial_coupon(db: DB, user_id: int) -> bool:
         return await cur.fetchone() is not None
 
 
-def build_user_menu(auto_on: bool, is_admin: bool) -> InlineKeyboardMarkup:
+def build_user_menu_keyboard(
+    auto_on: bool, is_admin: bool, price_months: list[int]
+) -> InlineKeyboardMarkup:
     """Собрать пользовательскую inline-клавиатуру."""
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Купить 1 мес", callback_data="buy:months:1")
-    builder.button(text="💳 Купить 2 мес", callback_data="buy:months:2")
-    builder.button(text="💳 Купить 3 мес", callback_data="buy:months:3")
+    for months in price_months[:6]:
+        builder.button(
+            text=f"💳 Купить {months} мес",
+            callback_data=f"buy:months:{months}",
+        )
     builder.button(
         text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
         callback_data="ar:toggle",
@@ -126,7 +138,8 @@ async def get_user_menu(db: DB, user_id: int) -> InlineKeyboardMarkup:
 
     user = await db.get_user(user_id)
     auto_flag = bool(user and user["auto_renew"])
-    return build_user_menu(auto_flag, is_super_admin(user_id))
+    price_months = [months for months, _ in await db.get_all_prices()]
+    return build_user_menu_keyboard(auto_flag, is_super_admin(user_id), price_months)
 
 
 async def refresh_user_menu(message: Message, db: DB, user_id: int) -> None:
@@ -158,9 +171,9 @@ async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
             chat_line = f"• Чат: id {chat_id}"
     trial_days = await db.get_trial_days_global(DEFAULT_TRIAL_DAYS)
     auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
-    prices = await db.get_prices({})
+    prices = await db.get_all_prices()
     if prices:
-        parts = [f"{months} мес — {price}₽" for months, price in sorted(prices.items())]
+        parts = [f"{months} мес — {price}₽" for months, price in prices]
         price_text = ", ".join(parts)
     else:
         price_text = "не настроен"
@@ -175,7 +188,7 @@ async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
 
     builder = InlineKeyboardBuilder()
     builder.button(text="🔗 Привязать чат", callback_data="admin:bind_chat")
-    builder.button(text="💰 Редактировать цены", callback_data="admin:prices")
+    builder.button(text="💰 Тарифы и цены", callback_data="admin:prices")
     builder.button(text="🗓️ Пробный период", callback_data="admin:trial_days")
     builder.button(
         text=f"🔁 Автопродление по умолчанию: {inline_emoji(auto_default)}",
@@ -230,6 +243,128 @@ async def refresh_admin_panel_by_state(bot: Bot, state: FSMContext, db: DB) -> N
             chat_id,
             text,
             reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
+
+async def build_price_list_view(db: DB) -> tuple[str, InlineKeyboardMarkup]:
+    """Сформировать текст и клавиатуру списка тарифов."""
+
+    prices = await db.get_all_prices()
+    lines = ["💰 Тарифы", "Выберите действие."]
+    if prices:
+        lines.append("")
+        for months, price in prices:
+            lines.append(f"{months} мес — {price}₽")
+    else:
+        lines.append("")
+        lines.append("Тарифов пока нет.")
+    text = "\n".join(escape_md(line) if line else "" for line in lines)
+
+    builder = InlineKeyboardBuilder()
+    for months, _ in prices:
+        builder.button(text="✏️ Редактировать", callback_data=f"price:edit:{months}")
+        builder.button(text="🗑️ Удалить", callback_data=f"price:del:{months}")
+    builder.button(text="➕ Добавить тариф", callback_data="price:add")
+    builder.button(text="⬅️ Назад", callback_data="admin:open")
+    builder.adjust(2, 1, 1)
+    return text, builder.as_markup()
+
+
+async def render_price_list(message: Message, db: DB) -> None:
+    """Показать экран управления тарифами."""
+
+    text, markup = await build_price_list_view(db)
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
+
+async def render_price_list_by_state(bot: Bot, state: FSMContext, db: DB) -> None:
+    """Обновить экран тарифов по сохранённым идентификаторам."""
+
+    data = await state.get_data()
+    chat_id = data.get("price_chat_id")
+    message_id = data.get("price_message_id")
+    if not chat_id or not message_id:
+        return
+    text, markup = await build_price_list_view(db)
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        await bot.send_message(
+            chat_id,
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
+
+async def render_price_edit(message: Message, months: int) -> None:
+    """Показать мини-меню редактирования тарифа."""
+
+    lines = [f"Изменить тариф {months} мес", "Выберите действие."]
+    text = "\n".join(escape_md(line) for line in lines)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⌛ Изменить месяцы", callback_data=f"price:editm:{months}")
+    builder.button(text="💵 Изменить цену", callback_data=f"price:editp:{months}")
+    builder.button(text="⬅️ Назад", callback_data="price:list")
+    builder.adjust(2, 1)
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
+
+async def render_price_delete_confirm(message: Message, months: int) -> None:
+    """Показать подтверждение удаления тарифа."""
+
+    text = escape_md(f"Удалить тариф {months} мес?")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да", callback_data=f"price:confirm_del:{months}")
+    builder.button(text="❌ Нет", callback_data="price:list")
+    builder.adjust(2)
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            text,
+            reply_markup=builder.as_markup(),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
@@ -357,10 +492,10 @@ async def handle_buy(callback: CallbackQuery, db: DB) -> None:
     except (IndexError, ValueError):
         await callback.answer("Не удалось определить срок подписки.", show_alert=True)
         return
-    prices = await db.get_prices({})
+    prices = await db.get_prices_dict()
     price = prices.get(months)
     if price is None:
-        await callback.answer("Цена не настроена. Обратитесь к администратору.", show_alert=True)
+        await callback.answer("Тариф не найден.", show_alert=True)
         return
     success, payment_text = await process_payment(user_id, months, prices)
     if not success:
@@ -580,20 +715,45 @@ async def process_bind_username(
 
 
 @router.callback_query(F.data == "admin:prices")
-async def admin_prices(callback: CallbackQuery, state: FSMContext) -> None:
-    """Перейти к редактированию цен."""
+async def admin_prices(callback: CallbackQuery, state: FSMContext, db: DB) -> None:
+    """Перейти к редактированию тарифов."""
 
     if not is_super_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
-    await state.set_state(Admin.WaitPrices)
+    await state.clear()
+    if callback.message:
+        await render_price_list(callback.message, db)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "price:list")
+async def price_list_back(callback: CallbackQuery, db: DB) -> None:
+    """Вернуться к списку тарифов."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    if callback.message:
+        await render_price_list(callback.message, db)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "price:add")
+async def price_add(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начать добавление тарифа."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.set_state(AdminPrice.AddMonths)
     if callback.message:
         await state.update_data(
-            panel_chat_id=callback.message.chat.id,
-            panel_message_id=callback.message.message_id,
+            price_chat_id=callback.message.chat.id,
+            price_message_id=callback.message.message_id,
         )
         await callback.message.answer(
-            escape_md("Пришлите цены в формате 1:399,2:699."),
+            escape_md("Введите длительность в месяцах (целое, ≥1)."),
             reply_markup=CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
@@ -601,9 +761,9 @@ async def admin_prices(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.message(Admin.WaitPrices)
-async def admin_set_prices(message: Message, state: FSMContext, db: DB, bot: Bot) -> None:
-    """Обработать ввод цен."""
+@router.message(AdminPrice.AddMonths)
+async def price_add_months(message: Message, state: FSMContext, db: DB, bot: Bot) -> None:
+    """Принять количество месяцев нового тарифа."""
 
     if not is_super_admin(message.from_user.id):
         await state.clear()
@@ -611,59 +771,346 @@ async def admin_set_prices(message: Message, state: FSMContext, db: DB, bot: Bot
     text = (message.text or "").strip()
     if is_cancel(text):
         await message.answer(
-            escape_md("Редактирование отменено."),
+            escape_md("Создание тарифа отменено."),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await render_price_list_by_state(bot, state, db)
+        await state.clear()
+        return
+    if not text.isdigit():
+        await message.answer(
+            escape_md("Нужно целое число."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+    months = int(text)
+    if months < 1:
+        await message.answer(
+            escape_md("Количество месяцев должно быть ≥1."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+    await state.update_data(new_price_months=months)
+    await state.set_state(AdminPrice.AddPrice)
+    await message.answer(
+        escape_md("Введите цену в ₽ (целое, ≥0)."),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+        reply_markup=CANCEL_REPLY,
+    )
+
+
+@router.message(AdminPrice.AddPrice)
+async def price_add_price(message: Message, state: FSMContext, db: DB, bot: Bot) -> None:
+    """Принять стоимость нового тарифа."""
+
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if is_cancel(text):
+        await message.answer(
+            escape_md("Создание тарифа отменено."),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await render_price_list_by_state(bot, state, db)
+        await state.clear()
+        return
+    if not text.isdigit():
+        await message.answer(
+            escape_md("Нужно целое число."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+    price = int(text)
+    if price < 0:
+        await message.answer(
+            escape_md("Цена должна быть ≥0."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+    data = await state.get_data()
+    months = data.get("new_price_months")
+    chat_id = data.get("price_chat_id")
+    message_id = data.get("price_message_id")
+    if months is None or chat_id is None or message_id is None:
+        await message.answer(
+            escape_md("Не удалось обновить тарифы. Откройте меню заново."),
             reply_markup=ReplyKeyboardRemove(),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
         await state.clear()
         return
-    cleaned = text.replace(" ", "")
-    entries = [item for item in cleaned.split(",") if item]
-    prices: dict[int, int] = {}
-    for entry in entries:
-        if ":" not in entry:
-            await message.answer(
-                escape_md("Используйте формат месяцы:цена."),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                disable_web_page_preview=True,
-            )
-            return
-        left, right = entry.split(":", 1)
-        try:
-            months = int(left)
-            price = int(right)
-        except ValueError:
-            await message.answer(
-                escape_md("Нужно указать целые числа."),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                disable_web_page_preview=True,
-            )
-            return
-        if months <= 0 or price <= 0:
-            await message.answer(
-                escape_md("Числа должны быть положительными."),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                disable_web_page_preview=True,
-            )
-            return
-        prices[months] = price
-    if not prices:
-        await message.answer(
-            escape_md("Не удалось распознать ни одной записи."),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
-        return
-    await db.set_prices(prices)
+    await db.upsert_price(int(months), price)
     await message.answer(
-        escape_md("✅ Цены обновлены."),
+        escape_md("✅ Тариф сохранён."),
         reply_markup=ReplyKeyboardRemove(),
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
-    await refresh_admin_panel_by_state(bot, state, db)
+    await render_price_list_by_state(bot, state, db)
     await state.clear()
+
+
+@router.callback_query(F.data.startswith("price:edit:"))
+async def price_edit(callback: CallbackQuery, db: DB) -> None:
+    """Открыть мини-меню редактирования тарифа."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    try:
+        months = int(parts[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    if callback.message:
+        await render_price_edit(callback.message, months)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("price:editp:"))
+async def price_edit_price(callback: CallbackQuery, state: FSMContext) -> None:
+    """Перейти к редактированию цены тарифа."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    try:
+        months = int(parts[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    await state.set_state(AdminPrice.EditPrice)
+    await state.update_data(
+        price_chat_id=callback.message.chat.id if callback.message else None,
+        price_message_id=callback.message.message_id if callback.message else None,
+        edit_months=months,
+    )
+    if callback.message:
+        await callback.message.answer(
+            escape_md("Введите новую цену в ₽ (целое, ≥0)."),
+            reply_markup=CANCEL_REPLY,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.message(AdminPrice.EditPrice)
+async def price_edit_price_input(message: Message, state: FSMContext, db: DB, bot: Bot) -> None:
+    """Принять новую цену тарифа."""
+
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if is_cancel(text):
+        await message.answer(
+            escape_md("Изменение отменено."),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await render_price_list_by_state(bot, state, db)
+        await state.clear()
+        return
+    if not text.isdigit():
+        await message.answer(
+            escape_md("Нужно целое число."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+    new_price = int(text)
+    if new_price < 0:
+        await message.answer(
+            escape_md("Цена должна быть ≥0."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+    data = await state.get_data()
+    months = data.get("edit_months")
+    chat_id = data.get("price_chat_id")
+    message_id = data.get("price_message_id")
+    if months is None or chat_id is None or message_id is None:
+        await message.answer(
+            escape_md("Не удалось обновить тарифы. Откройте меню заново."),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await state.clear()
+        return
+    await db.upsert_price(int(months), new_price)
+    await message.answer(
+        escape_md("✅ Цена обновлена."),
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    await render_price_list_by_state(bot, state, db)
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("price:editm:"))
+async def price_edit_months(callback: CallbackQuery, state: FSMContext) -> None:
+    """Перейти к редактированию длительности тарифа."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    try:
+        months = int(parts[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    await state.set_state(AdminPrice.EditMonths)
+    await state.update_data(
+        price_chat_id=callback.message.chat.id if callback.message else None,
+        price_message_id=callback.message.message_id if callback.message else None,
+        old_months=months,
+    )
+    if callback.message:
+        await callback.message.answer(
+            escape_md("Введите новое количество месяцев (целое, ≥1)."),
+            reply_markup=CANCEL_REPLY,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.message(AdminPrice.EditMonths)
+async def price_edit_months_input(message: Message, state: FSMContext, db: DB, bot: Bot) -> None:
+    """Принять новую длительность тарифа."""
+
+    if not is_super_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if is_cancel(text):
+        await message.answer(
+            escape_md("Изменение отменено."),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await render_price_list_by_state(bot, state, db)
+        await state.clear()
+        return
+    if not text.isdigit():
+        await message.answer(
+            escape_md("Нужно целое число."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+    new_months = int(text)
+    if new_months < 1:
+        await message.answer(
+            escape_md("Количество месяцев должно быть ≥1."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+    data = await state.get_data()
+    old_months = data.get("old_months")
+    chat_id = data.get("price_chat_id")
+    message_id = data.get("price_message_id")
+    if old_months is None or chat_id is None or message_id is None:
+        await message.answer(
+            escape_md("Не удалось обновить тарифы. Откройте меню заново."),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await state.clear()
+        return
+    prices = await db.get_prices_dict()
+    current_price = prices.get(int(old_months))
+    if current_price is None:
+        await message.answer(
+            escape_md("Тариф не найден."),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await state.clear()
+        return
+    if new_months == int(old_months):
+        await message.answer(
+            escape_md("Изменений нет."),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await render_price_list_by_state(bot, state, db)
+        await state.clear()
+        return
+    await db.upsert_price(new_months, current_price)
+    await db.delete_price(int(old_months))
+    await message.answer(
+        escape_md("✅ Длительность обновлена."),
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    await render_price_list_by_state(bot, state, db)
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("price:del:"))
+async def price_delete(callback: CallbackQuery) -> None:
+    """Запросить подтверждение удаления тарифа."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    try:
+        months = int(parts[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    if callback.message:
+        await render_price_delete_confirm(callback.message, months)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("price:confirm_del:"))
+async def price_confirm_delete(callback: CallbackQuery, db: DB) -> None:
+    """Удалить тариф после подтверждения."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    try:
+        months = int(parts[2])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    deleted = await db.delete_price(months)
+    if callback.message:
+        await render_price_list(callback.message, db)
+    if deleted:
+        await callback.answer("Тариф удалён.")
+    else:
+        await callback.answer("Тариф не найден.", show_alert=True)
 
 
 @router.callback_query(F.data == "admin:trial_days")
@@ -800,4 +1247,3 @@ async def admin_save_custom_code(message: Message, state: FSMContext, db: DB, bo
     )
     await refresh_admin_panel_by_state(bot, state, db)
     await state.clear()
-

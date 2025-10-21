@@ -2,7 +2,7 @@ import json
 import re
 import secrets
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import aiosqlite
 
@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS prices (
+    months INTEGER PRIMARY KEY,
+    price  INTEGER NOT NULL CHECK(price>=0),
+    CHECK(months>=1)
 );
 
 CREATE TABLE IF NOT EXISTS coupons (
@@ -143,24 +149,64 @@ class DB:
         except ValueError:
             return None
 
-    async def set_prices(self, price_map: Dict[int, int]) -> None:
-        await self.set_setting("prices", json.dumps(price_map))
+    async def get_all_prices(self) -> List[Tuple[int, int]]:
+        """Получить все тарифы, выполняя мягкую миграцию из настроек при необходимости."""
 
-    async def get_prices(self, default: Dict[int, int]) -> Dict[int, int]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT months, price FROM prices ORDER BY months ASC"
+            )
+            rows = await cur.fetchall()
+        if rows:
+            return [(int(row["months"]), int(row["price"])) for row in rows]
+
         raw = await self.get_setting("prices")
         if raw is None:
-            return default
+            return []
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            return default
-        cleaned: Dict[int, int] = {}
-        for key, value in parsed.items():
-            try:
-                cleaned[int(key)] = int(value)
-            except (TypeError, ValueError):
-                continue
-        return cleaned or default
+            return []
+        entries: List[Tuple[int, int]] = []
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                try:
+                    months = int(key)
+                    price = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if months < 1 or price < 0:
+                    continue
+                entries.append((months, price))
+        if not entries:
+            return []
+        entries.sort(key=lambda item: item[0])
+        async with aiosqlite.connect(self.path) as db:
+            await db.executemany(
+                "INSERT OR REPLACE INTO prices(months, price) VALUES(?, ?)", entries
+            )
+            await db.execute("DELETE FROM settings WHERE key=?", ("prices",))
+            await db.commit()
+        return entries
+
+    async def upsert_price(self, months: int, price: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO prices(months, price) VALUES(?, ?)",
+                (months, price),
+            )
+            await db.commit()
+
+    async def delete_price(self, months: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("DELETE FROM prices WHERE months=?", (months,))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def get_prices_dict(self) -> dict[int, int]:
+        prices = await self.get_all_prices()
+        return {months: price for months, price in prices}
 
     async def set_trial_days_global(self, days: int) -> None:
         await self.set_setting("trial_days", str(days))
