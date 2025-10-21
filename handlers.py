@@ -503,14 +503,24 @@ async def handle_buy(callback: CallbackQuery, db: DB) -> None:
         return
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
+    user_after = await db.get_user(user_id)
+    expires_at = user_after["expires_at"] if user_after else 0
+    formatted_expiry = format_expiry(expires_at) if expires_at else None
     if callback.message:
+        if formatted_expiry:
+            display_text = (
+                f"✅ Оплата {price}₽ за {months} мес.\n"
+                f"Подписка активна до {formatted_expiry}."
+            )
+        else:
+            display_text = f"✅ Оплата {price}₽ за {months} мес."
         await callback.message.answer(
-            escape_md(payment_text),
+            escape_md(display_text),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
         await refresh_user_menu(callback.message, db, user_id)
-    await callback.answer("Подписка продлена.")
+    await callback.answer("Оплата подтверждена.")
 
 
 @router.callback_query(F.data == "ar:toggle")
@@ -539,22 +549,55 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         await callback.answer("Чат не привязан.", show_alert=True)
         return
     expire_ts = int((datetime.utcnow() + timedelta(days=1)).timestamp())
+    link_url: str | None = None
+    hint: str = ""
     try:
         link = await bot.create_chat_invite_link(
             target_chat_id,
             member_limit=1,
             expire_date=expire_ts,
         )
+        link_url = link.invite_link
+        hint = "Действует 24 часа."
+    except TelegramBadRequest:
+        try:
+            fallback_link = await bot.export_chat_invite_link(target_chat_id)
+        except TelegramBadRequest:
+            await callback.answer(
+                "Не удалось создать ссылку. Проверьте права бота.",
+                show_alert=True,
+            )
+            return
+        except Exception:
+            await callback.answer(
+                "Не удалось создать ссылку. Сообщите администратору.",
+                show_alert=True,
+            )
+            return
+        else:
+            link_url = fallback_link
+            hint = "Ссылка постоянная."
     except Exception:
-        await callback.answer("Не удалось создать ссылку. Сообщите администратору.", show_alert=True)
+        await callback.answer(
+            "Не удалось создать ссылку. Сообщите администратору.",
+            show_alert=True,
+        )
+        return
+    if not link_url:
+        await callback.answer(
+            "Не удалось создать ссылку. Сообщите администратору.",
+            show_alert=True,
+        )
         return
     if callback.message:
         text = "\n".join(
             [
-                escape_md("Ваша ссылка (действует 24 часа):"),
-                escape_md(link.invite_link),
+                escape_md("🔗 Ваша ссылка:"),
+                escape_md(link_url),
+                escape_md(hint) if hint else "",
             ]
         )
+        text = "\n".join(line for line in text.split("\n") if line)
         await callback.message.answer(
             text,
             parse_mode=ParseMode.MARKDOWN_V2,
