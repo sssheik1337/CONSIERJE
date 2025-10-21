@@ -31,8 +31,11 @@ class AdminStates(StatesGroup):
 
     waiting_chat_username = State()
     waiting_trial_days = State()
+    confirming_trial_days = State()
     waiting_prices = State()
+    confirming_prices = State()
     waiting_trial_promo = State()
+    waiting_autorenew_default = State()
 
 
 class UserStates(StatesGroup):
@@ -144,12 +147,12 @@ async def build_admin_summary(db: DB) -> str:
     chat_username = await db.get_target_chat_username()
     chat_id = await db.get_target_chat_id()
     if chat_id is None:
-        chat_info = "Чат пока не привязан"
+        chat_info = "• Чат: не привязан"
     else:
         if not chat_username:
-            chat_info = f"Чат привязан: id {chat_id}"
+            chat_info = f"• Чат: id {chat_id}"
         else:
-            chat_info = f"Чат привязан: {chat_username} (id {chat_id})"
+            chat_info = f"• Чат: {chat_username} (id {chat_id})"
 
     trial_days = await db.get_trial_days(config.TRIAL_DAYS)
     auto_renew_default = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
@@ -157,17 +160,18 @@ async def build_admin_summary(db: DB) -> str:
     prices = await db.get_prices(config.PRICES)
     if prices:
         price_lines = [
-            f"{months} мес: {price}₽" for months, price in sorted(prices.items())
+            f"• {months} мес: {price}₽" for months, price in sorted(prices.items())
         ]
         price_text = "Прайс-лист:\n" + "\n".join(price_lines)
     else:
         price_text = "Прайс-лист пока пуст"
 
     lines = [
-        chat_info,
+        "📋 Текущие настройки:",
         "",
-        f"Пробный период: {trial_days} дн.",
-        f"Автопродление по умолчанию: {auto_renew_text}",
+        chat_info,
+        f"• Пробный период: {trial_days} дн.",
+        f"• Автопродление по умолчанию: {auto_renew_text}",
         "",
         price_text,
         "",
@@ -194,6 +198,39 @@ def build_autorenew_keyboard(current_flag: bool) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text=on_text, callback_data="user:autorenew:on")],
             [InlineKeyboardButton(text=off_text, callback_data="user:autorenew:off")],
+        ]
+    )
+
+
+def build_confirmation_keyboard(action: str) -> InlineKeyboardMarkup:
+    """Построить клавиатуру подтверждения для администраторских действий."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Подтвердить", callback_data=f"admin:{action}:confirm"
+                ),
+                InlineKeyboardButton(
+                    text="Отмена", callback_data=f"admin:{action}:cancel"
+                ),
+            ]
+        ]
+    )
+
+
+def build_autorenew_default_choice_keyboard(
+    current_flag: bool,
+) -> InlineKeyboardMarkup:
+    """Построить клавиатуру выбора значения автопродления по умолчанию."""
+
+    enable_text = "✅ Уже включено" if current_flag else "Включить"
+    disable_text = "Выключить" if current_flag else "✅ Уже выключено"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=enable_text, callback_data="admin:autorenew:on")],
+            [InlineKeyboardButton(text=disable_text, callback_data="admin:autorenew:off")],
+            [InlineKeyboardButton(text="Отмена", callback_data="admin:autorenew:cancel")],
         ]
     )
 
@@ -456,10 +493,13 @@ async def admin_set_trial_days_state(m: Message, state: FSMContext, db: DB):
     if days <= 0:
         await m.answer("Количество дней должно быть положительным. Попробуйте снова или отправьте 'отмена'.")
         return
-    await db.set_trial_days(days)
-    await state.clear()
-    await m.answer(f"Пробный период обновлён: {days} дн.")
-    await send_admin_menu(m, db)
+    await state.update_data(pending_trial_days=days)
+    await state.set_state(AdminStates.confirming_trial_days)
+    kb = build_confirmation_keyboard("trial")
+    await m.answer(
+        f"Подтвердите установку пробного периода: {days} дн.",
+        reply_markup=kb,
+    )
 
 
 def parse_prices_payload(text: str) -> Optional[dict[int, int]]:
@@ -524,10 +564,130 @@ async def admin_edit_prices_state(m: Message, state: FSMContext, db: DB):
             " Попробуйте снова или отправьте 'отмена'."
         )
         return
+    price_items = [
+        {"months": months, "price": price}
+        for months, price in sorted(prices.items())
+    ]
+    await state.update_data(pending_prices=price_items)
+    await state.set_state(AdminStates.confirming_prices)
+    summary_lines = [
+        f"• {item['months']} мес — {item['price']}₽" for item in price_items
+    ]
+    kb = build_confirmation_keyboard("prices")
+    await m.answer(
+        "Проверьте новый прайс-лист:\n" + "\n".join(summary_lines),
+        reply_markup=kb,
+    )
+
+
+@callback_router.callback_query(AdminStates.confirming_trial_days, F.data == "admin:trial:confirm")
+async def admin_confirm_trial_days(callback: CallbackQuery, state: FSMContext, db: DB):
+    """Подтвердить изменение длительности пробного периода."""
+
+    data = await state.get_data()
+    days_raw = data.get("pending_trial_days")
+    try:
+        days = int(days_raw)
+    except (TypeError, ValueError):
+        await callback.answer("Не удалось определить новое значение.", show_alert=True)
+        await state.clear()
+        await callback.message.edit_reply_markup()
+        await callback.message.answer(
+            "Не удалось сохранить пробный период. Попробуйте начать заново."
+        )
+        await send_admin_menu(callback.message, db)
+        return
+    await db.set_trial_days(days)
+    await state.clear()
+    await callback.message.edit_reply_markup()
+    await callback.message.answer(f"Пробный период обновлён: {days} дн.")
+    await send_admin_menu(callback.message, db)
+    await callback.answer("Изменения сохранены.")
+
+
+@callback_router.callback_query(AdminStates.confirming_trial_days, F.data == "admin:trial:cancel")
+async def admin_cancel_trial_days(callback: CallbackQuery, state: FSMContext, db: DB):
+    """Отменить изменение длительности пробного периода."""
+
+    await state.clear()
+    await callback.message.edit_reply_markup()
+    await callback.message.answer("Установка пробного периода отменена.")
+    await send_admin_menu(callback.message, db)
+    await callback.answer()
+
+
+@callback_router.callback_query(AdminStates.confirming_prices, F.data == "admin:prices:confirm")
+async def admin_confirm_prices(callback: CallbackQuery, state: FSMContext, db: DB):
+    """Подтвердить новый прайс-лист."""
+
+    data = await state.get_data()
+    price_items = data.get("pending_prices") or []
+    prices: dict[int, int] = {}
+    for item in price_items:
+        try:
+            months = int(item["months"])
+            price = int(item["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        prices[months] = price
+    if not prices:
+        await callback.answer("Не удалось определить новый прайс.", show_alert=True)
+        await state.clear()
+        await callback.message.edit_reply_markup()
+        await send_admin_menu(callback.message, db)
+        return
     await db.set_prices(prices)
     await state.clear()
-    await m.answer("Прайс обновлён.")
-    await send_admin_menu(m, db)
+    await callback.message.edit_reply_markup()
+    await callback.message.answer("Прайс обновлён.")
+    await send_admin_menu(callback.message, db)
+    await callback.answer("Изменения сохранены.")
+
+
+@callback_router.callback_query(AdminStates.confirming_prices, F.data == "admin:prices:cancel")
+async def admin_cancel_prices(callback: CallbackQuery, state: FSMContext, db: DB):
+    """Отменить изменение прайс-листа."""
+
+    await state.clear()
+    await callback.message.edit_reply_markup()
+    await callback.message.answer("Редактирование прайса отменено.")
+    await send_admin_menu(callback.message, db)
+    await callback.answer()
+
+
+@callback_router.callback_query(AdminStates.waiting_autorenew_default, F.data == "admin:autorenew:on")
+async def admin_set_autorenew_default_on(callback: CallbackQuery, state: FSMContext, db: DB):
+    """Включить автопродление по умолчанию после подтверждения."""
+
+    await db.set_auto_renew_default(True)
+    await state.clear()
+    await callback.message.edit_reply_markup()
+    await callback.message.answer("Автопродление по умолчанию включено.")
+    await send_admin_menu(callback.message, db)
+    await callback.answer("Изменения сохранены.")
+
+
+@callback_router.callback_query(AdminStates.waiting_autorenew_default, F.data == "admin:autorenew:off")
+async def admin_set_autorenew_default_off(callback: CallbackQuery, state: FSMContext, db: DB):
+    """Выключить автопродление по умолчанию после подтверждения."""
+
+    await db.set_auto_renew_default(False)
+    await state.clear()
+    await callback.message.edit_reply_markup()
+    await callback.message.answer("Автопродление по умолчанию выключено.")
+    await send_admin_menu(callback.message, db)
+    await callback.answer("Изменения сохранены.")
+
+
+@callback_router.callback_query(AdminStates.waiting_autorenew_default, F.data == "admin:autorenew:cancel")
+async def admin_cancel_autorenew_default(callback: CallbackQuery, state: FSMContext, db: DB):
+    """Отменить изменение автопродления по умолчанию."""
+
+    await state.clear()
+    await callback.message.edit_reply_markup()
+    await callback.message.answer("Изменение автопродления отменено.")
+    await send_admin_menu(callback.message, db)
+    await callback.answer()
 
 
 async def create_trial_codes_message(
@@ -617,15 +777,33 @@ async def admin_generate_trial_state(m: Message, state: FSMContext, db: DB):
 
 
 @router.message(F.text.regexp(r"^Автопродление по умолчанию"))
-async def admin_toggle_autorenew_default(m: Message, db: DB):
+async def admin_toggle_autorenew_default(m: Message, db: DB, state: FSMContext):
     if not is_super_admin(m.from_user.id):
         return
     current_flag = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
-    new_flag = not current_flag
-    await db.set_auto_renew_default(new_flag)
-    status_text = "включено" if new_flag else "выключено"
-    await m.answer(f"Автопродление по умолчанию теперь {status_text}.")
-    await send_admin_menu(m, db)
+    await state.set_state(AdminStates.waiting_autorenew_default)
+    kb = build_autorenew_default_choice_keyboard(current_flag)
+    status_text = "включено" if current_flag else "выключено"
+    await m.answer(
+        f"Сейчас автопродление по умолчанию {status_text}. Выберите действие ниже или нажмите 'Отмена'.",
+        reply_markup=kb,
+    )
+
+@router.message(AdminStates.waiting_autorenew_default)
+async def admin_autorenew_default_text(m: Message, state: FSMContext, db: DB):
+    """Обработать текстовый ввод при настройке автопродления по умолчанию."""
+
+    if not is_super_admin(m.from_user.id):
+        await state.clear()
+        return
+    text = (m.text or "").strip().lower()
+    if text in {"/cancel", "отмена"}:
+        await state.clear()
+        await m.answer("Изменение автопродления отменено.")
+        await send_admin_menu(m, db)
+        return
+    await m.answer("Пожалуйста, используйте кнопки ниже или отправьте 'отмена'.")
+
 
 @router.message(Command("set_trial_days"))
 async def cmd_set_trial_days(m: Message, db: DB):
