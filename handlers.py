@@ -2,7 +2,15 @@ from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, CallbackQuery
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from datetime import datetime, timedelta
 from config import config
 from db import DB
@@ -19,9 +27,36 @@ class AdminStates(StatesGroup):
     waiting_chat_username = State()
 
 
+class UserStates(StatesGroup):
+    """Состояния пользователя для диалогов по кнопкам."""
+
+    waiting_buy_months = State()
+
+
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Привязать чат")]],
     resize_keyboard=True,
+)
+
+
+USER_REPLY_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Получить ссылку")],
+        [KeyboardButton(text="Статус подписки")],
+        [KeyboardButton(text="Продлить подписку")],
+        [KeyboardButton(text="Настроить автопродление")],
+    ],
+    resize_keyboard=True,
+)
+
+
+USER_INLINE_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="Получить ссылку", callback_data="user:get_link")],
+        [InlineKeyboardButton(text="Статус подписки", callback_data="user:status")],
+        [InlineKeyboardButton(text="Продлить подписку", callback_data="user:buy")],
+        [InlineKeyboardButton(text="Автопродление", callback_data="user:autorenew_menu")],
+    ]
 )
 
 
@@ -47,8 +82,78 @@ async def send_admin_menu(m: Message, db: DB):
     )
     await m.answer(text, reply_markup=ADMIN_KEYBOARD)
 
+
+def build_autorenew_keyboard(current_flag: bool) -> InlineKeyboardMarkup:
+    """Построить inline-клавиатуру для переключения автопродления."""
+
+    on_text = "✅ Автопродление включено" if current_flag else "Включить автопродление"
+    off_text = "Выключить автопродление" if current_flag else "✅ Автопродление выключено"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=on_text, callback_data="user:autorenew:on")],
+            [InlineKeyboardButton(text=off_text, callback_data="user:autorenew:off")],
+        ]
+    )
+
+
+async def reply_to_target(target, text: str, **kwargs):
+    """Ответить сообщением независимо от типа апдейта."""
+
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(text, **kwargs)
+        await target.answer()
+    else:
+        await target.answer(text, **kwargs)
+
+
+async def send_subscription_status(target, db: DB):
+    """Ответить пользователю текущим статусом подписки."""
+
+    user_id = target.from_user.id
+    row = await db.get_user(user_id)
+    if not row:
+        await reply_to_target(target, "Вы ещё не зарегистрированы. Нажмите /start.")
+        return
+    exp = row["expires_at"]
+    dt = datetime.utcfromtimestamp(exp)
+    ar = "вкл" if row["auto_renew"] else "выкл"
+    po = "да" if row["paid_only"] else "нет"
+    await reply_to_target(
+        target,
+        f"Подписка до: {dt} UTC\nАвтопродление: {ar}\nБез пробника: {po}",
+    )
+
+
+async def send_invite_link(target, bot: Bot, db: DB):
+    """Создать и отправить одноразовую ссылку, если это возможно."""
+
+    user_id = target.from_user.id
+    row = await db.get_user(user_id)
+    if not row:
+        await reply_to_target(target, "Вы ещё не зарегистрированы. Нажмите /start.")
+        return
+    if row["expires_at"] < int(datetime.utcnow().timestamp()):
+        await reply_to_target(target, "Подписка не активна. Оплатите, чтобы получить доступ.")
+        return
+    target_chat_id = await db.get_target_chat_id()
+    if target_chat_id is None:
+        await reply_to_target(target, "Чат ещё не привязан. Дождитесь действий администратора.")
+        return
+    try:
+        expire_ts = int((datetime.utcnow() + timedelta(hours=24)).timestamp())
+        link = await bot.create_chat_invite_link(
+            target_chat_id, member_limit=1, expire_date=expire_ts
+        )
+        await reply_to_target(
+            target,
+            "Ваша одноразовая ссылка в канал (действует 24 часа):\n" + link.invite_link,
+        )
+    except Exception:
+        await reply_to_target(target, "Не удалось создать ссылку. Напишите админу.")
+
+
 @router.message(CommandStart())
-async def cmd_start(m: Message, bot: Bot, db: DB):
+async def cmd_start(m: Message, db: DB):
     now_ts = int(datetime.utcnow().timestamp())
     trial_days = await db.get_trial_days(config.TRIAL_DAYS)
     auto_renew_default = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
@@ -56,52 +161,21 @@ async def cmd_start(m: Message, bot: Bot, db: DB):
     bypass = (m.from_user.id in config.ADMIN_BYPASS_IDS)
     await db.upsert_user(m.from_user.id, now_ts, trial_days, auto_renew_default, paid_only, bypass)
 
-    # Добавить в канал, если не состоит
-    target_chat_id = await db.get_target_chat_id()
-    if target_chat_id is None:
-        await m.answer("Вы зарегистрированы, но чат ещё не привязан. Дождитесь привязки администратором.")
-        return
-    try:
-        # Индивидуальная одноразовая ссылка (24 часа)
-        expire_ts = int((datetime.utcnow() + timedelta(hours=24)).timestamp())
-        link = await bot.create_chat_invite_link(target_chat_id, member_limit=1, expire_date=expire_ts)
-        await m.answer(
-            "Добро пожаловать! Вот ваша одноразовая ссылка в канал (действует 24 часа):\n" + link.invite_link
-        )
-    except Exception as e:
-        await m.answer("Не удалось создать ссылку. Напишите админу.")
+    warning_lines = [
+        "⚠️ Подписка платная и продлевается автоматически по окончании оплаченного периода.",
+        "Если вы не хотите автопродления, отключите его заранее через меню.",
+        "Воспользуйтесь кнопками ниже, чтобы управлять доступом.",
+    ]
+    await m.answer("\n".join(warning_lines), reply_markup=USER_REPLY_KEYBOARD)
+    await m.answer("Выберите действие:", reply_markup=USER_INLINE_KEYBOARD)
 
 @router.message(Command("status"))
 async def cmd_status(m: Message, db: DB):
-    row = await db.get_user(m.from_user.id)
-    if not row:
-        await m.answer("Вы ещё не зарегистрированы. Нажмите /start.")
-        return
-    exp = row["expires_at"]
-    dt = datetime.utcfromtimestamp(exp)
-    ar = "вкл" if row["auto_renew"] else "выкл"
-    po = "да" if row["paid_only"] else "нет"
-    await m.answer(f"Подписка до: {dt} UTC\nАвтопродление: {ar}\nБез пробника: {po}")
+    await send_subscription_status(m, db)
 
 @router.message(Command("rejoin"))
 async def cmd_rejoin(m: Message, bot: Bot, db: DB):
-    row = await db.get_user(m.from_user.id)
-    if not row:
-        await m.answer("Вы ещё не зарегистрированы. Нажмите /start.")
-        return
-    if row["expires_at"] < int(datetime.utcnow().timestamp()):
-        await m.answer("Подписка не активна. Оплатите, чтобы вернуться.")
-        return
-    target_chat_id = await db.get_target_chat_id()
-    if target_chat_id is None:
-        await m.answer("Чат ещё не привязан. Свяжитесь с администратором.")
-        return
-    try:
-        expire_ts = int((datetime.utcnow() + timedelta(hours=24)).timestamp())
-        link = await bot.create_chat_invite_link(target_chat_id, member_limit=1, expire_date=expire_ts)
-        await m.answer("Ваша одноразовая ссылка (24ч):\n" + link.invite_link)
-    except Exception:
-        await m.answer("Не удалось создать ссылку. Напишите админу.")
+    await send_invite_link(m, bot, db)
 
 @router.message(Command("buy"))
 async def cmd_buy(m: Message, db: DB):
@@ -117,6 +191,52 @@ async def cmd_buy(m: Message, db: DB):
         return
     await db.extend_subscription(m.from_user.id, months)
     await m.answer(msg + "\nПодписка продлена.")
+
+@router.message(F.text == "Получить ссылку")
+async def user_get_link_button(m: Message, bot: Bot, db: DB):
+    await send_invite_link(m, bot, db)
+
+
+@router.message(F.text == "Статус подписки")
+async def user_status_button(m: Message, db: DB):
+    await send_subscription_status(m, db)
+
+
+@router.message(F.text == "Продлить подписку")
+async def user_buy_button(m: Message, state: FSMContext, db: DB):
+    await state.set_state(UserStates.waiting_buy_months)
+    await m.answer("На сколько месяцев продлить подписку? Укажите число или отправьте «отмена».")
+
+
+@router.message(F.text == "Настроить автопродление")
+async def user_autorenew_menu_message(m: Message, db: DB):
+    row = await db.get_user(m.from_user.id)
+    if not row:
+        await m.answer("Вы ещё не зарегистрированы. Нажмите /start.")
+        return
+    kb = build_autorenew_keyboard(bool(row["auto_renew"]))
+    await m.answer("Выберите состояние автопродления:", reply_markup=kb)
+
+
+@router.message(UserStates.waiting_buy_months)
+async def user_buy_months_input(m: Message, state: FSMContext, db: DB):
+    text = (m.text or "").strip().lower()
+    if text in {"/cancel", "отмена"}:
+        await state.clear()
+        await m.answer("Продление отменено.", reply_markup=USER_REPLY_KEYBOARD)
+        return
+    if not text.isdigit():
+        await m.answer("Нужно отправить количество месяцев числом или «отмена».")
+        return
+    months = int(text)
+    prices = await db.get_prices(config.PRICES)
+    ok, msg = await process_payment(m.from_user.id, months, prices)
+    if not ok:
+        await m.answer("Оплата не прошла: " + msg)
+        return
+    await db.extend_subscription(m.from_user.id, months)
+    await state.clear()
+    await m.answer(msg + "\nПодписка продлена.", reply_markup=USER_REPLY_KEYBOARD)
 
 # ==== Админские ====
 
@@ -245,6 +365,50 @@ async def cmd_invite(m: Message, bot: Bot, db: DB):
 
 
 # ==== Callback-кнопки ====
+
+@callback_router.callback_query(F.data == "user:get_link")
+async def user_get_link_callback(callback: CallbackQuery, bot: Bot, db: DB):
+    await send_invite_link(callback, bot, db)
+
+
+@callback_router.callback_query(F.data == "user:status")
+async def user_status_callback(callback: CallbackQuery, db: DB):
+    await send_subscription_status(callback, db)
+
+
+@callback_router.callback_query(F.data == "user:buy")
+async def user_buy_callback(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserStates.waiting_buy_months)
+    await callback.message.answer("На сколько месяцев продлить подписку? Укажите число или отправьте «отмена».")
+    await callback.answer()
+
+
+@callback_router.callback_query(F.data == "user:autorenew_menu")
+async def user_autorenew_menu_callback(callback: CallbackQuery, db: DB):
+    row = await db.get_user(callback.from_user.id)
+    if not row:
+        await callback.answer("Сначала выполните /start.", show_alert=True)
+        return
+    kb = build_autorenew_keyboard(bool(row["auto_renew"]))
+    await callback.message.answer("Выберите состояние автопродления:", reply_markup=kb)
+    await callback.answer()
+
+
+@callback_router.callback_query(F.data == "user:autorenew:on")
+async def user_autorenew_on(callback: CallbackQuery, db: DB):
+    await db.set_auto_renew(callback.from_user.id, True)
+    kb = build_autorenew_keyboard(True)
+    await callback.message.edit_text("Автопродление включено.", reply_markup=kb)
+    await callback.answer("Автопродление включено.")
+
+
+@callback_router.callback_query(F.data == "user:autorenew:off")
+async def user_autorenew_off(callback: CallbackQuery, db: DB):
+    await db.set_auto_renew(callback.from_user.id, False)
+    kb = build_autorenew_keyboard(False)
+    await callback.message.edit_text("Автопродление выключено.", reply_markup=kb)
+    await callback.answer("Автопродление выключено.")
+
 
 @callback_router.callback_query()
 async def handle_basic_callback(callback: CallbackQuery):
