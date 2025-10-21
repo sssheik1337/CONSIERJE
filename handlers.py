@@ -143,8 +143,12 @@ async def make_one_time_invite(
         logging.exception("Не удалось получить статус бота", exc_info=err)
         return False, "Не удалось проверить права. Попробуйте позже."
 
-    status = getattr(member, "status", "")
-    if status not in {"administrator", "creator"}:
+    status_raw = getattr(member, "status", "")
+    if hasattr(status_raw, "value"):
+        status_value = status_raw.value
+    else:
+        status_value = str(status_raw)
+    if status_value not in {"administrator", "creator"}:
         return False, "Бот не админ. Выдайте права администратора."
 
     can_invite_attr = getattr(member, "can_invite_users", None)
@@ -859,11 +863,15 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
             "• Рекомендация: дайте боту право «Пригласительные ссылки» и повторите.",
         ]
     else:
-        status = getattr(member, "status", "unknown")
+        status_raw = getattr(member, "status", "unknown")
+        if hasattr(status_raw, "value"):
+            status_display = status_raw.value
+        else:
+            status_display = str(status_raw)
         can_invite_attr = getattr(member, "can_invite_users", True)
         invite_ok = True if can_invite_attr is None else bool(can_invite_attr)
         lines = base_lines + [
-            f"• Статус: {status}",
+            f"• Статус: {status_display}",
             f"• Пригласительные ссылки: {inline_emoji(invite_ok)}",
             "• Рекомендация: дайте боту право «Пригласительные ссылки» и повторите.",
         ]
