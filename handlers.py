@@ -36,6 +36,7 @@ class AdminStates(StatesGroup):
     confirming_prices = State()
     waiting_trial_promo = State()
     waiting_autorenew_default = State()
+    waiting_invite_params = State()
 
 
 class UserStates(StatesGroup):
@@ -58,6 +59,7 @@ def build_admin_keyboard(auto_renew_default: bool) -> ReplyKeyboardMarkup:
                     text=f"Автопродление по умолчанию ({autorenew_marker})"
                 )
             ],
+            [KeyboardButton(text="Отправить ссылку пользователю")],
             [KeyboardButton(text="Сгенерировать промокоды (trial)")],
         ],
         resize_keyboard=True,
@@ -66,8 +68,8 @@ def build_admin_keyboard(auto_renew_default: bool) -> ReplyKeyboardMarkup:
 
 USER_REPLY_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Получить ссылку")],
-        [KeyboardButton(text="Статус подписки")],
+        [KeyboardButton(text="Отправить ссылку ещё раз")],
+        [KeyboardButton(text="Показать статус")],
         [KeyboardButton(text="Продлить подписку")],
         [KeyboardButton(text="Настроить автопродление")],
         [KeyboardButton(text="Ввести промокод")],
@@ -82,8 +84,8 @@ def build_user_inline_keyboard(auto_renew: bool) -> InlineKeyboardMarkup:
     autorenew_text = "Автопродление ✅" if auto_renew else "Автопродление ❌"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Получить ссылку", callback_data="user:get_link")],
-            [InlineKeyboardButton(text="Статус подписки", callback_data="user:status")],
+            [InlineKeyboardButton(text="Отправить ссылку ещё раз", callback_data="user:get_link")],
+            [InlineKeyboardButton(text="Показать статус", callback_data="user:status")],
             [InlineKeyboardButton(text="Продлить подписку", callback_data="user:buy")],
             [
                 InlineKeyboardButton(
@@ -322,20 +324,12 @@ async def cmd_use(m: Message, db: DB):
         return
     await apply_trial_promo(m, args[1], db)
 
-@router.message(Command("status"))
-async def cmd_status(m: Message, db: DB):
-    await send_subscription_status(m, db)
-
-@router.message(Command("rejoin"))
-async def cmd_rejoin(m: Message, bot: Bot, db: DB):
-    await send_invite_link(m, bot, db)
-
-@router.message(F.text == "Получить ссылку")
+@router.message(F.text.in_({"Отправить ссылку ещё раз", "Получить ссылку"}))
 async def user_get_link_button(m: Message, bot: Bot, db: DB):
     await send_invite_link(m, bot, db)
 
 
-@router.message(F.text == "Статус подписки")
+@router.message(F.text.in_({"Показать статус", "Статус подписки"}))
 async def user_status_button(m: Message, db: DB):
     await send_subscription_status(m, db)
 
@@ -462,6 +456,18 @@ async def admin_show_settings_button(m: Message, db: DB):
     auto_renew_default = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
     kb = build_admin_keyboard(auto_renew_default)
     await m.answer(summary, reply_markup=kb)
+
+
+@router.message(F.text == "Отправить ссылку пользователю")
+async def admin_send_invite_button(m: Message, state: FSMContext):
+    if not is_super_admin(m.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_invite_params)
+    await m.answer(
+        "Пришлите user_id получателя и опционально срок действия ссылки в часах "
+        "в формате '<user_id> [часы]'. Для отмены отправьте 'отмена'.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @router.message(F.text == "Установить пробный период")
@@ -776,6 +782,58 @@ async def admin_generate_trial_state(m: Message, state: FSMContext, db: DB):
     await send_admin_menu(m, db)
 
 
+@router.message(AdminStates.waiting_invite_params)
+async def admin_send_invite_state(m: Message, state: FSMContext, bot: Bot, db: DB):
+    """Обработать ввод параметров для отправки ссылки пользователю."""
+
+    if not is_super_admin(m.from_user.id):
+        await state.clear()
+        return
+    text = (m.text or "").strip()
+    if text.lower() in {"/cancel", "отмена"}:
+        await state.clear()
+        await m.answer("Отправка ссылки отменена.")
+        await send_admin_menu(m, db)
+        return
+    parts = text.split()
+    if not parts or not parts[0].isdigit() or (len(parts) > 1 and not parts[1].isdigit()):
+        await m.answer(
+            "Нужно указать user_id и необязательный срок действия в часах (целые числа). "
+            "Попробуйте снова или отправьте 'отмена'."
+        )
+        return
+    uid = int(parts[0])
+    hours = int(parts[1]) if len(parts) > 1 else 24
+    if hours <= 0:
+        await m.answer(
+            "Срок действия ссылки должен быть положительным количеством часов. "
+            "Попробуйте снова или отправьте 'отмена'."
+        )
+        return
+    target_chat_id = await db.get_target_chat_id()
+    if target_chat_id is None:
+        await state.clear()
+        await m.answer("Чат ещё не привязан. Сначала используйте кнопку \"Привязать чат\".")
+        await send_admin_menu(m, db)
+        return
+    try:
+        expire_ts = int((datetime.utcnow() + timedelta(hours=hours)).timestamp())
+        link = await bot.create_chat_invite_link(
+            target_chat_id, member_limit=1, expire_date=expire_ts
+        )
+        await bot.send_message(
+            uid,
+            f"Ваша персональная ссылка (действует {hours}ч):\n{link.invite_link}",
+        )
+        await state.clear()
+        await m.answer("Ссылка отправлена пользователю.")
+        await send_admin_menu(m, db)
+    except Exception:
+        await m.answer(
+            "Не удалось создать или отправить ссылку. Попробуйте ещё раз или отправьте 'отмена'."
+        )
+
+
 @router.message(F.text.regexp(r"^Автопродление по умолчанию"))
 async def admin_toggle_autorenew_default(m: Message, db: DB, state: FSMContext):
     if not is_super_admin(m.from_user.id):
@@ -860,29 +918,6 @@ async def cmd_price_list(m: Message, db: DB):
     prices = await db.get_prices(config.PRICES)
     lines = [f"{months} мес: {price}₽" for months, price in sorted(prices.items())]
     await m.answer("Прайс:\n" + "\n".join(lines))
-
-@router.message(Command("invite"))
-async def cmd_invite(m: Message, bot: Bot, db: DB):
-    if not is_super_admin(m.from_user.id):
-        return
-    args = (m.text or "").split()
-    if len(args) < 2 or not args[1].isdigit():
-        await m.answer("Формат: /invite <user_id> [hours]")
-        return
-    uid = int(args[1])
-    hours = int(args[2]) if len(args) > 2 and args[2].isdigit() else 24
-    target_chat_id = await db.get_target_chat_id()
-    if target_chat_id is None:
-        await m.answer("Чат ещё не привязан. Сначала используйте кнопку \"Привязать чат\".")
-        return
-    try:
-        expire_ts = int((datetime.utcnow() + timedelta(hours=hours)).timestamp())
-        link = await bot.create_chat_invite_link(target_chat_id, member_limit=1, expire_date=expire_ts)
-        await bot.send_message(uid, f"Ваша персональная ссылка (действует {hours}ч):\n{link.invite_link}")
-        await m.answer("Отправил пользователю.")
-    except Exception as e:
-        await m.answer("Не удалось создать/отправить ссылку.")
-
 
 @router.message(Command("generate_trial_codes"))
 async def cmd_generate_trial_codes(m: Message, db: DB):
