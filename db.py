@@ -1,4 +1,5 @@
 import json
+import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -29,10 +30,18 @@ CREATE TABLE IF NOT EXISTS coupons (
 );
 """
 
+COUPON_CODE_PATTERN = re.compile(r"^[A-Z0-9\-]{4,32}$")
+
 
 class DB:
     def __init__(self, path: str):
         self.path = path
+
+    @staticmethod
+    def _normalize_code(raw: str) -> str:
+        """Нормализовать промокод к верхнему регистру без лишних пробелов."""
+
+        return (raw or "").upper().strip()
 
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as db:
@@ -215,8 +224,29 @@ class DB:
             await db.commit()
         return codes
 
+    async def create_coupon(self, code: str, kind: str) -> Tuple[bool, str]:
+        """Создать ручной промокод, проходя валидацию и проверку на уникальность."""
+
+        normalized = self._normalize_code(code)
+        if not normalized:
+            return False, "Промокод не должен быть пустым"
+        if kind != "trial":
+            return False, "Поддерживается только пробный промокод"
+        if not COUPON_CODE_PATTERN.fullmatch(normalized):
+            return False, "Разрешены латиница, цифры и дефис (4–32 символа)"
+        async with aiosqlite.connect(self.path) as db:
+            try:
+                await db.execute(
+                    "INSERT INTO coupons(code, kind, used_by, used_at) VALUES(?, ?, NULL, NULL)",
+                    (normalized, kind),
+                )
+                await db.commit()
+            except aiosqlite.IntegrityError:
+                return False, "Код уже существует"
+        return True, normalized
+
     async def use_coupon(self, code: str, user_id: int) -> Tuple[bool, str, Optional[str]]:
-        normalized = code.strip()
+        normalized = self._normalize_code(code)
         if not normalized:
             return False, "Нужно указать промокод.", None
         async with aiosqlite.connect(self.path) as db:
