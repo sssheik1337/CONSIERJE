@@ -50,14 +50,22 @@ USER_REPLY_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
-USER_INLINE_KEYBOARD = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text="Получить ссылку", callback_data="user:get_link")],
-        [InlineKeyboardButton(text="Статус подписки", callback_data="user:status")],
-        [InlineKeyboardButton(text="Продлить подписку", callback_data="user:buy")],
-        [InlineKeyboardButton(text="Автопродление", callback_data="user:autorenew_menu")],
-    ]
-)
+def build_user_inline_keyboard(auto_renew: bool) -> InlineKeyboardMarkup:
+    """Построить пользовательское меню с учётом статуса автопродления."""
+
+    autorenew_text = "Автопродление ✅" if auto_renew else "Автопродление ❌"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Получить ссылку", callback_data="user:get_link")],
+            [InlineKeyboardButton(text="Статус подписки", callback_data="user:status")],
+            [InlineKeyboardButton(text="Продлить подписку", callback_data="user:buy")],
+            [
+                InlineKeyboardButton(
+                    text=autorenew_text, callback_data="user:autorenew:toggle"
+                )
+            ],
+        ]
+    )
 
 
 async def send_admin_menu(m: Message, db: DB):
@@ -159,7 +167,11 @@ async def cmd_start(m: Message, db: DB):
     auto_renew_default = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
     paid_only = (m.from_user.id in config.PAID_ONLY_IDS)
     bypass = (m.from_user.id in config.ADMIN_BYPASS_IDS)
-    await db.upsert_user(m.from_user.id, now_ts, trial_days, auto_renew_default, paid_only, bypass)
+    await db.upsert_user(
+        m.from_user.id, now_ts, trial_days, auto_renew_default, paid_only, bypass
+    )
+    row = await db.get_user(m.from_user.id)
+    auto_renew_flag = bool(row["auto_renew"]) if row else auto_renew_default
 
     warning_lines = [
         "⚠️ Подписка платная и продлевается автоматически по окончании оплаченного периода.",
@@ -167,7 +179,8 @@ async def cmd_start(m: Message, db: DB):
         "Воспользуйтесь кнопками ниже, чтобы управлять доступом.",
     ]
     await m.answer("\n".join(warning_lines), reply_markup=USER_REPLY_KEYBOARD)
-    await m.answer("Выберите действие:", reply_markup=USER_INLINE_KEYBOARD)
+    user_menu = build_user_inline_keyboard(auto_renew_flag)
+    await m.answer("Выберите действие:", reply_markup=user_menu)
 
 @router.message(Command("status"))
 async def cmd_status(m: Message, db: DB):
@@ -392,6 +405,23 @@ async def user_autorenew_menu_callback(callback: CallbackQuery, db: DB):
     kb = build_autorenew_keyboard(bool(row["auto_renew"]))
     await callback.message.answer("Выберите состояние автопродления:", reply_markup=kb)
     await callback.answer()
+
+
+@callback_router.callback_query(F.data == "user:autorenew:toggle")
+async def user_autorenew_toggle(callback: CallbackQuery, db: DB):
+    """Переключить флаг автопродления из основного меню."""
+
+    row = await db.get_user(callback.from_user.id)
+    if not row:
+        await callback.answer("Сначала выполните /start.", show_alert=True)
+        return
+    new_flag = not bool(row["auto_renew"])
+    await db.set_auto_renew(callback.from_user.id, new_flag)
+    await callback.message.edit_reply_markup(
+        reply_markup=build_user_inline_keyboard(new_flag)
+    )
+    status_text = "Автопродление включено" if new_flag else "Автопродление выключено"
+    await callback.answer(status_text)
 
 
 @callback_router.callback_query(F.data == "user:autorenew:on")
