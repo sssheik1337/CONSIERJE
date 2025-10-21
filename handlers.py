@@ -13,7 +13,8 @@ from aiogram.types import (
 )
 from datetime import datetime, timedelta
 import secrets
-from typing import Optional
+import re
+from typing import Optional, Tuple
 from config import config
 from db import DB
 from payments import process_payment
@@ -26,7 +27,12 @@ def is_super_admin(uid: int) -> bool:
 
 
 class AdminStates(StatesGroup):
+    """Состояния администратора для диалогов и форм."""
+
     waiting_chat_username = State()
+    waiting_trial_days = State()
+    waiting_prices = State()
+    waiting_trial_promo = State()
 
 
 class UserStates(StatesGroup):
@@ -35,10 +41,24 @@ class UserStates(StatesGroup):
     waiting_promo_code = State()
 
 
-ADMIN_KEYBOARD = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Привязать чат")]],
-    resize_keyboard=True,
-)
+def build_admin_keyboard(auto_renew_default: bool) -> ReplyKeyboardMarkup:
+    """Построить reply-клавиатуру администратора с актуальным статусом."""
+
+    autorenew_marker = "✅" if auto_renew_default else "❌"
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Привязать чат"), KeyboardButton(text="Показать настройки")],
+            [KeyboardButton(text="Редактировать цены")],
+            [KeyboardButton(text="Установить пробный период")],
+            [
+                KeyboardButton(
+                    text=f"Автопродление по умолчанию ({autorenew_marker})"
+                )
+            ],
+            [KeyboardButton(text="Сгенерировать промокоды (trial)")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 USER_REPLY_KEYBOARD = ReplyKeyboardMarkup(
@@ -118,8 +138,9 @@ async def apply_trial_promo(message: Message, code: str, db: DB) -> bool:
     return True
 
 
-async def send_admin_menu(m: Message, db: DB):
-    """Отправить основное админское меню со сводкой."""
+async def build_admin_summary(db: DB) -> str:
+    """Сформировать текст сводки для администратора."""
+
     chat_username = await db.get_target_chat_username()
     chat_id = await db.get_target_chat_id()
     if chat_id is None:
@@ -129,17 +150,39 @@ async def send_admin_menu(m: Message, db: DB):
             chat_info = f"Чат привязан: id {chat_id}"
         else:
             chat_info = f"Чат привязан: {chat_username} (id {chat_id})"
-    text = (
-        f"{chat_info}\n\n"
-        "/set_trial_days <d>\n"
-        "/set_paid_only <user_id> <on|off>\n"
-        "/set_autorenew <user_id> <on|off>\n"
-        "/bypass <user_id> <on|off>\n"
-        "/price_list\n"
-        "/invite <user_id> [hours]\n"
-        "/generate_trial_codes <count> <days> [ttl_days]\n"
-    )
-    await m.answer(text, reply_markup=ADMIN_KEYBOARD)
+
+    trial_days = await db.get_trial_days(config.TRIAL_DAYS)
+    auto_renew_default = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
+    auto_renew_text = "включено" if auto_renew_default else "выключено"
+    prices = await db.get_prices(config.PRICES)
+    if prices:
+        price_lines = [
+            f"{months} мес: {price}₽" for months, price in sorted(prices.items())
+        ]
+        price_text = "Прайс-лист:\n" + "\n".join(price_lines)
+    else:
+        price_text = "Прайс-лист пока пуст"
+
+    lines = [
+        chat_info,
+        "",
+        f"Пробный период: {trial_days} дн.",
+        f"Автопродление по умолчанию: {auto_renew_text}",
+        "",
+        price_text,
+        "",
+        "Используйте кнопки ниже для управления настройками.",
+    ]
+    return "\n".join(lines)
+
+
+async def send_admin_menu(m: Message, db: DB):
+    """Отправить основное админское меню со сводкой."""
+
+    summary = await build_admin_summary(db)
+    auto_renew_default = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
+    kb = build_admin_keyboard(auto_renew_default)
+    await m.answer(summary, reply_markup=kb)
 
 
 def build_autorenew_keyboard(current_flag: bool) -> InlineKeyboardMarkup:
@@ -373,6 +416,217 @@ async def admin_bind_chat_username(m: Message, bot: Bot, db: DB, state: FSMConte
     await m.answer(f"Чат {stored_username} (id {chat.id}) успешно привязан.")
     await send_admin_menu(m, db)
 
+
+@router.message(F.text == "Показать настройки")
+async def admin_show_settings_button(m: Message, db: DB):
+    if not is_super_admin(m.from_user.id):
+        return
+    summary = await build_admin_summary(db)
+    auto_renew_default = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
+    kb = build_admin_keyboard(auto_renew_default)
+    await m.answer(summary, reply_markup=kb)
+
+
+@router.message(F.text == "Установить пробный период")
+async def admin_set_trial_button(m: Message, state: FSMContext, db: DB):
+    if not is_super_admin(m.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_trial_days)
+    await m.answer(
+        "Пришлите количество дней пробного периода (целое число > 0). Для отмены отправьте 'отмена'.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(AdminStates.waiting_trial_days)
+async def admin_set_trial_days_state(m: Message, state: FSMContext, db: DB):
+    if not is_super_admin(m.from_user.id):
+        await state.clear()
+        return
+    text = (m.text or "").strip()
+    if text.lower() in {"/cancel", "отмена"}:
+        await state.clear()
+        await m.answer("Установка пробного периода отменена.")
+        await send_admin_menu(m, db)
+        return
+    if not text.isdigit():
+        await m.answer("Нужно указать целое число дней. Попробуйте снова или отправьте 'отмена'.")
+        return
+    days = int(text)
+    if days <= 0:
+        await m.answer("Количество дней должно быть положительным. Попробуйте снова или отправьте 'отмена'.")
+        return
+    await db.set_trial_days(days)
+    await state.clear()
+    await m.answer(f"Пробный период обновлён: {days} дн.")
+    await send_admin_menu(m, db)
+
+
+def parse_prices_payload(text: str) -> Optional[dict[int, int]]:
+    """Распарсить ввод прайса формата 1=990, 3=2700."""
+
+    cleaned_text = text.replace("\n", " ")
+    tokens = [token for token in re.split(r"[\s,;]+", cleaned_text) if token]
+    if not tokens:
+        return None
+    prices: dict[int, int] = {}
+    for token in tokens:
+        if "=" not in token:
+            return None
+        left, right = token.split("=", 1)
+        try:
+            months = int(left)
+            price = int(right)
+        except ValueError:
+            return None
+        if months <= 0 or price <= 0:
+            return None
+        prices[months] = price
+    return prices
+
+
+@router.message(F.text == "Редактировать цены")
+async def admin_edit_prices_button(m: Message, state: FSMContext, db: DB):
+    if not is_super_admin(m.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_prices)
+    current_prices = await db.get_prices(config.PRICES)
+    if current_prices:
+        current_lines = [
+            f"{months}={price}" for months, price in sorted(current_prices.items())
+        ]
+        current_text = ", ".join(current_lines)
+    else:
+        current_text = "не задан"
+    await m.answer(
+        "Пришлите пары вида '<месяцев>=<цена>' через пробел или запятую. Например: '1=990 3=2700'."
+        " Для отмены отправьте 'отмена'."
+        f"\nТекущий прайс: {current_text}",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(AdminStates.waiting_prices)
+async def admin_edit_prices_state(m: Message, state: FSMContext, db: DB):
+    if not is_super_admin(m.from_user.id):
+        await state.clear()
+        return
+    text = (m.text or "").strip()
+    if text.lower() in {"/cancel", "отмена"}:
+        await state.clear()
+        await m.answer("Редактирование прайса отменено.")
+        await send_admin_menu(m, db)
+        return
+    prices = parse_prices_payload(text)
+    if not prices:
+        await m.answer(
+            "Не удалось разобрать ввод. Используйте формат '1=990 3=2700'."
+            " Попробуйте снова или отправьте 'отмена'."
+        )
+        return
+    await db.set_prices(prices)
+    await state.clear()
+    await m.answer("Прайс обновлён.")
+    await send_admin_menu(m, db)
+
+
+async def create_trial_codes_message(
+    db: DB, count: int, trial_days: int, ttl_days: Optional[int]
+) -> Tuple[bool, str]:
+    """Создать промокоды и вернуть результат для ответа."""
+
+    expires_at: Optional[int] = None
+    if ttl_days is not None:
+        expires_at = int((datetime.utcnow() + timedelta(days=ttl_days)).timestamp())
+
+    codes: list[str] = []
+    attempts = 0
+    max_attempts = max(count * 5, 10)
+    while len(codes) < count and attempts < max_attempts:
+        attempts += 1
+        code = generate_promo_code()
+        try:
+            await db.create_promo_code(
+                code=code,
+                code_type="trial",
+                expires_at=expires_at,
+                max_uses=1,
+                per_user_limit=1,
+                trial_days=trial_days,
+            )
+            codes.append(code)
+        except ValueError:
+            continue
+    if not codes:
+        return False, "Не удалось создать промокоды. Попробуйте ещё раз."
+    lines = [f"Создано {len(codes)} промокодов на {trial_days} дн."]
+    if len(codes) < count:
+        lines.append("Не удалось получить полное количество. Попробуйте повторить операцию.")
+    if expires_at:
+        expire_dt = datetime.utcfromtimestamp(expires_at)
+        lines.append(f"Коды действуют до {expire_dt} UTC.")
+    lines.append("Коды:\n" + "\n".join(codes))
+    return True, "\n\n".join(lines)
+
+
+@router.message(F.text == "Сгенерировать промокоды (trial)")
+async def admin_generate_trial_button(m: Message, state: FSMContext):
+    if not is_super_admin(m.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_trial_promo)
+    await m.answer(
+        "Пришлите параметры в формате '<кол-во> <дней_пробного> [срок_кода_в_днях]'."
+        " Например: '5 7 30'. Для отмены отправьте 'отмена'.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(AdminStates.waiting_trial_promo)
+async def admin_generate_trial_state(m: Message, state: FSMContext, db: DB):
+    if not is_super_admin(m.from_user.id):
+        await state.clear()
+        return
+    text = (m.text or "").strip()
+    if text.lower() in {"/cancel", "отмена"}:
+        await state.clear()
+        await m.answer("Создание промокодов отменено.")
+        await send_admin_menu(m, db)
+        return
+    parts = text.split()
+    if len(parts) < 2 or len(parts) > 3 or not all(part.isdigit() for part in parts):
+        await m.answer(
+            "Нужно указать два или три числа: '<кол-во> <дней_пробного> [срок_кода_в_днях]'."
+            " Попробуйте снова или отправьте 'отмена'."
+        )
+        return
+    count = int(parts[0])
+    trial_days = int(parts[1])
+    ttl_days = int(parts[2]) if len(parts) == 3 else None
+    if count <= 0 or trial_days <= 0 or (ttl_days is not None and ttl_days <= 0):
+        await m.answer(
+            "Все параметры должны быть положительными числами. Попробуйте снова или отправьте 'отмена'."
+        )
+        return
+    if count > 100:
+        await m.answer("За один раз можно создать не более 100 кодов. Попробуйте снова.")
+        return
+    ok, message = await create_trial_codes_message(db, count, trial_days, ttl_days)
+    await state.clear()
+    await m.answer(message)
+    await send_admin_menu(m, db)
+
+
+@router.message(F.text.regexp(r"^Автопродление по умолчанию"))
+async def admin_toggle_autorenew_default(m: Message, db: DB):
+    if not is_super_admin(m.from_user.id):
+        return
+    current_flag = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
+    new_flag = not current_flag
+    await db.set_auto_renew_default(new_flag)
+    status_text = "включено" if new_flag else "выключено"
+    await m.answer(f"Автопродление по умолчанию теперь {status_text}.")
+    await send_admin_menu(m, db)
+
 @router.message(Command("set_trial_days"))
 async def cmd_set_trial_days(m: Message, db: DB):
     if not is_super_admin(m.from_user.id):
@@ -470,7 +724,7 @@ async def cmd_generate_trial_codes(m: Message, db: DB):
     if count > 100:
         await m.answer("За один раз можно создать не более 100 кодов.")
         return
-    expires_at: Optional[int] = None
+    ttl_days: Optional[int] = None
     if len(args) > 3:
         if not args[3].isdigit():
             await m.answer("Третий аргумент должен быть числом дней действия кода.")
@@ -479,36 +733,8 @@ async def cmd_generate_trial_codes(m: Message, db: DB):
         if ttl_days <= 0:
             await m.answer("Срок действия кода должен быть положительным.")
             return
-        expires_at = int((datetime.utcnow() + timedelta(days=ttl_days)).timestamp())
-    codes: list[str] = []
-    attempts = 0
-    max_attempts = count * 5
-    while len(codes) < count and attempts < max_attempts:
-        attempts += 1
-        code = generate_promo_code()
-        try:
-            await db.create_promo_code(
-                code=code,
-                code_type="trial",
-                expires_at=expires_at,
-                max_uses=1,
-                per_user_limit=1,
-                trial_days=trial_days,
-            )
-            codes.append(code)
-        except ValueError:
-            continue
-    if not codes:
-        await m.answer("Не удалось создать промокоды. Попробуйте ещё раз.")
-        return
-    lines = [f"Создано {len(codes)} промокодов на {trial_days} дн."]
-    if len(codes) < count:
-        lines.append("Не удалось получить полное количество. Попробуйте повторить команду.")
-    if expires_at:
-        expire_dt = datetime.utcfromtimestamp(expires_at)
-        lines.append(f"Коды действуют до {expire_dt} UTC.")
-    lines.append("Коды:\n" + "\n".join(codes))
-    await m.answer("\n\n".join(lines))
+    ok, message = await create_trial_codes_message(db, count, trial_days, ttl_days)
+    await m.answer(message)
 
 
 # ==== Callback-кнопки ====
