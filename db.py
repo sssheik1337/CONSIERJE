@@ -1,7 +1,7 @@
 import aiosqlite
 import json
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -18,6 +18,27 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS promo_codes (
+    code TEXT PRIMARY KEY,
+    code_type TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    max_uses INTEGER,
+    used_count INTEGER NOT NULL DEFAULT 0,
+    per_user_limit INTEGER NOT NULL DEFAULT 1,
+    trial_days INTEGER,
+    payload TEXT
+);
+
+CREATE TABLE IF NOT EXISTS promo_redemptions (
+    code TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0,
+    last_redeemed_at INTEGER,
+    PRIMARY KEY (code, user_id),
+    FOREIGN KEY (code) REFERENCES promo_codes(code) ON DELETE CASCADE
 );
 """
 
@@ -172,3 +193,153 @@ class DB:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM users WHERE expires_at<? AND bypass=0", (now_ts,))
             return await cur.fetchall()
+
+    async def grant_trial_days(
+        self,
+        user_id: int,
+        days: int,
+        now_ts: int,
+        auto_renew_default: bool,
+        bypass: bool,
+    ):
+        """Выдать или продлить пробный период на указанное количество дней."""
+
+        delta = int(timedelta(days=days).total_seconds())
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT expires_at, bypass FROM users WHERE user_id=?", (user_id,))
+            row = await cur.fetchone()
+            if row:
+                current_exp = row["expires_at"] or now_ts
+                new_exp = max(current_exp, now_ts) + delta
+                await db.execute(
+                    "UPDATE users SET expires_at=?, paid_only=0 WHERE user_id=?",
+                    (new_exp, user_id),
+                )
+            else:
+                started_at = now_ts
+                expires_at = now_ts + delta
+                await db.execute(
+                    "INSERT INTO users(user_id, started_at, expires_at, auto_renew, paid_only, bypass) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        user_id,
+                        started_at,
+                        expires_at,
+                        1 if auto_renew_default else 0,
+                        0,
+                        1 if bypass else 0,
+                    ),
+                )
+            await db.commit()
+
+    async def create_promo_code(
+        self,
+        code: str,
+        code_type: str,
+        expires_at: Optional[int],
+        max_uses: Optional[int],
+        per_user_limit: int,
+        trial_days: Optional[int] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ):
+        """Создать промокод с заданными параметрами."""
+
+        normalized_code = code.strip().upper()
+        if not normalized_code:
+            raise ValueError("Код не может быть пустым.")
+        if per_user_limit <= 0:
+            raise ValueError("Лимит на пользователя должен быть положительным.")
+        payload_json = json.dumps(payload) if payload else None
+        created_at = int(datetime.utcnow().timestamp())
+        async with aiosqlite.connect(self.path) as db:
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO promo_codes(code, code_type, created_at, expires_at, max_uses, used_count, per_user_limit, trial_days, payload)
+                    VALUES(?, ?, ?, ?, ?, 0, ?, ?, ?)
+                    """,
+                    (
+                        normalized_code,
+                        code_type,
+                        created_at,
+                        expires_at,
+                        max_uses,
+                        per_user_limit,
+                        trial_days,
+                        payload_json,
+                    ),
+                )
+                await db.commit()
+            except aiosqlite.IntegrityError as err:
+                raise ValueError("Такой промокод уже существует.") from err
+
+    async def redeem_promo_code(
+        self, code: str, user_id: int, now_ts: int
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Погасить промокод, проверяя сроки и лимиты."""
+
+        normalized_code = code.strip().upper()
+        if not normalized_code:
+            return False, "Нужно указать промокод.", None
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN")
+            cur = await db.execute(
+                "SELECT * FROM promo_codes WHERE code=?", (normalized_code,)
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return False, "Такого промокода нет.", None
+            expires_at = row["expires_at"]
+            if expires_at and expires_at < now_ts:
+                await db.rollback()
+                return False, "Срок действия промокода истёк.", None
+            max_uses = row["max_uses"]
+            used_count = row["used_count"] or 0
+            if max_uses is not None and max_uses > 0 and used_count >= max_uses:
+                await db.rollback()
+                return False, "Промокод уже исчерпан.", None
+            per_user_limit = row["per_user_limit"] or 0
+            cur_usage = await db.execute(
+                "SELECT uses FROM promo_redemptions WHERE code=? AND user_id=?",
+                (normalized_code, user_id),
+            )
+            usage_row = await cur_usage.fetchone()
+            if usage_row and per_user_limit and usage_row["uses"] >= per_user_limit:
+                await db.rollback()
+                return False, "Вы уже использовали этот промокод.", None
+            if usage_row:
+                new_uses = usage_row["uses"] + 1
+                await db.execute(
+                    "UPDATE promo_redemptions SET uses=?, last_redeemed_at=? WHERE code=? AND user_id=?",
+                    (new_uses, now_ts, normalized_code, user_id),
+                )
+            else:
+                await db.execute(
+                    "INSERT INTO promo_redemptions(code, user_id, uses, last_redeemed_at) VALUES(?, ?, 1, ?)",
+                    (normalized_code, user_id, now_ts),
+                )
+            await db.execute(
+                "UPDATE promo_codes SET used_count = used_count + 1 WHERE code=?",
+                (normalized_code,),
+            )
+            await db.commit()
+        payload_raw = row["payload"]
+        payload: Dict[str, Any] = {}
+        if payload_raw:
+            try:
+                payload = json.loads(payload_raw)
+            except json.JSONDecodeError:
+                payload = {}
+        result: Dict[str, Any] = {
+            "code": row["code"],
+            "code_type": row["code_type"],
+            "expires_at": expires_at,
+            "max_uses": max_uses,
+            "used_count": used_count + 1,
+            "per_user_limit": per_user_limit,
+            "trial_days": row["trial_days"],
+            "payload": payload,
+        }
+        return True, "", result

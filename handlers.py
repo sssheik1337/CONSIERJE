@@ -12,6 +12,8 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from datetime import datetime, timedelta
+import secrets
+from typing import Optional
 from config import config
 from db import DB
 from payments import process_payment
@@ -30,6 +32,8 @@ class AdminStates(StatesGroup):
 class UserStates(StatesGroup):
     """Состояния пользователя для диалогов по кнопкам."""
 
+    waiting_promo_code = State()
+
 
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Привязать чат")]],
@@ -43,6 +47,7 @@ USER_REPLY_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(text="Статус подписки")],
         [KeyboardButton(text="Продлить подписку")],
         [KeyboardButton(text="Настроить автопродление")],
+        [KeyboardButton(text="Ввести промокод")],
     ],
     resize_keyboard=True,
 )
@@ -66,6 +71,53 @@ def build_user_inline_keyboard(auto_renew: bool) -> InlineKeyboardMarkup:
     )
 
 
+def generate_promo_code(length: int = 10) -> str:
+    """Сгенерировать промокод из удобочитаемых символов."""
+
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+async def apply_trial_promo(message: Message, code: str, db: DB) -> bool:
+    """Проверить и активировать промокод на пробный период."""
+
+    normalized = (code or "").strip()
+    if not normalized:
+        await message.answer("Промокод не должен быть пустым.")
+        return False
+    user_id = message.from_user.id
+    now_ts = int(datetime.utcnow().timestamp())
+    ok, error, details = await db.redeem_promo_code(normalized, user_id, now_ts)
+    if not ok:
+        await message.answer(error)
+        return False
+    if (details or {}).get("code_type") != "trial":
+        await message.answer("Этот промокод не даёт пробный период.")
+        return False
+    trial_days_raw = details.get("trial_days") if details else None
+    try:
+        trial_days = int(trial_days_raw)
+    except (TypeError, ValueError):
+        await message.answer(
+            "Для этого промокода не настроен срок пробного периода. Обратитесь к администратору."
+        )
+        return False
+    auto_renew_default = await db.get_auto_renew_default(config.AUTO_RENEW_DEFAULT)
+    bypass = user_id in config.ADMIN_BYPASS_IDS
+    await db.grant_trial_days(user_id, trial_days, now_ts, auto_renew_default, bypass)
+    row = await db.get_user(user_id)
+    if row and row["expires_at"]:
+        dt = datetime.utcfromtimestamp(row["expires_at"])
+        await message.answer(
+            f"Промокод активирован! Подписка действует до: {dt} UTC."
+        )
+    else:
+        await message.answer(
+            "Промокод активирован. Выполните /start, если ещё не регистрировались."
+        )
+    return True
+
+
 async def send_admin_menu(m: Message, db: DB):
     """Отправить основное админское меню со сводкой."""
     chat_username = await db.get_target_chat_username()
@@ -85,6 +137,7 @@ async def send_admin_menu(m: Message, db: DB):
         "/bypass <user_id> <on|off>\n"
         "/price_list\n"
         "/invite <user_id> [hours]\n"
+        "/generate_trial_codes <count> <days> [ttl_days]\n"
     )
     await m.answer(text, reply_markup=ADMIN_KEYBOARD)
 
@@ -180,6 +233,15 @@ async def cmd_start(m: Message, db: DB):
     user_menu = build_user_inline_keyboard(auto_renew_flag)
     await m.answer("Выберите действие:", reply_markup=user_menu)
 
+
+@router.message(Command("use"))
+async def cmd_use(m: Message, db: DB):
+    args = (m.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await m.answer("Формат: /use <промокод>.")
+        return
+    await apply_trial_promo(m, args[1], db)
+
 @router.message(Command("status"))
 async def cmd_status(m: Message, db: DB):
     await send_subscription_status(m, db)
@@ -216,6 +278,42 @@ async def user_autorenew_menu_message(m: Message, db: DB):
         return
     kb = build_autorenew_keyboard(bool(row["auto_renew"]))
     await m.answer("Выберите состояние автопродления:", reply_markup=kb)
+
+
+@router.message(F.text == "Ввести промокод")
+async def user_enter_promo_button(m: Message, state: FSMContext):
+    await state.set_state(UserStates.waiting_promo_code)
+    await m.answer(
+        "Пришлите промокод одним сообщением. Для отмены отправьте 'отмена'.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(UserStates.waiting_promo_code)
+async def user_waiting_promo_code(m: Message, db: DB, state: FSMContext):
+    text = (m.text or "").strip()
+    if text.lower() in {"/cancel", "отмена"}:
+        await state.clear()
+        await m.answer(
+            "Ввод промокода отменён.", reply_markup=USER_REPLY_KEYBOARD
+        )
+        return
+    if not text:
+        await m.answer(
+            "Промокод не должен быть пустым. Попробуйте ещё раз или отправьте 'отмена'."
+        )
+        return
+    success = await apply_trial_promo(m, text, db)
+    if success:
+        await state.clear()
+        await m.answer(
+            "Можете выбрать следующее действие из меню.",
+            reply_markup=USER_REPLY_KEYBOARD,
+        )
+    else:
+        await m.answer(
+            "Попробуйте ещё раз или отправьте 'отмена'."
+        )
 
 
 def build_purchase_keyboard(prices: dict[int, int]) -> InlineKeyboardMarkup:
@@ -352,6 +450,65 @@ async def cmd_invite(m: Message, bot: Bot, db: DB):
         await m.answer("Отправил пользователю.")
     except Exception as e:
         await m.answer("Не удалось создать/отправить ссылку.")
+
+
+@router.message(Command("generate_trial_codes"))
+async def cmd_generate_trial_codes(m: Message, db: DB):
+    if not is_super_admin(m.from_user.id):
+        return
+    args = (m.text or "").split()
+    if len(args) < 3 or not args[1].isdigit() or not args[2].isdigit():
+        await m.answer(
+            "Формат: /generate_trial_codes <кол-во> <дней_пробного> [срок_кода_в_днях]"
+        )
+        return
+    count = int(args[1])
+    trial_days = int(args[2])
+    if count <= 0 or trial_days <= 0:
+        await m.answer("Аргументы должны быть положительными.")
+        return
+    if count > 100:
+        await m.answer("За один раз можно создать не более 100 кодов.")
+        return
+    expires_at: Optional[int] = None
+    if len(args) > 3:
+        if not args[3].isdigit():
+            await m.answer("Третий аргумент должен быть числом дней действия кода.")
+            return
+        ttl_days = int(args[3])
+        if ttl_days <= 0:
+            await m.answer("Срок действия кода должен быть положительным.")
+            return
+        expires_at = int((datetime.utcnow() + timedelta(days=ttl_days)).timestamp())
+    codes: list[str] = []
+    attempts = 0
+    max_attempts = count * 5
+    while len(codes) < count and attempts < max_attempts:
+        attempts += 1
+        code = generate_promo_code()
+        try:
+            await db.create_promo_code(
+                code=code,
+                code_type="trial",
+                expires_at=expires_at,
+                max_uses=1,
+                per_user_limit=1,
+                trial_days=trial_days,
+            )
+            codes.append(code)
+        except ValueError:
+            continue
+    if not codes:
+        await m.answer("Не удалось создать промокоды. Попробуйте ещё раз.")
+        return
+    lines = [f"Создано {len(codes)} промокодов на {trial_days} дн."]
+    if len(codes) < count:
+        lines.append("Не удалось получить полное количество. Попробуйте повторить команду.")
+    if expires_at:
+        expire_dt = datetime.utcfromtimestamp(expires_at)
+        lines.append(f"Коды действуют до {expire_dt} UTC.")
+    lines.append("Коды:\n" + "\n".join(codes))
+    await m.answer("\n\n".join(lines))
 
 
 # ==== Callback-кнопки ====
