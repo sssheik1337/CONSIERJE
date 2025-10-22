@@ -15,7 +15,9 @@ def _parse_ids(raw: str) -> set[int]:
 class Config:
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 
-    SUPER_ADMIN_IDS: set[int] = _parse_ids(os.getenv("SUPER_ADMIN_IDS", ""))
+    SUPER_ADMIN_IDS: set[int] = field(
+        default_factory=lambda: _parse_ids(os.getenv("SUPER_ADMIN_IDS", ""))
+    )
 
     DB_PATH: str = os.getenv("DB_PATH", "./concierge.sqlite3")
     TIMEZONE: str = os.getenv("TIMEZONE", "Europe/Moscow")
