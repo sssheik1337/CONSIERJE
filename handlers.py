@@ -117,84 +117,134 @@ async def make_one_time_invite(
     db: DB,
     hours: int = 24,
     member_limit: int = 1,
-) -> tuple[bool, str]:
-    """Создать одноразовую ссылку или вернуть понятную ошибку."""
+) -> tuple[bool, str, str]:
+    """Создать одноразовую ссылку или вернуть причину ошибки с подсказкой."""
 
     chat_id = await db.get_target_chat_id()
     if chat_id is None:
         return (
             False,
-            "Чат не привязан. Админу: откройте Админ-панель → Привязать чат.",
+            "Чат не привязан. Откройте Админ-панель → 🔗 Привязать чат.",
+            "",
         )
 
     try:
         me = await bot.me()
         member = await bot.get_chat_member(chat_id, me.id)
+        chat = await bot.get_chat(chat_id)
     except TelegramForbiddenError:
-        return False, "Бот не состоит в чате или нет прав. Добавьте его администратором."
+        return (
+            False,
+            "Доступ запрещён. Бот не админ или сняты права.",
+            "Назначьте бота админом и дайте «Пригласительные ссылки».",
+        )
     except TelegramBadRequest as err:
         err_text = str(err)
         lower = err_text.lower()
         if "chat not found" in lower or "chat_not_found" in lower:
-            return False, "Чат не найден. Привяжите чат заново."
-        logging.exception("Ошибка при проверке статуса бота", exc_info=err)
-        return False, f"Не удалось проверить права: {err_text}"
+            return (
+                False,
+                "Чат недоступен боту.",
+                "Привяжите чат заново.",
+            )
+        logging.exception("Ошибка при получении сведений о боте", exc_info=err)
+        return (
+            False,
+            "Не удалось проверить права.",
+            err_text,
+        )
     except Exception as err:
-        logging.exception("Не удалось получить статус бота", exc_info=err)
-        return False, "Не удалось проверить права. Попробуйте позже."
+        logging.exception("Не удалось получить сведения о боте", exc_info=err)
+        return (
+            False,
+            "Не удалось проверить права.",
+            "См. логи.",
+        )
 
     status_raw = getattr(member, "status", "")
-    if hasattr(status_raw, "value"):
-        status_value = status_raw.value
-    else:
-        status_value = str(status_raw)
+    status_value = status_raw.value if hasattr(status_raw, "value") else str(status_raw)
     if status_value not in {"administrator", "creator"}:
-        return False, "Бот не админ. Выдайте права администратора."
+        return (
+            False,
+            "Бот не админ в целевом чате.",
+            "Выдайте боту права администратора.",
+        )
 
-    can_invite_attr = getattr(member, "can_invite_users", None)
-    if can_invite_attr is False:
-        return False, "Недостаточно прав. Включите разрешение «Пригласительные ссылки» у бота."
+    if chat.type == "supergroup":
+        can_invite_attr = getattr(member, "can_invite_users", None)
+        if can_invite_attr is False:
+            return (
+                False,
+                "Нет права «Пригласительные ссылки».",
+                "Включите его в правах бота.",
+            )
 
     expire_ts = int((datetime.utcnow() + timedelta(hours=hours)).timestamp())
     try:
         link = await bot.create_chat_invite_link(
             chat_id,
-            member_limit=member_limit,
+            member_limit=int(member_limit),
             expire_date=expire_ts,
         )
-        return True, link.invite_link
-    except (TelegramBadRequest, TelegramForbiddenError) as err:
+        return True, link.invite_link, ""
+    except TelegramForbiddenError:
+        return (
+            False,
+            "Доступ запрещён. Бот не админ или сняты права.",
+            "Назначьте бота админом и дайте «Пригласительные ссылки».",
+        )
+    except TelegramBadRequest as err:
         err_text = str(err)
         lower = err_text.lower()
-        if "username_not_occupied" in lower or "chat not found" in lower or "chat_not_found" in lower:
-            return False, "Чат не найден. Привяжите чат заново."
-
-        rights_message = "Недостаточно прав. Включите разрешение «Пригласительные ссылки» у бота."
-        if (
-            "not enough rights" in lower
-            or "chat_admin_required" in lower
-            or "need administrator rights" in lower
-            or "chat admin required" in lower
-        ):
+        if "chat_admin_required" in lower or "not enough rights" in lower:
             try:
                 fallback = await bot.export_chat_invite_link(chat_id)
             except (TelegramBadRequest, TelegramForbiddenError):
-                return False, rights_message
+                return (
+                    False,
+                    "Недостаточно прав для создания одноразовой ссылки.",
+                    "Дайте право «Пригласительные ссылки».",
+                )
             except Exception as export_err:
                 logging.exception("Ошибка при получении постоянной ссылки", exc_info=export_err)
-                return False, rights_message
-            warning = (
-                "⚠️ Это постоянная ссылка, не одноразовая. Используйте только временно. "
-                "Включите право «Пригласительные ссылки» у бота, чтобы выдавать одноразовые ссылки.\n"
-                f"{fallback}"
+                return (
+                    False,
+                    "Недостаточно прав для создания одноразовой ссылки.",
+                    "Дайте право «Пригласительные ссылки».",
+                )
+            return (
+                False,
+                "⚠️ Можно выдать *постоянную* ссылку (неодноразовая). Разрешите «Пригласительные ссылки», чтобы выдавать одноразовые.",
+                fallback,
             )
-            return True, warning
-
-        logging.exception("Не удалось создать ссылку", exc_info=err)
-        return False, f"Не удалось создать ссылку: {err_text}"
+        if "user_not_participant" in lower or "chat not found" in lower or "chat_not_found" in lower:
+            return (
+                False,
+                "Чат недоступен боту.",
+                "Привяжите чат заново.",
+            )
+        return (
+            False,
+            f"Не удалось создать ссылку: {err_text}",
+            "Проверьте права и тип чата.",
+        )
     except Exception as err:
         logging.exception("Неожиданная ошибка при создании ссылки", exc_info=err)
-        return False, "Не удалось создать ссылку. Попробуйте позже."
+        return (
+            False,
+            "Не удалось создать ссылку.",
+            "См. логи.",
+        )
+
+
+def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMarkup:
+    """Создать инлайн-кнопку для перехода по ссылке."""
+
+    builder = InlineKeyboardBuilder()
+    text = "🔗 Войти в канал" if not permanent else "⚠️ Постоянная ссылка"
+    builder.button(text=text, url=link)
+    builder.adjust(1)
+    return builder.as_markup()
 
 
 def build_user_menu_keyboard(
@@ -632,25 +682,34 @@ async def handle_toggle_autorenew(callback: CallbackQuery, db: DB) -> None:
 async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     """Выдать одноразовую ссылку в целевой чат."""
 
-    ok, info = await make_one_time_invite(bot, db)
+    ok, info, hint = await make_one_time_invite(bot, db)
     if callback.message:
-        if ok and not info.startswith("⚠️"):
-            lines = [
-                "🔗 Ваша ссылка (действует 24ч, одноразовая):",
-                info,
-            ]
+        if ok:
+            await callback.message.answer(
+                escape_md("🔗 Ссылка готова. Нажмите кнопку ниже."),
+                reply_markup=invite_button_markup(info),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
         else:
-            lines = info.split("\n")
-        text = "\n".join(escape_md(line) for line in lines if line)
-        await callback.message.answer(
-            text,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
+            hint_is_link = bool(hint) and hint.lower().startswith(("http://", "https://"))
+            text_lines = [info]
+            if hint and not hint_is_link:
+                text_lines.append(hint)
+            text = "\n".join(escape_md(line) for line in text_lines if line)
+            reply_markup = (
+                invite_button_markup(hint, permanent=True) if hint_is_link else None
+            )
+            await callback.message.answer(
+                text or escape_md("❗ Не удалось создать ссылку."),
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
     if ok:
         await callback.answer()
     else:
-        await callback.answer("Ошибка, проверьте сообщение.", show_alert=True)
+        await callback.answer("Не удалось создать ссылку.", show_alert=True)
 
 
 @router.callback_query(F.data == "promo:enter")
@@ -846,34 +905,40 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         lines = base_lines + [
             "• Статус: нет доступа",
             "• Пригласительные ссылки: ❌",
-            "• Рекомендация: дайте боту право «Пригласительные ссылки» и повторите.",
+            "• Рекомендация: назначьте бота админом и включите «Пригласительные ссылки».",
         ]
     except TelegramBadRequest as err:
         err_text = str(err)
         lines = base_lines + [
             f"• Статус: ошибка ({err_text})",
             "• Пригласительные ссылки: ❌",
-            "• Рекомендация: дайте боту право «Пригласительные ссылки» и повторите.",
+            "• Рекомендация: откройте права бота → включите «Пригласительные ссылки».",
         ]
     except Exception as err:
         logging.exception("Ошибка при проверке прав бота", exc_info=err)
         lines = base_lines + [
             "• Статус: не удалось проверить",
             "• Пригласительные ссылки: ❌",
-            "• Рекомендация: дайте боту право «Пригласительные ссылки» и повторите.",
+            "• Рекомендация: проверьте права администратора и попробуйте снова.",
         ]
     else:
         status_raw = getattr(member, "status", "unknown")
-        if hasattr(status_raw, "value"):
-            status_display = status_raw.value
+        status_display = status_raw.value if hasattr(status_raw, "value") else str(status_raw)
+        can_invite_attr = getattr(member, "can_invite_users", None)
+        if can_invite_attr is None:
+            invite_flag = "—"
         else:
-            status_display = str(status_raw)
-        can_invite_attr = getattr(member, "can_invite_users", True)
-        invite_ok = True if can_invite_attr is None else bool(can_invite_attr)
+            invite_flag = "✅" if can_invite_attr else "❌"
+        if status_display not in {"administrator", "creator"}:
+            recommendation = "• Рекомендация: назначьте бота администратором."
+        elif can_invite_attr is False:
+            recommendation = "• Рекомендация: откройте права бота → включите «Пригласительные ссылки»."
+        else:
+            recommendation = "• Рекомендация: всё в порядке."
         lines = base_lines + [
             f"• Статус: {status_display}",
-            f"• Пригласительные ссылки: {inline_emoji(invite_ok)}",
-            "• Рекомендация: дайте боту право «Пригласительные ссылки» и повторите.",
+            f"• Пригласительные ссылки: {invite_flag}",
+            recommendation,
         ]
 
     text = "\n".join(escape_md(line) for line in lines)
