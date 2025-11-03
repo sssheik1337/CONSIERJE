@@ -21,7 +21,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import config
+from config import config, get_docs_map
 from db import DB
 from payments import process_payment
 
@@ -214,7 +214,7 @@ async def make_one_time_invite(
                 )
             return (
                 False,
-                "⚠️ Можно выдать *постоянную* ссылку (неодноразовая). Разрешите «Пригласительные ссылки», чтобы выдавать одноразовые.",
+                "⚠️ Можно выдать постоянную ссылку (неодноразовая). Разрешите «Пригласительные ссылки», чтобы выдавать одноразовые.",
                 fallback,
             )
         if "user_not_participant" in lower or "chat not found" in lower or "chat_not_found" in lower:
@@ -247,6 +247,43 @@ def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMa
     return builder.as_markup()
 
 
+def build_docs_message() -> tuple[str, str]:
+    """Сформировать текст и режим форматирования для списка документов."""
+
+    docs = get_docs_map()
+    items = [
+        ("Согласие на рассылку", docs.get("newsletter", "")),
+        ("Согласие на обработку ПД", docs.get("pd_consent", "")),
+        ("Политика обработки ПД", docs.get("pd_policy", "")),
+        ("Оферта", docs.get("offer", "")),
+    ]
+    lines = ["📄 Документы:"]
+    for idx, (title, url) in enumerate(items, start=1):
+        if url:
+            lines.append(f"{idx}) [{title}]({url})")
+        else:
+            lines.append(f"{idx}) {title} — не указан")
+    text = "\n".join(lines)
+    return text, "Markdown"
+
+
+def build_welcome_with_legal() -> tuple[str, InlineKeyboardMarkup]:
+    """Подготовить приветствие с обязательным согласием и клавиатурой."""
+
+    docs_text, _ = build_docs_message()
+    text = (
+        "👋 Добро пожаловать!\n"
+        "Прежде чем продолжить, ознакомьтесь с документами ниже.\n"
+        "_Нажимая «✅ Продолжить», вы подтверждаете согласие._\n\n"
+        f"{docs_text}"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Продолжить", callback_data="legal:accept")
+    builder.button(text="📄 Открыть документы", callback_data="legal:docs")
+    builder.adjust(1)
+    return text, builder.as_markup()
+
+
 def build_user_menu_keyboard(
     auto_on: bool, is_admin: bool, price_months: list[int]
 ) -> InlineKeyboardMarkup:
@@ -264,6 +301,7 @@ def build_user_menu_keyboard(
     )
     builder.button(text="🔗 Получить ссылку", callback_data="invite:once")
     builder.button(text="🏷️ Ввести промокод", callback_data="promo:enter")
+    builder.button(text="📄 Документы", callback_data="docs:open")
     if is_admin:
         builder.button(text="🛠️ Админ-панель", callback_data="admin:open")
     builder.adjust(2, 2, 2, 1)
@@ -604,12 +642,29 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
     now_ts = int(datetime.utcnow().timestamp())
     auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
     trial_days = await db.get_trial_days_global(DEFAULT_TRIAL_DAYS)
+    existing_user = await db.get_user(user_id)
     paid_only = True
     if await has_trial_coupon(db, user_id):
         paid_only = False
-    await db.upsert_user(user_id, now_ts, trial_days, auto_default, paid_only)
-    if not paid_only:
-        await db.set_paid_only(user_id, False)
+    if existing_user is None:
+        await db.upsert_user(user_id, now_ts, trial_days, auto_default, paid_only)
+        user = await db.get_user(user_id)
+    else:
+        user = existing_user
+        if not paid_only and user and user["paid_only"]:
+            await db.set_paid_only(user_id, False)
+            user = await db.get_user(user_id)
+    if not user:
+        return
+    if not await db.has_accepted_legal(user_id):
+        text, markup = build_welcome_with_legal()
+        await message.answer(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+        return
     menu = await get_user_menu(db, user_id)
     await message.answer(
         escape_md(START_TEXT),
@@ -617,6 +672,185 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
+
+
+@router.callback_query(F.data == "legal:docs")
+async def legal_show_docs(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    """Показать документы во время подтверждения согласия."""
+
+    if callback.message:
+        data = await state.get_data()
+        prev_chat = data.get("legal_doc_chat_id")
+        prev_message = data.get("legal_doc_message_id")
+        if prev_chat and prev_message:
+            try:
+                await bot.delete_message(prev_chat, prev_message)
+            except TelegramBadRequest:
+                pass
+        text, parse_mode = build_docs_message()
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⬅️ Назад", callback_data="legal:back")
+        builder.adjust(1)
+        markup = builder.as_markup()
+        sent = None
+        try:
+            sent = await callback.message.answer(
+                text,
+                reply_markup=markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+            )
+        except TelegramBadRequest:
+            sent = await callback.message.answer(
+                text,
+                reply_markup=markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+            )
+        if sent:
+            await state.update_data(
+                legal_doc_message_id=sent.message_id,
+                legal_doc_chat_id=sent.chat.id,
+            )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "legal:back")
+async def legal_back(callback: CallbackQuery, state: FSMContext) -> None:
+    """Закрыть список документов и вернуться к согласию."""
+
+    await state.update_data(legal_doc_message_id=None, legal_doc_chat_id=None)
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            text, markup = build_welcome_with_legal()
+            try:
+                await callback.message.edit_text(
+                    text,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    text,
+                    reply_markup=markup,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "legal:accept")
+async def legal_accept(callback: CallbackQuery, bot: Bot, state: FSMContext, db: DB) -> None:
+    """Зафиксировать согласие пользователя и открыть меню."""
+
+    user_id = callback.from_user.id
+    now_ts = int(datetime.utcnow().timestamp())
+    data = await state.get_data()
+    doc_chat_id = data.get("legal_doc_chat_id")
+    doc_message_id = data.get("legal_doc_message_id")
+    if doc_chat_id and doc_message_id:
+        try:
+            await bot.delete_message(doc_chat_id, doc_message_id)
+        except TelegramBadRequest:
+            pass
+    await db.set_accepted_legal(user_id, True, now_ts)
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                "✅ Спасибо! Можете продолжить.",
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                "✅ Спасибо! Можете продолжить.",
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+    menu = await get_user_menu(db, user_id)
+    if callback.message:
+        try:
+            await callback.message.answer(
+                escape_md(START_TEXT),
+                reply_markup=menu,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        except TelegramBadRequest:
+            await bot.send_message(
+                callback.message.chat.id,
+                escape_md(START_TEXT),
+                reply_markup=menu,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+    else:
+        await bot.send_message(
+            user_id,
+            escape_md(START_TEXT),
+            reply_markup=menu,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await state.clear()
+    await callback.answer()
+
+
+@router.callback_query(F.data == "docs:open")
+async def docs_open(callback: CallbackQuery, db: DB) -> None:
+    """Показать документы из пользовательского меню."""
+
+    user_id = callback.from_user.id
+    if not await db.has_accepted_legal(user_id):
+        await callback.answer("Сначала подтвердите согласие.", show_alert=True)
+        return
+    if callback.message:
+        text, parse_mode = build_docs_message()
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⬅️ Назад", callback_data="docs:back")
+        builder.adjust(1)
+        markup = builder.as_markup()
+        try:
+            await callback.message.edit_text(
+                text,
+                reply_markup=markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                text,
+                reply_markup=markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+            )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "docs:back")
+async def docs_back(callback: CallbackQuery, db: DB) -> None:
+    """Вернуться к пользовательскому меню из раздела документов."""
+
+    if callback.message:
+        menu = await get_user_menu(db, callback.from_user.id)
+        try:
+            await callback.message.edit_text(
+                escape_md(START_TEXT),
+                reply_markup=menu,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                escape_md(START_TEXT),
+                reply_markup=menu,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("buy:months:"))
@@ -682,6 +916,9 @@ async def handle_toggle_autorenew(callback: CallbackQuery, db: DB) -> None:
 async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     """Выдать одноразовую ссылку в целевой чат."""
 
+    if not await db.has_accepted_legal(callback.from_user.id):
+        await callback.answer("Сначала подтвердите согласие.", show_alert=True)
+        return
     ok, info, hint = await make_one_time_invite(bot, db)
     if callback.message:
         if ok:
@@ -692,16 +929,20 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
                 disable_web_page_preview=True,
             )
         else:
-            hint_is_link = bool(hint) and hint.lower().startswith(("http://", "https://"))
-            text_lines = [info]
+            hint_value = hint or ""
+            hint_lower = hint_value.lower()
+            hint_is_link = hint_lower.startswith("http://") or hint_lower.startswith("https://")
+            lines = []
+            if info:
+                lines.append(escape_md(info))
             if hint and not hint_is_link:
-                text_lines.append(hint)
-            text = "\n".join(escape_md(line) for line in text_lines if line)
+                lines.append(escape_md(hint))
+            text = "\n".join(lines) or escape_md("❗ Не удалось создать ссылку.")
             reply_markup = (
-                invite_button_markup(hint, permanent=True) if hint_is_link else None
+                invite_button_markup(hint_value, permanent=True) if hint_is_link else None
             )
             await callback.message.answer(
-                text or escape_md("❗ Не удалось создать ссылку."),
+                text,
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,

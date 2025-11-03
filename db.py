@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import secrets
 from datetime import datetime, timedelta
@@ -14,7 +15,9 @@ CREATE TABLE IF NOT EXISTS users (
     started_at INTEGER,
     expires_at INTEGER,
     auto_renew INTEGER NOT NULL DEFAULT 0,
-    paid_only INTEGER NOT NULL DEFAULT 0
+    paid_only INTEGER NOT NULL DEFAULT 0,
+    accepted_legal INTEGER NOT NULL DEFAULT 0,
+    accepted_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -52,6 +55,19 @@ class DB:
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.executescript(SCHEMA)
+            for ddl in (
+                "ALTER TABLE users ADD COLUMN accepted_legal INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN accepted_at INTEGER",
+            ):
+                try:
+                    await db.execute(ddl)
+                except aiosqlite.OperationalError as err:
+                    message = str(err).lower()
+                    if "duplicate column name" in message:
+                        continue
+                    logging.exception("Ошибка при миграции таблицы users", exc_info=err)
+                except Exception as err:
+                    logging.exception("Не удалось обновить схему таблицы users", exc_info=err)
             await db.commit()
 
     async def get_user(self, user_id: int) -> Optional[Tuple]:
@@ -109,6 +125,35 @@ class DB:
                 (1 if flag else 0, user_id),
             )
             await db.commit()
+
+    async def set_accepted_legal(
+        self, user_id: int, flag: bool, ts: Optional[int] = None
+    ) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            if flag:
+                ts_value = ts if ts is not None else int(datetime.utcnow().timestamp())
+                await db.execute(
+                    "UPDATE users SET accepted_legal=1, accepted_at=? WHERE user_id=?",
+                    (ts_value, user_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE users SET accepted_legal=0, accepted_at=NULL WHERE user_id=?",
+                    (user_id,),
+                )
+            await db.commit()
+
+    async def has_accepted_legal(self, user_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT accepted_legal FROM users WHERE user_id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return False
+        return bool(row["accepted_legal"])
 
     async def set_setting(self, key: str, value: str) -> None:
         async with aiosqlite.connect(self.path) as db:
