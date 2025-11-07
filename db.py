@@ -42,11 +42,27 @@ CREATE TABLE IF NOT EXISTS coupons (
 CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
-    payment_id TEXT UNIQUE,
+    order_id TEXT,
+    payment_id TEXT,
     amount INTEGER,
     months INTEGER,
     status TEXT DEFAULT 'PENDING',
     created_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_payments_payment_id ON payments(payment_id);
+CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id);
+
+CREATE TABLE IF NOT EXISTS webhook_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payment_id TEXT,
+    order_id TEXT,
+    status TEXT,
+    terminal_key TEXT,
+    raw_json TEXT,
+    headers_json TEXT,
+    received_at INTEGER,
+    processed INTEGER DEFAULT 0
 );
 """
 
@@ -69,6 +85,7 @@ class DB:
             for ddl in (
                 "ALTER TABLE users ADD COLUMN accepted_legal INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN accepted_at INTEGER",
+                "ALTER TABLE payments ADD COLUMN order_id TEXT",
             ):
                 try:
                     await db.execute(ddl)
@@ -76,12 +93,21 @@ class DB:
                     message = str(err).lower()
                     if "duplicate column name" in message:
                         continue
-                    logging.exception("Ошибка при миграции таблицы users", exc_info=err)
-                except Exception as err:
-                    logging.exception("Не удалось обновить схему таблицы users", exc_info=err)
+                    logging.exception("Ошибка при миграции таблиц", exc_info=err)
+                except Exception as err:  # noqa: BLE001
+                    logging.exception("Не удалось обновить схему базы данных", exc_info=err)
+            try:
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_payments_payment_id ON payments(payment_id)"
+                )
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)"
+                )
+            except Exception as err:  # noqa: BLE001
+                logging.exception("Не удалось создать индексы платежей", exc_info=err)
             await db.commit()
 
-    async def get_user(self, user_id: int) -> Optional[Tuple]:
+    async def get_user(self, user_id: int) -> Optional[aiosqlite.Row]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
@@ -266,9 +292,9 @@ class DB:
 
     async def add_payment(
         self,
-        *,
         user_id: int,
         payment_id: str,
+        order_id: str,
         amount: int,
         months: int,
         status: str = "PENDING",
@@ -276,20 +302,39 @@ class DB:
         """Сохранить платёж в базе данных."""
 
         normalized_status = status.upper() if status else "PENDING"
-        created_at = int(time.time())
         async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                """
-                INSERT INTO payments (user_id, payment_id, amount, months, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(payment_id) DO UPDATE SET
-                    user_id=excluded.user_id,
-                    amount=excluded.amount,
-                    months=excluded.months,
-                    status=excluded.status
-                """,
-                (user_id, payment_id, amount, months, normalized_status, created_at),
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id FROM payments WHERE payment_id=? OR order_id=?",
+                (payment_id, order_id),
             )
+            row = await cur.fetchone()
+            if row:
+                await db.execute(
+                    """
+                    UPDATE payments
+                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?
+                    WHERE id=?
+                    """,
+                    (user_id, order_id, payment_id, amount, months, normalized_status, row["id"]),
+                )
+            else:
+                created_at = int(time.time())
+                await db.execute(
+                    """
+                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        order_id,
+                        payment_id,
+                        amount,
+                        months,
+                        normalized_status,
+                        created_at,
+                    ),
+                )
             await db.commit()
 
     async def set_payment_status(self, payment_id: str, status: str) -> bool:
@@ -306,7 +351,9 @@ class DB:
             await db.commit()
             return cur.rowcount > 0
 
-    async def get_payment_by_id(self, payment_id: str) -> Optional[aiosqlite.Row]:
+    async def get_payment_by_payment_id(
+        self, payment_id: str
+    ) -> Optional[aiosqlite.Row]:
         """Получить платёж по идентификатору PaymentId."""
 
         async with aiosqlite.connect(self.path) as db:
@@ -316,6 +363,22 @@ class DB:
                 (payment_id,),
             )
             return await cur.fetchone()
+
+    async def get_payment_by_order_id(self, order_id: str) -> Optional[aiosqlite.Row]:
+        """Получить платёж по идентификатору заказа мерчанта."""
+
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM payments WHERE order_id=?",
+                (order_id,),
+            )
+            return await cur.fetchone()
+
+    async def get_payment_by_id(self, payment_id: str) -> Optional[aiosqlite.Row]:
+        """Обратная совместимость: вернуть платёж по PaymentId."""
+
+        return await self.get_payment_by_payment_id(payment_id)
 
     async def get_latest_payment(
         self, user_id: int, status: Optional[str] = None
@@ -332,6 +395,53 @@ class DB:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(query, params)
             return await cur.fetchone()
+
+    async def log_webhook_event(
+        self,
+        payment_id: str,
+        order_id: str,
+        status: str,
+        terminal_key: str,
+        raw: dict,
+        headers: dict,
+        received_at: int,
+        processed: int = 0,
+    ) -> int:
+        """Сохранить событие вебхука и вернуть его идентификатор."""
+
+        raw_json = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        headers_json = json.dumps(headers, ensure_ascii=False, separators=(",", ":"))
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                """
+                INSERT INTO webhook_events (
+                    payment_id, order_id, status, terminal_key, raw_json, headers_json, received_at, processed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payment_id or "",
+                    order_id or "",
+                    status.upper() if status else "",
+                    terminal_key or "",
+                    raw_json,
+                    headers_json,
+                    received_at,
+                    processed,
+                ),
+            )
+            await db.commit()
+            return int(cur.lastrowid)
+
+    async def mark_webhook_processed(self, event_id: int) -> bool:
+        """Отметить событие вебхука как обработанное."""
+
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "UPDATE webhook_events SET processed=1 WHERE id=?",
+                (event_id,),
+            )
+            await db.commit()
+            return cur.rowcount > 0
 
     async def set_trial_days_global(self, days: int) -> None:
         await self.set_setting("trial_days", str(days))
@@ -399,12 +509,9 @@ class DB:
         """Создать ручной промокод, проходя валидацию и проверку на уникальность."""
 
         normalized = self._normalize_code(code)
-        if not normalized:
-            return False, "Промокод не должен быть пустым"
-        if kind != "trial":
-            return False, "Поддерживается только пробный промокод"
-        if not COUPON_CODE_PATTERN.fullmatch(normalized):
-            return False, "Разрешены латиница, цифры и дефис (4–32 символа)"
+        if not normalized or not COUPON_CODE_PATTERN.match(normalized):
+            return False, "Промокод должен состоять из 4-32 символов (A-Z, 0-9, -)"
+
         async with aiosqlite.connect(self.path) as db:
             try:
                 await db.execute(
@@ -412,29 +519,6 @@ class DB:
                     (normalized, kind),
                 )
                 await db.commit()
+                return True, normalized
             except aiosqlite.IntegrityError:
-                return False, "Код уже существует"
-        return True, normalized
-
-    async def use_coupon(self, code: str, user_id: int) -> Tuple[bool, str, Optional[str]]:
-        normalized = self._normalize_code(code)
-        if not normalized:
-            return False, "Нужно указать промокод.", None
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT code, kind, used_by FROM coupons WHERE code=?",
-                (normalized,),
-            )
-            row = await cur.fetchone()
-            if row is None:
-                return False, "Промокод не найден.", None
-            if row["used_by"] is not None:
-                return False, "Промокод уже использован.", row["kind"]
-            now_ts = int(datetime.utcnow().timestamp())
-            await db.execute(
-                "UPDATE coupons SET used_by=?, used_at=? WHERE code=?",
-                (user_id, now_ts, normalized),
-            )
-            await db.commit()
-        return True, "Промокод успешно применён.", row["kind"]
+                return False, "Такой промокод уже существует"

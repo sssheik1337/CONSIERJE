@@ -1,9 +1,16 @@
+# Подсказка по тестированию уведомлений T-Банка:
+# 1) Запустите бота — он поднимет локальный HTTP-сервер на WEBHOOK_PORT.
+# 2) Откройте туннель: ngrok http --domain=<ваш-поддомен>.ngrok-free.app <WEBHOOK_PORT>.
+# 3) Пропишите TINKOFF_NOTIFY_URL=https://<ваш-поддомен>.ngrok-free.app/tbank_notify.
+# 4) Создайте оплату и дождитесь нотификации от T-Банка.
+
 import asyncio
+import contextlib
+import hashlib
 import logging
-import os
+import time
 from datetime import datetime
-from typing import Optional, Tuple
-from urllib.parse import urlparse
+from typing import Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
@@ -16,48 +23,46 @@ from db import DB
 from handlers import router
 from scheduler import setup_scheduler
 
-
 logging.basicConfig(level=logging.INFO)
 
 
-async def handle_tbank_notify(request: web.Request) -> web.Response:
-    """Обработать уведомление от T-Bank о статусе платежа."""
+def compute_token(payload: dict, password: str) -> str:
+    """Вычислить подпись T-Банка по корневым полям."""
 
-    db: DB = request.app["db"]
-    bot: Bot = request.app["bot"]
+    items: list[tuple[str, str]] = []
+    for key, value in payload.items():
+        if key.lower() == "token":
+            continue
+        if isinstance(value, (dict, list)):
+            continue
+        if value is None:
+            continue
+        items.append((str(key), str(value)))
+    items.append(("Password", password))
+    items.sort(key=lambda item: item[0])
+    concatenated = "".join(value for _, value in items)
+    return hashlib.sha256(concatenated.encode("utf-8")).hexdigest()
+
+
+async def _notify_user_payment_confirmed(bot: Bot, db: DB, user_id: int, months: int) -> None:
+    """Отправить пользователю уведомление о продлении подписки."""
+
     try:
-        data = await request.json()
+        user_row = await db.get_user(user_id)
     except Exception as err:  # noqa: BLE001
-        logging.exception("Не удалось разобрать уведомление T-Bank", exc_info=err)
-        return web.Response(status=400)
+        logging.exception("Не удалось получить данные пользователя %s", user_id, exc_info=err)
+        user_row = None
 
-    payment_id = data.get("PaymentId")
-    status = (data.get("Status") or "").upper()
-    if not payment_id:
-        logging.warning("Получено уведомление T-Bank без PaymentId")
-        return web.Response(status=400)
+    expires_at = 0
+    if user_row is not None:
+        try:
+            expires_at = int(user_row["expires_at"])
+        except Exception:  # noqa: BLE001
+            try:
+                expires_at = int(user_row.get("expires_at", 0))  # type: ignore[arg-type]
+            except Exception:  # noqa: BLE001
+                expires_at = 0
 
-    payment = await db.get_payment_by_id(payment_id)
-    if payment is None:
-        logging.warning("Платёж %s не найден в базе", payment_id)
-        if status:
-            await db.set_payment_status(payment_id, status)
-        return web.Response(status=200)
-
-    current_status = (payment["status"] or "").upper()
-    if status:
-        await db.set_payment_status(payment_id, status)
-
-    if status != "CONFIRMED" or current_status == "CONFIRMED":
-        return web.Response(status=200)
-
-    user_id = int(payment["user_id"])
-    months = int(payment["months"])
-    await db.extend_subscription(user_id, months)
-    await db.set_paid_only(user_id, False)
-
-    user_after = await db.get_user(user_id)
-    expires_at = user_after["expires_at"] if user_after else 0
     expiry_text = None
     if expires_at:
         expiry_text = datetime.utcfromtimestamp(expires_at).strftime("%d.%m.%Y %H:%M UTC")
@@ -74,38 +79,145 @@ async def handle_tbank_notify(request: web.Request) -> web.Response:
     except Exception as err:  # noqa: BLE001
         logging.exception("Не удалось уведомить пользователя о подтверждении оплаты", exc_info=err)
 
-    return web.Response(status=200)
+
+async def tbank_notify(request: web.Request) -> web.Response:
+    """Обработать уведомление от T-Bank о статусе платежа."""
+
+    db: DB = request.app["db"]
+    bot: Bot = request.app["bot"]
+    now_ts = int(time.time())
+
+    try:
+        data = await request.json()
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Не удалось разобрать уведомление T-Bank", exc_info=err)
+        return web.json_response({"ok": True})
+
+    if not isinstance(data, dict):
+        logging.warning("Webhook T-Bank получен в неверном формате: %s", data)
+        return web.json_response({"ok": True})
+
+    headers = dict(request.headers)
+
+    try:
+        terminal_key = str(data.get("TerminalKey") or data.get("terminalKey") or "")
+        if terminal_key != config.T_PAY_TERMINAL_KEY:
+            logging.warning("Отклонён webhook T-Bank: некорректный TerminalKey")
+            return web.Response(status=403)
+
+        if config.TINKOFF_WEBHOOK_SECRET:
+            secret_header = headers.get("X-Tbank-Secret") or headers.get("X-TBank-Secret")
+            if secret_header != config.TINKOFF_WEBHOOK_SECRET:
+                logging.warning("Отклонён webhook T-Bank: неверный X-Tbank-Secret")
+                return web.Response(status=403)
+
+        token = data.get("Token") or data.get("token")
+        if token:
+            expected = compute_token(data, config.T_PAY_PASSWORD)
+            if expected != str(token):
+                logging.warning("Отклонён webhook T-Bank: подпись не сошлась")
+                return web.Response(status=403)
+    except web.HTTPException:
+        raise
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Ошибка при проверке подписи webhook T-Bank", exc_info=err)
+        return web.json_response({"ok": True})
+
+    payment_id = str(data.get("PaymentId") or data.get("paymentId") or "")
+    order_id = str(data.get("OrderId") or data.get("orderId") or "")
+    status_raw = str(data.get("Status") or data.get("status") or "")
+    status_upper = status_raw.upper()
+
+    logging.info(
+        "Webhook T-Bank: status=%s payment_id=%s order_id=%s",
+        status_upper or status_raw,
+        payment_id or "-",
+        order_id or "-",
+    )
+
+    try:
+        event_id = await db.log_webhook_event(
+            payment_id,
+            order_id,
+            status_upper,
+            terminal_key,
+            data,
+            headers,
+            now_ts,
+            processed=0,
+        )
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Не удалось записать webhook-событие", exc_info=err)
+        event_id = 0
+
+    processed = False
+
+    try:
+        target_payment_id = payment_id
+        if not target_payment_id and order_id:
+            payment_row = await db.get_payment_by_order_id(order_id)
+            if payment_row:
+                target_payment_id = payment_row["payment_id"]
+
+        if status_upper == "CONFIRMED" and target_payment_id:
+            payment_before = await db.get_payment_by_payment_id(target_payment_id)
+            was_confirmed = False
+            if payment_before is not None:
+                was_confirmed = (payment_before["status"] or "").upper() == "CONFIRMED"
+            applied = await payments.apply_successful_payment(target_payment_id, db)
+            processed = applied
+            if applied:
+                payment_row = await db.get_payment_by_payment_id(target_payment_id)
+                if payment_row:
+                    user_id = int(payment_row["user_id"] or 0)
+                    months = int(payment_row["months"] or 0)
+                    if user_id > 0 and months > 0 and not was_confirmed:
+                        await _notify_user_payment_confirmed(bot, db, user_id, months)
+        elif status_upper:
+            if target_payment_id:
+                await db.set_payment_status(target_payment_id, status_upper)
+                processed = True
+            elif order_id:
+                payment_row = await db.get_payment_by_order_id(order_id)
+                if payment_row and payment_row["payment_id"]:
+                    await db.set_payment_status(payment_row["payment_id"], status_upper)
+                    processed = True
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Ошибка обработки webhook T-Bank", exc_info=err)
+    finally:
+        if processed and event_id:
+            try:
+                await db.mark_webhook_processed(event_id)
+            except Exception as err:  # noqa: BLE001
+                logging.exception("Не удалось пометить webhook как обработанный", exc_info=err)
+
+    return web.json_response({"ok": True})
 
 
-async def setup_tbank_server(bot: Bot, db: DB) -> Optional[Tuple[web.AppRunner, web.TCPSite]]:
-    """Запустить сервер обработки уведомлений T-Bank, если указан URL."""
+async def start_webhook_server(bot: Bot, db: DB) -> None:
+    """Поднять aiohttp-сервер для приёма уведомлений T-Банка."""
 
-    if not config.TINKOFF_NOTIFY_URL:
-        logging.info("TINKOFF_NOTIFY_URL не задан. Уведомления T-Bank отключены.")
-        return None
-
-    parsed = urlparse(config.TINKOFF_NOTIFY_URL)
-    path = parsed.path or "/tbank_notify"
     app = web.Application()
     app["db"] = db
     app["bot"] = bot
-    app.router.add_post(path, handle_tbank_notify)
+    app.router.add_post("/tbank_notify", tbank_notify)
 
     runner = web.AppRunner(app)
     await runner.setup()
-
-    host = os.getenv("TINKOFF_NOTIFY_HOST", "0.0.0.0")
-    port_raw = os.getenv("TINKOFF_NOTIFY_PORT")
-    try:
-        port = int(port_raw) if port_raw else 8080
-    except ValueError:
-        logging.warning("Некорректное значение TINKOFF_NOTIFY_PORT=%s, используется 8080", port_raw)
-        port = 8080
-
-    site = web.TCPSite(runner, host, port)
+    site = web.TCPSite(runner, host=config.WEBHOOK_HOST, port=config.WEBHOOK_PORT)
     await site.start()
-    logging.info("Эндпоинт T-Bank запущен на %s:%s%s", host, port, path)
-    return runner, site
+    logging.info(
+        "Сервер уведомлений T-Bank запущен на %s:%s",
+        config.WEBHOOK_HOST,
+        config.WEBHOOK_PORT,
+    )
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        await site.stop()
+        await runner.cleanup()
+        raise
 
 
 async def main() -> None:
@@ -119,25 +231,19 @@ async def main() -> None:
     bot = Bot(config.BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Сохраняем экземпляр базы данных в контексте диспетчера
     dp["db"] = db
-
-    # Подключаем маршрутизатор с обработчиками
     dp.include_router(router)
-
-    # Настраиваем планировщик с учётом часового пояса
     setup_scheduler(bot, db, tz_name=config.TIMEZONE)
 
-    runner_site = await setup_tbank_server(bot, db)
+    webhook_task: Optional[asyncio.Task] = asyncio.create_task(start_webhook_server(bot, db))
 
     try:
-        # Запускаем обработку обновлений
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
-        if runner_site:
-            runner, site = runner_site
-            await site.stop()
-            await runner.cleanup()
+        if webhook_task:
+            webhook_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await webhook_task
 
 
 if __name__ == "__main__":
