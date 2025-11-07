@@ -23,7 +23,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import config, get_docs_map
 from db import DB
-from payments import process_payment
+from payments import check_payment_status, create_payment
 
 router = Router()
 
@@ -295,6 +295,10 @@ def build_user_menu_keyboard(
             text=f"💳 Купить {months} мес",
             callback_data=f"buy:months:{months}",
         )
+    builder.button(
+        text="💳 Оплатить подписку",
+        callback_data="buy:open",
+    )
     builder.button(
         text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
         callback_data="ar:toggle",
@@ -853,6 +857,43 @@ async def docs_back(callback: CallbackQuery, db: DB) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "buy:open")
+async def handle_buy_open(callback: CallbackQuery, db: DB) -> None:
+    """Показать пользователю список тарифов для оплаты."""
+
+    prices = await db.get_all_prices()
+    if not prices:
+        await callback.answer("Тарифы пока не настроены.", show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    for months, price in prices[:6]:
+        builder.button(
+            text=f"{months} мес — {price}₽",
+            callback_data=f"buy:months:{months}",
+        )
+    builder.button(text="❌ Отмена", callback_data="buy:cancel")
+    builder.adjust(1)
+    if callback.message:
+        await callback.message.answer(
+            "Выберите срок подписки для оплаты:",
+            reply_markup=builder.as_markup(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "buy:cancel")
+async def handle_buy_cancel(callback: CallbackQuery) -> None:
+    """Закрыть сообщение с выбором срока подписки."""
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            await callback.answer("Сообщение уже закрыто.", show_alert=True)
+            return
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("buy:months:"))
 async def handle_buy(callback: CallbackQuery, db: DB) -> None:
     """Обработка покупки подписки."""
@@ -869,23 +910,78 @@ async def handle_buy(callback: CallbackQuery, db: DB) -> None:
     if price is None:
         await callback.answer("Тариф не найден.", show_alert=True)
         return
-    success, payment_text = await process_payment(user_id, months, prices)
-    if not success:
-        await callback.answer(payment_text, show_alert=True)
+    try:
+        payment_url = await create_payment(user_id, price, months)
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Не удалось создать платёж", exc_info=err)
+        await callback.answer("Не удалось создать платёж. Попробуйте позже.", show_alert=True)
         return
+
+    payment = await db.get_latest_payment(user_id, status="PENDING")
+    payment_id = payment["payment_id"] if payment else None
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Перейти к оплате 💳", url=payment_url)
+    if payment_id:
+        builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
+    builder.adjust(1)
+    if callback.message:
+        text_lines = [
+            f"💳 Оплата подписки на {months} мес.",
+            f"Сумма к оплате: {price}₽.",
+            "Нажмите кнопку ниже, чтобы перейти к платёжной странице.",
+        ]
+        await callback.message.answer(
+            "\n".join(text_lines),
+            reply_markup=builder.as_markup(),
+            disable_web_page_preview=True,
+        )
+    await callback.answer("Ссылка на оплату готова.")
+
+
+@router.callback_query(F.data.startswith("payment:check:"))
+async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
+    """Проверить статус платежа и продлить подписку."""
+
+    parts = (callback.data or "").split(":")
+    try:
+        payment_id = parts[2]
+    except IndexError:
+        await callback.answer("Не удалось определить платёж.", show_alert=True)
+        return
+
+    payment = await db.get_payment_by_id(payment_id)
+    if payment is None:
+        await callback.answer("Платёж не найден. Свяжитесь с поддержкой.", show_alert=True)
+        return
+
+    try:
+        confirmed = await check_payment_status(payment_id)
+    except RuntimeError as err:
+        await callback.answer(str(err), show_alert=True)
+        return
+
+    if not confirmed:
+        await callback.answer("Платёж ещё обрабатывается. Попробуйте чуть позже.", show_alert=True)
+        return
+
+    user_id = int(payment["user_id"])
+    months = int(payment["months"])
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
+    await db.set_payment_status(payment_id, "CONFIRMED")
+
     user_after = await db.get_user(user_id)
     expires_at = user_after["expires_at"] if user_after else 0
     formatted_expiry = format_expiry(expires_at) if expires_at else None
+
     if callback.message:
         if formatted_expiry:
             display_text = (
-                f"✅ Оплата {price}₽ за {months} мес.\n"
-                f"Подписка активна до {formatted_expiry}."
+                f"✅ Оплата подтверждена. Подписка продлена на {months} мес.\n"
+                f"Новая дата окончания: {formatted_expiry}."
             )
         else:
-            display_text = f"✅ Оплата {price}₽ за {months} мес."
+            display_text = "✅ Оплата подтверждена и подписка продлена."
         await callback.message.answer(
             escape_md(display_text),
             parse_mode=ParseMode.MARKDOWN_V2,

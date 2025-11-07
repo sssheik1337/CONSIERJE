@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
@@ -36,6 +37,16 @@ CREATE TABLE IF NOT EXISTS coupons (
     kind TEXT NOT NULL,
     used_by INTEGER,
     used_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    payment_id TEXT UNIQUE,
+    amount INTEGER,
+    months INTEGER,
+    status TEXT DEFAULT 'PENDING',
+    created_at INTEGER
 );
 """
 
@@ -252,6 +263,75 @@ class DB:
     async def get_prices_dict(self) -> dict[int, int]:
         prices = await self.get_all_prices()
         return {months: price for months, price in prices}
+
+    async def add_payment(
+        self,
+        *,
+        user_id: int,
+        payment_id: str,
+        amount: int,
+        months: int,
+        status: str = "PENDING",
+    ) -> None:
+        """Сохранить платёж в базе данных."""
+
+        normalized_status = status.upper() if status else "PENDING"
+        created_at = int(time.time())
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO payments (user_id, payment_id, amount, months, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(payment_id) DO UPDATE SET
+                    user_id=excluded.user_id,
+                    amount=excluded.amount,
+                    months=excluded.months,
+                    status=excluded.status
+                """,
+                (user_id, payment_id, amount, months, normalized_status, created_at),
+            )
+            await db.commit()
+
+    async def set_payment_status(self, payment_id: str, status: str) -> bool:
+        """Обновить статус платежа."""
+
+        normalized_status = status.upper() if status else ""
+        if not normalized_status:
+            return False
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "UPDATE payments SET status=? WHERE payment_id=?",
+                (normalized_status, payment_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def get_payment_by_id(self, payment_id: str) -> Optional[aiosqlite.Row]:
+        """Получить платёж по идентификатору PaymentId."""
+
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM payments WHERE payment_id=?",
+                (payment_id,),
+            )
+            return await cur.fetchone()
+
+    async def get_latest_payment(
+        self, user_id: int, status: Optional[str] = None
+    ) -> Optional[aiosqlite.Row]:
+        """Вернуть последний платёж пользователя, опционально по статусу."""
+
+        query = "SELECT * FROM payments WHERE user_id=?"
+        params: List[object] = [user_id]
+        if status:
+            query += " AND status=?"
+            params.append(status.upper())
+        query += " ORDER BY created_at DESC LIMIT 1"
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(query, params)
+            return await cur.fetchone()
 
     async def set_trial_days_global(self, days: int) -> None:
         await self.set_setting("trial_days", str(days))

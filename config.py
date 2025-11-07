@@ -2,8 +2,13 @@ from dataclasses import dataclass, field
 import os
 from dotenv import load_dotenv
 
+import t_pay  # noqa: F401  # Импортируем для инициализации настроек платежей
+
 # Загружаем значения из файла окружения
 load_dotenv()
+
+# URL для уведомлений от T-Bank
+TINKOFF_NOTIFY_URL: str = os.getenv("TINKOFF_NOTIFY_URL", "")
 
 
 def _parse_ids(raw: str) -> set[int]:
@@ -27,6 +32,10 @@ class Config:
     DOCS_PD_CONSENT_URL: str = os.getenv("DOCS_PD_CONSENT_URL", "")
     DOCS_PD_POLICY_URL: str = os.getenv("DOCS_PD_POLICY_URL", "")
     DOCS_OFFER_URL: str = os.getenv("DOCS_OFFER_URL", "")
+
+    T_PAY_SUCCESS_URL: str = os.getenv("T_PAY_SUCCESS_URL", "")
+    T_PAY_FAIL_URL: str = os.getenv("T_PAY_FAIL_URL", "")
+    TINKOFF_NOTIFY_URL: str = TINKOFF_NOTIFY_URL
 
 
 config = Config()
