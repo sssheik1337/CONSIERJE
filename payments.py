@@ -71,8 +71,8 @@ async def create_payment(
             notification_url=config.TINKOFF_NOTIFY_URL or None,
         )
     except Exception as err:  # noqa: BLE001
-        logger.exception("Не удалось вызвать T-Bank Init", exc_info=err)
-        raise RuntimeError("Не удалось создать платёж через T-Bank") from err
+        logging.error("Некорректный ответ Init: %s", err)
+        raise RuntimeError(str(err)) from err
 
     if not response:
         raise RuntimeError("Не удалось создать платёж через T-Bank")
@@ -88,6 +88,8 @@ async def create_payment(
         error_text = response.get("Message") or response.get("Details") or "Ошибка создания платежа"
         logger.error("Создание платежа завершилось с ошибкой: %s", response)
         raise RuntimeError(error_text)
+
+    logging.info("Payment created: order=%s, payment_id=%s", order_id, response.get("PaymentId"))
 
     await db_instance.add_payment(
         user_id=user_id,
