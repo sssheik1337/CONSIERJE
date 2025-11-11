@@ -1,10 +1,13 @@
-import os
+import asyncio
 import hashlib
+import json
 import logging
+import os
+import socket
 from typing import Any, Dict, Optional, Tuple
 
-from dotenv import load_dotenv
 import aiohttp
+from dotenv import load_dotenv
 
 
 class TBankHttpError(RuntimeError):
@@ -145,6 +148,55 @@ async def _post(
                     data.get("Details"),
                 )
             return data
+
+
+async def net_diagnostics() -> Dict[str, Any]:
+    """Выполнить сетевую диагностику доступности T-Bank."""
+
+    result: Dict[str, Any] = {}
+    try:
+        result["local_ip"] = socket.gethostbyname(socket.gethostname())
+    except Exception as err:  # noqa: BLE001
+        result["local_ip"] = f"unresolved: {err}"
+
+    try:
+        loop = asyncio.get_running_loop()
+        result["event_loop"] = str(loop)
+    except RuntimeError:
+        result["event_loop"] = "loop not running"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.ipify.org", timeout=5) as resp:
+                result["external_ip_status"] = resp.status
+                result["external_ip"] = await resp.text()
+    except Exception as err:  # noqa: BLE001
+        result["external_ip_error"] = str(err)
+
+    base_url = (os.getenv("T_PAY_BASE_URL") or "https://securepay.tinkoff.ru/v2").rstrip("/")
+    host = base_url.split("//", 1)[1].split("/", 1)[0]
+    result["base_url"] = base_url
+    result["base_host"] = host
+
+    try:
+        dns_entries = socket.getaddrinfo("rest-api-test.tinkoff.ru", 443)
+        result["sandbox_dns_ok"] = True
+        result["sandbox_dns"] = list({entry[4][0] for entry in dns_entries})
+    except Exception as err:  # noqa: BLE001
+        result["sandbox_dns_ok"] = False
+        result["sandbox_dns_error"] = str(err)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{base_url}/Init", timeout=5) as resp:
+                result["probe_status"] = resp.status
+                result["probe_ct"] = resp.headers.get("Content-Type")
+                result["probe_body_peek"] = (await resp.text())[:200]
+    except Exception as err:  # noqa: BLE001
+        result["probe_error"] = str(err)
+
+    logging.info("[NET] diag: %s", json.dumps(result, ensure_ascii=False))
+    return result
 
 
 async def init_payment(
@@ -402,4 +454,5 @@ __all__ = [
     "confirm_payment",
     "get_payment_state",
     "finish_authorize",
+    "net_diagnostics",
 ]

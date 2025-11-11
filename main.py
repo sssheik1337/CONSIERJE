@@ -7,6 +7,7 @@
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import time
 from datetime import datetime
@@ -17,7 +18,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import payments
-import t_pay  # noqa: F401
+import t_pay
 from config import config
 from db import DB
 from handlers import router
@@ -194,12 +195,31 @@ async def tbank_notify(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def debug_net(request: web.Request) -> web.Response:
+    """Вернуть результаты сетевой диагностики T-Bank."""
+
+    try:
+        data = await t_pay.net_diagnostics()
+    except Exception as err:  # noqa: BLE001
+        return web.Response(
+            text=json.dumps({"error": str(err)}, ensure_ascii=False),
+            content_type="application/json",
+            status=500,
+        )
+
+    return web.Response(
+        text=json.dumps(data, ensure_ascii=False),
+        content_type="application/json",
+    )
+
+
 async def start_webhook_server(bot: Bot, db: DB) -> None:
     """Поднять aiohttp-сервер для приёма уведомлений T-Банка."""
 
     app = web.Application()
     app["db"] = db
     app["bot"] = bot
+    app.router.add_get("/debug/net", debug_net)
     app.router.add_post("/tbank_notify", tbank_notify)
 
     runner = web.AppRunner(app)
