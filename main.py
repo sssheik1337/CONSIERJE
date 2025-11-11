@@ -232,6 +232,23 @@ async def start_webhook_server(bot: Bot, db: DB) -> None:
         config.WEBHOOK_PORT,
     )
     try:
+        diagnostics = await t_pay.net_diagnostics()
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Не удалось выполнить сетевую диагностику T-Bank", exc_info=err)
+    else:
+        local_ip = diagnostics.get("local_ip") or "-"
+        external_repr = (
+            diagnostics.get("external_ip")
+            or diagnostics.get("external_ip_error")
+            or diagnostics.get("probe_error")
+            or "-"
+        )
+        logging.info(
+            "Диагностика сети при старте: local_ip=%s external=%s",
+            local_ip,
+            external_repr,
+        )
+    try:
         while True:
             await asyncio.sleep(3600)
     except asyncio.CancelledError:
