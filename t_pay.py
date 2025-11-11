@@ -6,6 +6,22 @@ from typing import Any, Dict, Optional, Tuple
 from dotenv import load_dotenv
 import aiohttp
 
+
+class TBankHttpError(RuntimeError):
+    """Ошибка HTTP уровня при обращении к T-Bank."""
+
+
+class TBankApiError(RuntimeError):
+    """Ошибка бизнес-логики, возвращённая T-Bank API."""
+
+    def __init__(self, code: str, message: str, details: Optional[str] = None):
+        self.code = code
+        self.details = details
+        base_message = f"[{code}] {message}"
+        if details:
+            base_message = f"{base_message} | {details}"
+        super().__init__(base_message)
+
 load_dotenv()
 
 """
@@ -104,17 +120,30 @@ async def _post(
     body["Token"] = _generate_token(body, password)
     headers = {
         "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "ConciergeBot/1.0",
     }
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=body, headers=headers) as resp:
-            # попытаться вернуть json, даже если статус код != 200
-            try:
-                data = await resp.json()
-            except Exception:
+            if resp.status != 200:
                 text = await resp.text()
-                raise RuntimeError(f"Unexpected response from {url}: {text}")
+                raise TBankHttpError(
+                    f"HTTP {resp.status} {resp.content_type}: {text[:500]}"
+                )
+            if resp.content_type != "application/json":
+                text = await resp.text()
+                raise TBankHttpError(
+                    f"Unexpected content-type {resp.content_type}: {text[:500]}"
+                )
+            data = await resp.json()
+            if isinstance(data, dict) and data.get("Success") is False:
+                raise TBankApiError(
+                    str(data.get("ErrorCode", "")),
+                    data.get("Message", ""),
+                    data.get("Details"),
+                )
             return data
 
 
@@ -203,18 +232,21 @@ async def init_payment(
         payload.setdefault("DATA", {})["Email"] = email
     if phone:
         payload.setdefault("DATA", {})["Phone"] = phone
-    response = await _post(
-        "Init",
-        payload,
-        base_url=base_url,
-        terminal_key=terminal_key,
-        password=password,
-        api_token=api_token,
-    )
-
-    if isinstance(response, dict) and response.get("Success") is False:
-        message = response.get("Details") or response.get("Message") or "Неизвестная ошибка Init"
-        raise RuntimeError(message)
+    try:
+        response = await _post(
+            "Init",
+            payload,
+            base_url=base_url,
+            terminal_key=terminal_key,
+            password=password,
+            api_token=api_token,
+        )
+    except TBankHttpError as err:
+        logging.error("NETWORK/HTTP: %s (проверьте whitelist/host)", err)
+        raise
+    except TBankApiError as err:
+        logging.error("API: %s", err)
+        raise
 
     return response
 
@@ -286,14 +318,21 @@ async def get_payment_state(payment_id: str, ip: Optional[str] = None) -> Dict[s
     }
     if ip:
         payload["IP"] = ip
-    return await _post(
-        "GetState",
-        payload,
-        base_url=base_url,
-        terminal_key=terminal_key,
-        password=password,
-        api_token=api_token,
-    )
+    try:
+        return await _post(
+            "GetState",
+            payload,
+            base_url=base_url,
+            terminal_key=terminal_key,
+            password=password,
+            api_token=api_token,
+        )
+    except TBankHttpError as err:
+        logging.error("NETWORK/HTTP: %s (проверьте whitelist/host)", err)
+        raise
+    except TBankApiError as err:
+        logging.error("API: %s", err)
+        raise
 
 
 async def finish_authorize(
@@ -357,6 +396,8 @@ async def finish_authorize(
 
 
 __all__ = [
+    "TBankApiError",
+    "TBankHttpError",
     "init_payment",
     "confirm_payment",
     "get_payment_state",

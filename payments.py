@@ -6,7 +6,7 @@ from typing import Optional
 
 from config import config
 from db import DB
-from t_pay import get_payment_state, init_payment
+from t_pay import TBankApiError, TBankHttpError, get_payment_state, init_payment
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +70,11 @@ async def create_payment(
             fail_url=config.T_PAY_FAIL_URL or None,
             notification_url=config.TINKOFF_NOTIFY_URL or None,
         )
-    except Exception as err:  # noqa: BLE001
+    except (TBankHttpError, TBankApiError) as err:
         logging.error("Некорректный ответ Init: %s", err)
+        raise RuntimeError(str(err)) from err
+    except Exception as err:  # noqa: BLE001
+        logging.error("Неожиданная ошибка при создании платежа: %s", err)
         raise RuntimeError(str(err)) from err
 
     if not response:
