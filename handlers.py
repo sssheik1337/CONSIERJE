@@ -1073,6 +1073,30 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     if not await db.has_accepted_legal(callback.from_user.id):
         await callback.answer("Сначала подтвердите согласие.", show_alert=True)
         return
+
+    user = await db.get_user(callback.from_user.id)
+    now_ts = int(datetime.utcnow().timestamp())
+    expires_at = int(user["expires_at"] or 0) if user else 0
+    has_active_subscription = expires_at > now_ts
+    has_active_trial = False
+    if user:
+        has_active_trial = await has_trial_coupon(db, callback.from_user.id) and expires_at > now_ts
+
+    if not has_active_subscription and not has_active_trial:
+        if callback.message:
+            builder = InlineKeyboardBuilder()
+            builder.button(text="💳 Купить доступ", callback_data="buy:open")
+            builder.button(text="🎟 Ввести промокод", callback_data="promo:enter")
+            builder.button(text="🏠 Главное меню", callback_data="menu:home")
+            builder.adjust(1)
+            await callback.message.answer(
+                escape_md("У вас нет активной подписки. Оформите доступ или введите промокод."),
+                reply_markup=builder.as_markup(),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        await callback.answer("Нет активной подписки", show_alert=True)
+        return
     ok, info, hint = await make_one_time_invite(bot, db)
     if callback.message:
         if ok:
