@@ -56,7 +56,14 @@ async def _notify_user_payment_confirmed(bot: Bot, db: DB, user_id: int, months:
         user_row = None
 
     expires_at = 0
-    if user_row is not None:
+    try:
+        subscription_end = await db.get_subscription_end(user_id)
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Не удалось получить конец подписки для уведомления", exc_info=err)
+        subscription_end = None
+    if subscription_end:
+        expires_at = subscription_end
+    elif user_row is not None:
         try:
             expires_at = int(user_row["expires_at"])
         except Exception:  # noqa: BLE001

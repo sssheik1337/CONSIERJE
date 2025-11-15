@@ -25,6 +25,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import config, get_docs_map
 from db import DB
 from payments import check_payment_status, create_payment
+from scheduler import daily_check
 
 router = Router()
 
@@ -84,6 +85,12 @@ def format_expiry(ts: int) -> str:
     """Отформатировать таймстамп в строку UTC."""
 
     return datetime.utcfromtimestamp(ts).strftime("%d.%m.%Y %H:%M UTC")
+
+
+def format_short_date(ts: int) -> str:
+    """Отформатировать дату в коротком виде ДД.ММ.ГГГГ."""
+
+    return datetime.utcfromtimestamp(ts).strftime("%d.%m.%Y")
 
 
 def is_super_admin(user_id: int) -> bool:
@@ -303,8 +310,9 @@ async def send_main_menu_screen(
         disable_web_page_preview=True,
     )
     menu = await get_user_menu(db, message.from_user.id)
+    main_text = await compose_main_menu_text(db, message.from_user.id)
     await message.answer(
-        escape_md(START_TEXT),
+        escape_md(main_text),
         reply_markup=menu,
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
@@ -406,6 +414,27 @@ async def get_user_menu(db: DB, user_id: int) -> InlineKeyboardMarkup:
     auto_flag = bool(user and user["auto_renew"])
     price_months = [months for months, _ in await db.get_all_prices()]
     return build_user_menu_keyboard(auto_flag, is_super_admin(user_id), price_months)
+
+
+async def compose_main_menu_text(db: DB, user_id: int) -> str:
+    """Сформировать текст главного меню с указанием статуса доступа."""
+
+    now_ts = int(datetime.utcnow().timestamp())
+    user = await db.get_user(user_id)
+    trial_end = 0
+    if user and hasattr(user, "keys") and "trial_end" in user.keys():
+        try:
+            trial_end = int(user["trial_end"] or 0)
+        except (TypeError, ValueError):
+            trial_end = 0
+    subscription_end = await db.get_subscription_end(user_id) or 0
+    if trial_end and now_ts < trial_end:
+        status_line = f"🧪 Пробный период до: {format_short_date(trial_end)}"
+    elif subscription_end and now_ts < subscription_end:
+        status_line = f"✅ Подписка активна до: {format_short_date(subscription_end)}"
+    else:
+        status_line = "⛔ Нет активной подписки. Доступ к каналу закрыт."
+    return f"{status_line}\n\n{START_TEXT}"
 
 
 async def refresh_user_menu(message: Message, db: DB, user_id: int) -> None:
@@ -646,24 +675,47 @@ async def apply_trial_coupon(db: DB, user_id: int) -> tuple[bool, str]:
     trial_seconds = int(timedelta(days=trial_days).total_seconds())
     now_ts = int(datetime.utcnow().timestamp())
     user = await db.get_user(user_id)
+    subscription_end = await db.get_subscription_end(user_id) or 0
+    trial_end_existing = 0
+    if user and hasattr(user, "keys") and "trial_end" in user.keys():
+        try:
+            trial_end_existing = int(user["trial_end"] or 0)
+        except (TypeError, ValueError):
+            trial_end_existing = 0
+
     if user is None:
         auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
         await db.upsert_user(user_id, now_ts, trial_days, auto_default, False)
-        await db.set_paid_only(user_id, False)
-        expires_at = now_ts + trial_seconds
-        return True, f"✅ Пробный доступ активирован до {format_expiry(expires_at)}."
-    expires_at = user["expires_at"] or 0
-    if expires_at <= now_ts:
-        new_exp = now_ts + trial_seconds
+        end_ts = now_ts + trial_seconds
         async with aiosqlite.connect(db.path) as conn:
             await conn.execute(
-                "UPDATE users SET expires_at=?, paid_only=0, invite_issued=0 WHERE user_id=?",
-                (new_exp, user_id),
+                """
+                UPDATE users
+                SET trial_start=?, trial_end=?, expires_at=?, paid_only=0, invite_issued=0
+                WHERE user_id=?
+                """,
+                (now_ts, end_ts, max(end_ts, subscription_end), user_id),
             )
             await conn.commit()
-        return True, f"✅ Пробный доступ активирован до {format_expiry(new_exp)}."
+        return True, f"✅ Пробный доступ активирован до {format_expiry(end_ts)}."
+
+    current_access = max(subscription_end, trial_end_existing)
+    if current_access <= now_ts:
+        new_end = now_ts + trial_seconds
+        async with aiosqlite.connect(db.path) as conn:
+            await conn.execute(
+                """
+                UPDATE users
+                SET trial_start=?, trial_end=?, expires_at=?, paid_only=0, invite_issued=0
+                WHERE user_id=?
+                """,
+                (now_ts, new_end, max(new_end, subscription_end), user_id),
+            )
+            await conn.commit()
+        return True, f"✅ Пробный доступ активирован до {format_expiry(new_end)}."
+
     await db.set_paid_only(user_id, False)
-    return True, f"✅ Промокод принят. Подписка активна до {format_expiry(expires_at)}."
+    return True, f"✅ Промокод принят. Подписка активна до {format_expiry(current_access)}."
 
 
 async def redeem_promo_code(
@@ -757,8 +809,9 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
         )
         return
     menu = await get_user_menu(db, user_id)
+    main_text = await compose_main_menu_text(db, user_id)
     await message.answer(
-        escape_md(START_TEXT),
+        escape_md(main_text),
         reply_markup=menu,
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
@@ -795,13 +848,41 @@ async def handle_menu_home(callback: CallbackQuery, state: FSMContext, db: DB) -
 
     menu = await get_user_menu(db, user_id)
     if callback.message:
+        main_text = await compose_main_menu_text(db, user_id)
         await callback.message.answer(
-            escape_md(START_TEXT),
+            escape_md(main_text),
             reply_markup=menu,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
     await callback.answer()
+
+
+@router.message(Command("test_expire_me"))
+async def cmd_test_expire_me(message: Message, db: DB, bot: Bot) -> None:
+    """Принудительно завершить подписку и триал для самотестирования суперадмина."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer(
+            escape_md("❌ Команда доступна только суперадминистратору."),
+            reply_markup=main_menu_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
+    past_dt = datetime.utcnow() - timedelta(minutes=1)
+    await db.set_subscription_end(message.from_user.id, past_dt)
+    await db.set_trial_end(message.from_user.id, past_dt)
+    try:
+        await daily_check(bot, db)
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Сбой тестовой проверки истечения подписки", exc_info=err)
+    await send_main_menu_screen(
+        message,
+        db,
+        notice="Тест: подписка и триал завершены, проверка истечения выполнена.",
+    )
 
 
 @router.callback_query(F.data == "legal:docs")
@@ -901,10 +982,11 @@ async def legal_accept(callback: CallbackQuery, bot: Bot, state: FSMContext, db:
                 disable_web_page_preview=True,
             )
     menu = await get_user_menu(db, user_id)
+    main_text = await compose_main_menu_text(db, user_id)
     if callback.message:
         try:
             await callback.message.answer(
-                escape_md(START_TEXT),
+                escape_md(main_text),
                 reply_markup=menu,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,
@@ -912,7 +994,7 @@ async def legal_accept(callback: CallbackQuery, bot: Bot, state: FSMContext, db:
         except TelegramBadRequest:
             await bot.send_message(
                 callback.message.chat.id,
-                escape_md(START_TEXT),
+                escape_md(main_text),
                 reply_markup=menu,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,
@@ -920,7 +1002,7 @@ async def legal_accept(callback: CallbackQuery, bot: Bot, state: FSMContext, db:
     else:
         await bot.send_message(
             user_id,
-            escape_md(START_TEXT),
+            escape_md(main_text),
             reply_markup=menu,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
@@ -966,16 +1048,17 @@ async def docs_back(callback: CallbackQuery, db: DB) -> None:
 
     if callback.message:
         menu = await get_user_menu(db, callback.from_user.id)
+        main_text = await compose_main_menu_text(db, callback.from_user.id)
         try:
             await callback.message.edit_text(
-                escape_md(START_TEXT),
+                escape_md(main_text),
                 reply_markup=menu,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,
             )
         except TelegramBadRequest:
             await callback.message.answer(
-                escape_md(START_TEXT),
+                escape_md(main_text),
                 reply_markup=menu,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,
@@ -1097,9 +1180,8 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
     await db.set_paid_only(user_id, False)
     await db.set_payment_status(payment_id, "CONFIRMED")
 
-    user_after = await db.get_user(user_id)
-    expires_at = user_after["expires_at"] if user_after else 0
-    formatted_expiry = format_expiry(expires_at) if expires_at else None
+    subscription_end = await db.get_subscription_end(user_id) or 0
+    formatted_expiry = format_expiry(subscription_end) if subscription_end else None
 
     if callback.message:
         if formatted_expiry:
@@ -1175,11 +1257,15 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         )
 
     now_ts = int(datetime.utcnow().timestamp())
-    expires_at = int(user["expires_at"] or 0) if user else 0
-    has_active_subscription = expires_at > now_ts
-    has_active_trial = False
-    if user:
-        has_active_trial = await has_trial_coupon(db, callback.from_user.id) and expires_at > now_ts
+    subscription_end = await db.get_subscription_end(callback.from_user.id) or 0
+    trial_end = 0
+    if user and hasattr(user, "keys") and "trial_end" in user.keys():
+        try:
+            trial_end = int(user["trial_end"] or 0)
+        except (TypeError, ValueError):
+            trial_end = 0
+    has_active_subscription = subscription_end > now_ts
+    has_active_trial = trial_end > now_ts
 
     if not has_active_subscription and not has_active_trial:
         if callback.message:

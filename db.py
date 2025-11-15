@@ -3,7 +3,7 @@ import logging
 import re
 import secrets
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 import aiosqlite
@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS users (
     paid_only INTEGER NOT NULL DEFAULT 0,
     accepted_legal INTEGER NOT NULL DEFAULT 0,
     accepted_at INTEGER,
-    invite_issued INTEGER NOT NULL DEFAULT 0
+    invite_issued INTEGER NOT NULL DEFAULT 0,
+    trial_start INTEGER DEFAULT 0,
+    trial_end INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -38,6 +40,12 @@ CREATE TABLE IF NOT EXISTS coupons (
     kind TEXT NOT NULL,
     used_by INTEGER,
     used_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    user_id INTEGER PRIMARY KEY,
+    end_at INTEGER,
+    updated_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS coupon_usages (
@@ -91,6 +99,37 @@ class DB:
 
         return (raw or "").upper().strip()
 
+    @staticmethod
+    def _safe_int(value: object) -> int:
+        """Попытаться преобразовать значение в int, возвращая 0 при ошибке."""
+
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _datetime_to_ts(dt: datetime) -> int:
+        """Сконвертировать дату в таймстамп в секундах UTC."""
+
+        if dt.tzinfo is None:
+            return int(dt.replace(tzinfo=timezone.utc).timestamp())
+        return int(dt.timestamp())
+
+    async def _get_subscription_end_internal(
+        self, conn: aiosqlite.Connection, user_id: int
+    ) -> int:
+        """Получить конец подписки для пользователя в рамках открытого соединения."""
+
+        cur = await conn.execute(
+            "SELECT end_at FROM subscriptions WHERE user_id=?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return 0
+        return self._safe_int(row["end_at"])
+
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
@@ -99,6 +138,8 @@ class DB:
                 "ALTER TABLE users ADD COLUMN accepted_legal INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN accepted_at INTEGER",
                 "ALTER TABLE users ADD COLUMN invite_issued INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN trial_start INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN trial_end INTEGER DEFAULT 0",
                 "ALTER TABLE payments ADD COLUMN order_id TEXT",
             ):
                 try:
@@ -119,6 +160,67 @@ class DB:
                 )
             except Exception as err:  # noqa: BLE001
                 logging.exception("Не удалось создать индексы платежей", exc_info=err)
+
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT user_id, expires_at, trial_start, trial_end
+                    FROM users
+                    WHERE expires_at IS NOT NULL AND expires_at > 0
+                    """
+                )
+                rows = await cur.fetchall()
+                now_stamp = int(time.time())
+                for row in rows:
+                    user_id = self._safe_int(row["user_id"])
+                    expires_at = self._safe_int(row["expires_at"])
+                    if user_id <= 0 or expires_at <= 0:
+                        continue
+                    pay_cur = await db.execute(
+                        "SELECT 1 FROM payments WHERE user_id=? AND UPPER(status)='CONFIRMED' LIMIT 1",
+                        (user_id,),
+                    )
+                    has_payment = await pay_cur.fetchone() is not None
+                    if has_payment:
+                        await db.execute(
+                            """
+                            INSERT INTO subscriptions(user_id, end_at, updated_at)
+                            VALUES(?, ?, ?)
+                            ON CONFLICT(user_id) DO UPDATE SET end_at=excluded.end_at, updated_at=excluded.updated_at
+                            """,
+                            (user_id, expires_at, now_stamp),
+                        )
+                        continue
+                    trial_cur = await db.execute(
+                        "SELECT 1 FROM coupon_usages WHERE user_id=? AND kind=? LIMIT 1",
+                        (user_id, "trial"),
+                    )
+                    has_trial = await trial_cur.fetchone() is not None
+                    if has_trial:
+                        trial_end_current = (
+                            self._safe_int(row["trial_end"]) if "trial_end" in row.keys() else 0
+                        )
+                        if not trial_end_current:
+                            trial_start = (
+                                self._safe_int(row["trial_start"]) if "trial_start" in row.keys() else 0
+                            )
+                            if not trial_start or trial_start > expires_at:
+                                trial_start = expires_at
+                            await db.execute(
+                                "UPDATE users SET trial_start=?, trial_end=? WHERE user_id=?",
+                                (trial_start, expires_at, user_id),
+                            )
+                    else:
+                        await db.execute(
+                            """
+                            INSERT INTO subscriptions(user_id, end_at, updated_at)
+                            VALUES(?, ?, ?)
+                            ON CONFLICT(user_id) DO UPDATE SET end_at=excluded.end_at, updated_at=excluded.updated_at
+                            """,
+                            (user_id, expires_at, now_stamp),
+                        )
+            except Exception as err:  # noqa: BLE001
+                logging.exception("Не удалось синхронизировать текущие сроки подписок", exc_info=err)
 
             try:
                 cur = await db.execute(
@@ -511,30 +613,116 @@ class DB:
             return fallback
         return value in {"1", "true", "True", "TRUE"}
 
-    async def extend_subscription(self, user_id: int, months: int) -> None:
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT expires_at FROM users WHERE user_id=?", (user_id,))
+    async def get_subscription_end(self, user_id: int) -> Optional[int]:
+        """Получить дату окончания платной подписки пользователя."""
+
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT end_at FROM subscriptions WHERE user_id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        value = self._safe_int(row["end_at"])
+        return value or None
+
+    async def set_subscription_end(self, user_id: int, dt: datetime) -> None:
+        """Принудительно обновить дату окончания подписки пользователя."""
+
+        ts = self._datetime_to_ts(dt)
+        stamp = int(time.time())
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute(
+                """
+                INSERT INTO subscriptions(user_id, end_at, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET end_at=excluded.end_at, updated_at=excluded.updated_at
+                """,
+                (user_id, ts, stamp),
+            )
+            cur = await conn.execute(
+                "SELECT trial_end, invite_issued FROM users WHERE user_id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            if row is not None and hasattr(row, "keys"):
+                trial_end = self._safe_int(row["trial_end"]) if "trial_end" in row.keys() else 0
+                new_exp = max(trial_end, ts)
+                await conn.execute(
+                    "UPDATE users SET expires_at=? WHERE user_id=?",
+                    (new_exp, user_id),
+                )
+            await conn.commit()
+
+    async def set_trial_end(self, user_id: int, dt: datetime) -> None:
+        """Принудительно установить окончание пробного периода пользователя."""
+
+        ts = self._datetime_to_ts(dt)
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT trial_start FROM users WHERE user_id=?",
+                (user_id,),
+            )
             row = await cur.fetchone()
             if row is None:
+                await conn.commit()
                 return
-            expires_at = row["expires_at"] or 0
-            invite_flag = 0
-            if hasattr(row, "keys") and "invite_issued" in row.keys():
-                try:
-                    invite_flag = int(row["invite_issued"] or 0)
-                except (TypeError, ValueError):
-                    invite_flag = 0
-            now_ts = int(datetime.utcnow().timestamp())
-            delta = int(timedelta(days=30 * months).total_seconds())
-            new_exp = max(expires_at, now_ts) + delta
-            expired_before = expires_at <= now_ts
-            new_invite_flag = 0 if expired_before else invite_flag
-            await db.execute(
-                "UPDATE users SET expires_at=?, invite_issued=? WHERE user_id=?",
-                (new_exp, new_invite_flag, user_id),
+            trial_start = 0
+            if hasattr(row, "keys") and "trial_start" in row.keys():
+                trial_start = self._safe_int(row["trial_start"])
+            new_start = trial_start if trial_start and trial_start <= ts else ts
+            sub_end = await self._get_subscription_end_internal(conn, user_id)
+            new_exp = max(ts, sub_end)
+            await conn.execute(
+                "UPDATE users SET trial_start=?, trial_end=?, expires_at=? WHERE user_id=?",
+                (new_start, ts, new_exp, user_id),
             )
-            await db.commit()
+            await conn.commit()
+
+    async def extend_subscription(self, user_id: int, months: int) -> None:
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT invite_issued, trial_end FROM users WHERE user_id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await conn.commit()
+                return
+            invite_flag = 0
+            trial_end = 0
+            if hasattr(row, "keys"):
+                if "invite_issued" in row.keys():
+                    invite_flag = self._safe_int(row["invite_issued"])
+                if "trial_end" in row.keys():
+                    trial_end = self._safe_int(row["trial_end"])
+            now_ts = int(datetime.utcnow().timestamp())
+            current_sub_end = await self._get_subscription_end_internal(conn, user_id)
+            base = max(current_sub_end, now_ts)
+            delta = int(timedelta(days=30 * months).total_seconds())
+            new_end = base + delta
+            expired_before = current_sub_end <= now_ts
+            new_invite_flag = 0 if expired_before else invite_flag
+            stamp = int(time.time())
+            await conn.execute(
+                """
+                INSERT INTO subscriptions(user_id, end_at, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET end_at=excluded.end_at, updated_at=excluded.updated_at
+                """,
+                (user_id, new_end, stamp),
+            )
+            new_expires = max(trial_end, new_end)
+            await conn.execute(
+                "UPDATE users SET invite_issued=?, expires_at=? WHERE user_id=?",
+                (new_invite_flag, new_expires, user_id),
+            )
+            await conn.commit()
 
     async def list_expired(self, now_ts: int) -> List[aiosqlite.Row]:
         async with aiosqlite.connect(self.path) as db:
