@@ -185,6 +185,15 @@ async def make_one_time_invite(
             chat_id,
             member_limit=int(member_limit),
             expire_date=expire_ts,
+            creates_join_request=False,
+        )
+        logging.info(
+            "Создана одноразовая ссылка: chat_id=%s limit=%s expire=%s join_request=%s link=%s",
+            chat_id,
+            getattr(link, "member_limit", None),
+            getattr(link, "expire_date", None),
+            getattr(link, "creates_join_request", None),
+            link.invite_link,
         )
         return True, link.invite_link, ""
     except TelegramForbiddenError:
@@ -237,13 +246,23 @@ async def make_one_time_invite(
         )
 
 
-def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMarkup:
-    """Создать инлайн-кнопку для перехода по ссылке."""
+def main_menu_markup() -> InlineKeyboardMarkup:
+    """Создать клавиатуру с переходом в главное меню."""
 
     builder = InlineKeyboardBuilder()
-    text = "🔗 Войти в канал" if not permanent else "⚠️ Постоянная ссылка"
-    builder.button(text=text, url=link)
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMarkup:
+    """Создать инлайн-кнопку для перехода по ссылке с возвратом в меню."""
+
+    builder = InlineKeyboardBuilder()
+    text = "➡️ Войти в канал" if not permanent else "⚠️ Постоянная ссылка"
+    builder.button(text=text, url=link)
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
+    builder.adjust(2)
     return builder.as_markup()
 
 
@@ -678,6 +697,45 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
     )
 
 
+@router.callback_query(F.data == "menu:home")
+async def handle_menu_home(callback: CallbackQuery, state: FSMContext, db: DB) -> None:
+    """Вернуть пользователя в главное меню по кнопке."""
+
+    await state.clear()
+    user_id = callback.from_user.id
+    user = await db.get_user(user_id)
+    if user is None:
+        if callback.message:
+            await callback.message.answer(
+                "Сначала выполните /start.",
+                reply_markup=None,
+            )
+        await callback.answer("Требуется команда /start", show_alert=True)
+        return
+
+    if not await db.has_accepted_legal(user_id):
+        if callback.message:
+            text, markup = build_welcome_with_legal()
+            await callback.message.answer(
+                text,
+                reply_markup=markup,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+        await callback.answer()
+        return
+
+    menu = await get_user_menu(db, user_id)
+    if callback.message:
+        await callback.message.answer(
+            escape_md(START_TEXT),
+            reply_markup=menu,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "legal:docs")
 async def legal_show_docs(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     """Показать документы во время подтверждения согласия."""
@@ -1019,7 +1077,7 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     if callback.message:
         if ok:
             await callback.message.answer(
-                escape_md("🔗 Ссылка готова. Нажмите кнопку ниже."),
+                escape_md("Ваша ссылка (действует 24ч, одноразовая)."),
                 reply_markup=invite_button_markup(info),
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,
@@ -1028,14 +1086,18 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
             hint_value = hint or ""
             hint_lower = hint_value.lower()
             hint_is_link = hint_lower.startswith("http://") or hint_lower.startswith("https://")
-            lines = []
+            lines: list[str] = []
             if info:
                 lines.append(escape_md(info))
             if hint and not hint_is_link:
                 lines.append(escape_md(hint))
-            text = "\n".join(lines) or escape_md("❗ Не удалось создать ссылку.")
+            combined_lower = " ".join(lines).lower()
+            expired_line = escape_md("Ссылка устарела, запросите новую")
+            if "устарел" not in combined_lower:
+                lines.append(expired_line)
+            text = "\n".join(lines) if lines else expired_line
             reply_markup = (
-                invite_button_markup(hint_value, permanent=True) if hint_is_link else None
+                invite_button_markup(hint_value, permanent=True) if hint_is_link else main_menu_markup()
             )
             await callback.message.answer(
                 text,
