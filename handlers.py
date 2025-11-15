@@ -132,6 +132,12 @@ async def has_trial_coupon(db: DB, user_id: int) -> bool:
 
     async with aiosqlite.connect(db.path) as conn:
         cur = await conn.execute(
+            "SELECT 1 FROM coupon_usages WHERE kind=? AND user_id=? LIMIT 1",
+            (COUPON_KIND_TRIAL, user_id),
+        )
+        if await cur.fetchone() is not None:
+            return True
+        cur = await conn.execute(
             "SELECT 1 FROM coupons WHERE kind=? AND used_by=? LIMIT 1",
             (COUPON_KIND_TRIAL, user_id),
         )

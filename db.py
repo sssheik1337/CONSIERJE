@@ -39,6 +39,17 @@ CREATE TABLE IF NOT EXISTS coupons (
     used_at INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS coupon_usages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    used_at INTEGER NOT NULL,
+    kind TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_coupon_usages_code ON coupon_usages(code);
+CREATE INDEX IF NOT EXISTS idx_coupon_usages_user_kind ON coupon_usages(user_id, kind);
+
 CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -81,6 +92,7 @@ class DB:
 
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
             await db.executescript(SCHEMA)
             for ddl in (
                 "ALTER TABLE users ADD COLUMN accepted_legal INTEGER NOT NULL DEFAULT 0",
@@ -105,6 +117,29 @@ class DB:
                 )
             except Exception as err:  # noqa: BLE001
                 logging.exception("Не удалось создать индексы платежей", exc_info=err)
+
+            try:
+                cur = await db.execute(
+                    "SELECT code, kind, used_by, used_at FROM coupons WHERE used_by IS NOT NULL AND used_at IS NOT NULL"
+                )
+                rows = await cur.fetchall()
+                for row in rows:
+                    if row["used_by"] is None:
+                        continue
+                    exists_cur = await db.execute(
+                        "SELECT 1 FROM coupon_usages WHERE code=? AND user_id=? AND used_at=?",
+                        (row["code"], row["used_by"], row["used_at"]),
+                    )
+                    if await exists_cur.fetchone() is not None:
+                        continue
+                    await db.execute(
+                        "INSERT INTO coupon_usages(code, user_id, used_at, kind) VALUES(?, ?, ?, ?)",
+                        (row["code"], row["used_by"], row["used_at"], row["kind"]),
+                    )
+            except Exception as err:  # noqa: BLE001
+                logging.exception(
+                    "Не удалось перенести историю использования промокодов", exc_info=err
+                )
             await db.commit()
 
     async def get_user(self, user_id: int) -> Optional[aiosqlite.Row]:
@@ -499,7 +534,7 @@ class DB:
             cur = await db.execute("SELECT * FROM coupons WHERE code=?", (normalized,))
             row = await cur.fetchone()
             if row is None:
-                return False, "Промокод недействителен или уже использован.", None
+                return False, "Промокод недействителен или истёк.", None
 
             now_ts = int(time.time())
             keys = set(row.keys())
@@ -515,17 +550,16 @@ class DB:
                 except (TypeError, ValueError):
                     logging.warning("Некорректное значение срока действия промокода %s: %s", normalized, expires_raw)
             if expires_at is not None and expires_at < now_ts:
-                return False, "Промокод недействителен или уже использован.", row["kind"]
-
-            used_raw = row["used_at"]
-            if used_raw not in (None, ""):
-                return False, "Промокод недействителен или уже использован.", row["kind"]
+                return False, "Промокод недействителен или истёк.", row["kind"]
 
             kind = row["kind"]
-
             await db.execute(
                 "UPDATE coupons SET used_by=?, used_at=? WHERE code=?",
                 (user_id, now_ts, normalized),
+            )
+            await db.execute(
+                "INSERT INTO coupon_usages(code, user_id, used_at, kind) VALUES(?, ?, ?, ?)",
+                (normalized, user_id, now_ts, kind),
             )
             # Здесь можно расширить логику для разных типов купонов (скидки, бонусы и т.д.)
             await db.commit()
