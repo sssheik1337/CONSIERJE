@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS users (
     auto_renew INTEGER NOT NULL DEFAULT 0,
     paid_only INTEGER NOT NULL DEFAULT 0,
     accepted_legal INTEGER NOT NULL DEFAULT 0,
-    accepted_at INTEGER
+    accepted_at INTEGER,
+    invite_issued INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -97,6 +98,7 @@ class DB:
             for ddl in (
                 "ALTER TABLE users ADD COLUMN accepted_legal INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN accepted_at INTEGER",
+                "ALTER TABLE users ADD COLUMN invite_issued INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE payments ADD COLUMN order_id TEXT",
             ):
                 try:
@@ -194,6 +196,16 @@ class DB:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 "UPDATE users SET auto_renew=? WHERE user_id=?",
+                (1 if flag else 0, user_id),
+            )
+            await db.commit()
+
+    async def set_invite_issued(self, user_id: int, flag: bool) -> None:
+        """Обновить признак выдачи одноразовой ссылки пользователю."""
+
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET invite_issued=? WHERE user_id=?",
                 (1 if flag else 0, user_id),
             )
             await db.commit()
@@ -507,12 +519,20 @@ class DB:
             if row is None:
                 return
             expires_at = row["expires_at"] or 0
+            invite_flag = 0
+            if hasattr(row, "keys") and "invite_issued" in row.keys():
+                try:
+                    invite_flag = int(row["invite_issued"] or 0)
+                except (TypeError, ValueError):
+                    invite_flag = 0
             now_ts = int(datetime.utcnow().timestamp())
             delta = int(timedelta(days=30 * months).total_seconds())
             new_exp = max(expires_at, now_ts) + delta
+            expired_before = expires_at <= now_ts
+            new_invite_flag = 0 if expired_before else invite_flag
             await db.execute(
-                "UPDATE users SET expires_at=? WHERE user_id=?",
-                (new_exp, user_id),
+                "UPDATE users SET expires_at=?, invite_issued=? WHERE user_id=?",
+                (new_exp, new_invite_flag, user_id),
             )
             await db.commit()
 
@@ -554,8 +574,8 @@ class DB:
 
             kind = row["kind"]
             await db.execute(
-                "UPDATE coupons SET used_by=?, used_at=? WHERE code=?",
-                (user_id, now_ts, normalized),
+                "UPDATE coupons SET used_by=NULL, used_at=? WHERE code=?",
+                (now_ts, normalized),
             )
             await db.execute(
                 "INSERT INTO coupon_usages(code, user_id, used_at, kind) VALUES(?, ?, ?, ?)",

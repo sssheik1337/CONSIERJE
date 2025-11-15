@@ -13,6 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    ChatMember,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
@@ -656,7 +657,7 @@ async def apply_trial_coupon(db: DB, user_id: int) -> tuple[bool, str]:
         new_exp = now_ts + trial_seconds
         async with aiosqlite.connect(db.path) as conn:
             await conn.execute(
-                "UPDATE users SET expires_at=?, paid_only=0 WHERE user_id=?",
+                "UPDATE users SET expires_at=?, paid_only=0, invite_issued=0 WHERE user_id=?",
                 (new_exp, user_id),
             )
             await conn.commit()
@@ -1144,6 +1145,35 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         return
 
     user = await db.get_user(callback.from_user.id)
+
+    async def send_invite_failure(info_text: str, hint_text: str | None) -> None:
+        """Отправить пользователю сообщение о невозможности выдать ссылку."""
+
+        if not callback.message:
+            return
+        hint_value = hint_text or ""
+        hint_lower = hint_value.lower()
+        hint_is_link = hint_lower.startswith("http://") or hint_lower.startswith("https://")
+        lines: list[str] = []
+        if info_text:
+            lines.append(escape_md(info_text))
+        if hint_text and not hint_is_link:
+            lines.append(escape_md(hint_value))
+        combined_lower = " ".join(lines).lower()
+        expired_line = escape_md("Ссылка устарела, запросите новую")
+        if "устарел" not in combined_lower:
+            lines.append(expired_line)
+        text = "\n".join(lines) if lines else expired_line
+        reply_markup = (
+            invite_button_markup(hint_value, permanent=True) if hint_is_link else main_menu_markup()
+        )
+        await callback.message.answer(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
     now_ts = int(datetime.utcnow().timestamp())
     expires_at = int(user["expires_at"] or 0) if user else 0
     has_active_subscription = expires_at > now_ts
@@ -1166,7 +1196,85 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
             )
         await callback.answer("Нет активной подписки", show_alert=True)
         return
+    chat_id = await db.get_target_chat_id()
+    if chat_id is None:
+        ok, info, hint = await make_one_time_invite(bot, db)
+        await send_invite_failure(info, hint)
+        await callback.answer("Чат не привязан", show_alert=True)
+        return
+
+    member: ChatMember | None = None
+    try:
+        member = await bot.get_chat_member(chat_id, callback.from_user.id)
+    except TelegramForbiddenError as err:
+        logging.warning("Не удалось проверить участие пользователя %s: %s", callback.from_user.id, err)
+        ok, info, hint = await make_one_time_invite(bot, db)
+        await send_invite_failure(info, hint)
+        await callback.answer("Бот не имеет доступа к чату", show_alert=True)
+        return
+    except TelegramBadRequest as err:
+        logging.warning(
+            "Ошибка Telegram при проверке участия пользователя %s: %s",
+            callback.from_user.id,
+            err,
+        )
+        ok, info, hint = await make_one_time_invite(bot, db)
+        await send_invite_failure(info, hint)
+        await callback.answer("Не удалось проверить участие", show_alert=True)
+        return
+    except Exception as err:  # noqa: BLE001
+        logging.exception(
+            "Сбой при проверке участия пользователя %s в канале", callback.from_user.id, exc_info=err
+        )
+        if callback.message:
+            await callback.message.answer(
+                escape_md(
+                    "Не удалось проверить участие в канале. Попробуйте позже или обратитесь к администратору."
+                ),
+                reply_markup=main_menu_markup(),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        await callback.answer("Ошибка проверки участия", show_alert=True)
+        return
+
+    status_raw = getattr(member, "status", "") if member else ""
+    status_value = status_raw.value if hasattr(status_raw, "value") else str(status_raw)
+    if status_value.lower() in {"member", "administrator", "creator", "owner"}:
+        if callback.message:
+            await callback.message.answer(
+                escape_md("Вы уже являетесь участником канала, пригласительная ссылка вам не нужна."),
+                reply_markup=main_menu_markup(),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        await callback.answer()
+        return
+
+    invite_flag = 0
+    if user and hasattr(user, "keys") and "invite_issued" in user.keys():
+        try:
+            invite_flag = int(user["invite_issued"] or 0)
+        except (TypeError, ValueError):
+            invite_flag = 0
+    if invite_flag:
+        if callback.message:
+            await callback.message.answer(
+                escape_md(
+                    "Вы уже использовали свою одноразовую ссылку. Если вы вышли из канала, свяжитесь с администратором"
+                    " для восстановления доступа."
+                ),
+                reply_markup=main_menu_markup(),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        await callback.answer("Ссылка уже выдавалась", show_alert=True)
+        return
+
     ok, info, hint = await make_one_time_invite(bot, db)
+    if ok:
+        await db.set_invite_issued(callback.from_user.id, True)
+
     if callback.message:
         if ok:
             await callback.message.answer(
@@ -1176,28 +1284,7 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
                 disable_web_page_preview=True,
             )
         else:
-            hint_value = hint or ""
-            hint_lower = hint_value.lower()
-            hint_is_link = hint_lower.startswith("http://") or hint_lower.startswith("https://")
-            lines: list[str] = []
-            if info:
-                lines.append(escape_md(info))
-            if hint and not hint_is_link:
-                lines.append(escape_md(hint))
-            combined_lower = " ".join(lines).lower()
-            expired_line = escape_md("Ссылка устарела, запросите новую")
-            if "устарел" not in combined_lower:
-                lines.append(expired_line)
-            text = "\n".join(lines) if lines else expired_line
-            reply_markup = (
-                invite_button_markup(hint_value, permanent=True) if hint_is_link else main_menu_markup()
-            )
-            await callback.message.answer(
-                text,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN_V2,
-                disable_web_page_preview=True,
-            )
+            await send_invite_failure(info, hint)
     if ok:
         await callback.answer()
     else:
