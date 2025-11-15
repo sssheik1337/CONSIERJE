@@ -34,7 +34,11 @@ COUPON_KIND_TRIAL = "trial"
 MD_V2_SPECIAL = set("_*[]()~`>#+-=|{}.!\\")
 
 CANCEL_REPLY = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Отмена")]],
+    keyboard=[
+        [KeyboardButton(text="⬅️ Назад")],
+        [KeyboardButton(text="🏠 Главное меню")],
+        [KeyboardButton(text="Отмена")],
+    ],
     resize_keyboard=True,
 )
 
@@ -93,12 +97,34 @@ def inline_emoji(flag: bool) -> str:
     return "✅" if flag else "❌"
 
 
+def _normalize_control_text(text: str | None) -> str:
+    """Нормализовать текст кнопок управления для сравнения."""
+
+    if text is None:
+        return ""
+    cleaned = (
+        text.replace("🏠", "")
+        .replace("⬅️", "")
+        .replace("✅", "")
+        .replace("❌", "")
+        .strip()
+        .lower()
+    )
+    return cleaned
+
+
 def is_cancel(text: str | None) -> bool:
     """Понять, хочет ли пользователь отменить ввод."""
 
-    if text is None:
-        return False
-    return text.strip().lower() == "отмена"
+    cleaned = _normalize_control_text(text)
+    return cleaned in {"отмена", "назад"}
+
+
+def is_go_home(text: str | None) -> bool:
+    """Понять, хочет ли пользователь вернуться в главное меню."""
+
+    cleaned = _normalize_control_text(text)
+    return cleaned in {"главное меню", "домой"}
 
 
 async def has_trial_coupon(db: DB, user_id: int) -> bool:
@@ -253,6 +279,41 @@ def main_menu_markup() -> InlineKeyboardMarkup:
     builder.button(text="🏠 Главное меню", callback_data="menu:home")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def send_main_menu_screen(
+    message: Message,
+    db: DB,
+    notice: str | None = None,
+) -> None:
+    """Показать главное меню пользователю с удалением реплай-клавиатуры."""
+
+    notice_text = notice or "Возвращаю в главное меню."
+    await message.answer(
+        escape_md(notice_text),
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    menu = await get_user_menu(db, message.from_user.id)
+    await message.answer(
+        escape_md(START_TEXT),
+        reply_markup=menu,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+
+
+async def go_home_from_state(
+    message: Message,
+    state: FSMContext,
+    db: DB,
+    notice: str | None = None,
+) -> None:
+    """Очистить состояние и вернуть пользователя в главное меню."""
+
+    await state.clear()
+    await send_main_menu_screen(message, db, notice)
 
 
 def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMarkup:
@@ -981,6 +1042,7 @@ async def handle_buy(callback: CallbackQuery, db: DB) -> None:
     builder.button(text="Перейти к оплате 💳", url=payment_url)
     if payment_id:
         builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
     builder.adjust(1)
     if callback.message:
         text_lines = [
@@ -1042,6 +1104,7 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
             display_text = "✅ Оплата подтверждена и подписка продлена."
         await callback.message.answer(
             escape_md(display_text),
+            reply_markup=main_menu_markup(),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
@@ -1155,20 +1218,11 @@ async def handle_promo_input(message: Message, state: FSMContext, db: DB) -> Non
     """Обработать ввод промокода пользователем."""
 
     text = message.text or ""
+    if is_go_home(text):
+        await go_home_from_state(message, state, db, "Возвращаю вас в главное меню.")
+        return
     if is_cancel(text):
-        await state.clear()
-        await message.answer(
-            escape_md("Ввод промокода отменён."),
-            reply_markup=ReplyKeyboardRemove(),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
-        await message.answer(
-            escape_md("Меню обновлено."),
-            reply_markup=await get_user_menu(db, message.from_user.id),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
+        await go_home_from_state(message, state, db, "Ввод промокода отменён.")
         return
     await redeem_promo_code(message, db, text, remove_keyboard=True)
     await state.clear()
@@ -1217,7 +1271,8 @@ async def admin_bind_chat(callback: CallbackQuery, state: FSMContext) -> None:
         )
         await callback.message.answer(
             escape_md(
-                "Пришлите @username, username или chat_id канала/группы."
+                "Пришлите @username, username или chat_id канала/группы.\n\n"
+                "Можно нажать «⬅️ Назад» или «🏠 Главное меню»."
             ),
             reply_markup=CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -1239,6 +1294,9 @@ async def process_bind_username(
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Привязка отменена."),
@@ -1592,6 +1650,9 @@ async def price_add_months(message: Message, state: FSMContext, db: DB, bot: Bot
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Создание тарифа отменено."),
@@ -1635,6 +1696,9 @@ async def price_add_price(message: Message, state: FSMContext, db: DB, bot: Bot)
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Создание тарифа отменено."),
@@ -1739,6 +1803,9 @@ async def price_edit_price_input(message: Message, state: FSMContext, db: DB, bo
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Изменение отменено."),
@@ -1825,6 +1892,9 @@ async def price_edit_months_input(message: Message, state: FSMContext, db: DB, b
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Изменение отменено."),
@@ -1966,6 +2036,9 @@ async def admin_set_trial_days(message: Message, state: FSMContext, db: DB, bot:
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Изменение отменено."),
@@ -2045,6 +2118,9 @@ async def admin_save_custom_code(message: Message, state: FSMContext, db: DB, bo
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Создание промокода отменено."),
