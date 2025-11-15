@@ -141,6 +141,7 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
     if not payment_id:
         return False
 
+    logger.info("Ручная проверка оплаты: запрос статуса payment_id=%s", payment_id)
     try:
         response = await get_payment_state(payment_id)
     except Exception as err:  # noqa: BLE001
@@ -151,6 +152,11 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
         return False
 
     status = (response.get("Status") or "").upper()
+    logger.info(
+        "Ручная проверка оплаты: получен статус %s для payment_id=%s",
+        status or "неизвестно",
+        payment_id,
+    )
     db_instance = db or _get_db()
     if status:
         await db_instance.set_payment_status(payment_id, status)

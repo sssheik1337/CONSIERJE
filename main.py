@@ -131,7 +131,7 @@ async def tbank_notify(request: web.Request) -> web.Response:
     status_upper = status_raw.upper()
 
     logging.info(
-        "Webhook T-Bank: status=%s payment_id=%s order_id=%s",
+        "Webhook от T-Bank: статус=%s payment_id=%s order_id=%s",
         status_upper or status_raw,
         payment_id or "-",
         order_id or "-",
