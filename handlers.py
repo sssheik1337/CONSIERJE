@@ -42,7 +42,7 @@ START_TEXT = "🎟️ Доступ в канал\nВыберите действ�
 
 
 class BindChat(StatesGroup):
-    """Состояния для привязки чата по username."""
+    """Состояния для привязки чата по идентификатору."""
 
     wait_username = State()
 
@@ -1118,7 +1118,7 @@ async def open_admin_panel(callback: CallbackQuery, db: DB) -> None:
 
 @router.callback_query(F.data == "admin:bind_chat")
 async def admin_bind_chat(callback: CallbackQuery, state: FSMContext) -> None:
-    """Запросить у администратора username целевого чата."""
+    """Запросить у администратора идентификатор целевого чата."""
 
     if not is_super_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
@@ -1130,7 +1130,9 @@ async def admin_bind_chat(callback: CallbackQuery, state: FSMContext) -> None:
             panel_message_id=callback.message.message_id,
         )
         await callback.message.answer(
-            escape_md("Пришлите @username канала или группы."),
+            escape_md(
+                "Пришлите @username, username или chat_id канала/группы."
+            ),
             reply_markup=CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
@@ -1145,7 +1147,7 @@ async def process_bind_username(
     db: DB,
     state: FSMContext,
 ) -> None:
-    """Привязать чат по присланному username."""
+    """Привязать чат по присланному идентификатору."""
 
     if not is_super_admin(message.from_user.id):
         await state.clear()
@@ -1160,38 +1162,198 @@ async def process_bind_username(
         )
         await state.clear()
         return
-    if not text.startswith("@") or len(text) < 2:
+    compact = "".join(text.split())
+    if not compact:
         await message.answer(
-            escape_md("Нужен username в формате @example."),
+            escape_md("Введите идентификатор чата или отмените команду."),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
         return
+
+    is_numeric_candidate = False
+    if compact.startswith("-"):
+        is_numeric_candidate = compact[1:].isdigit()
+    elif compact.isdigit():
+        is_numeric_candidate = True
+
+    normalized_chat_id: int | None = None
+    chat = None
+
+    if is_numeric_candidate:
+        digits = compact
+        numeric_candidates: list[int] = []
+
+        if digits.startswith("-"):
+            try:
+                numeric_candidates.append(int(digits))
+            except ValueError:
+                numeric_candidates = []
+        else:
+            try:
+                value = int(digits)
+            except ValueError:
+                numeric_candidates = []
+            else:
+                if len(digits) >= 11 and digits.startswith("100"):
+                    numeric_candidates.append(-value)
+                try:
+                    numeric_candidates.append(int(f"-100{digits}"))
+                except ValueError:
+                    pass
+                numeric_candidates.append(-value)
+                numeric_candidates.append(value)
+
+        seen_candidates: set[int] = set()
+        ordered_candidates: list[int] = []
+        for candidate in numeric_candidates:
+            if candidate not in seen_candidates:
+                seen_candidates.add(candidate)
+                ordered_candidates.append(candidate)
+
+        last_error: Exception | None = None
+        for candidate in ordered_candidates:
+            try:
+                chat = await bot.get_chat(candidate)
+            except TelegramForbiddenError:
+                await message.answer(
+                    escape_md(
+                        "Бот не имеет доступа к чату. Назначьте его администратором."
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_web_page_preview=True,
+                )
+                return
+            except TelegramBadRequest as err:
+                last_error = err
+                continue
+            except Exception as err:
+                logging.exception("Ошибка при получении чата", exc_info=err)
+                await message.answer(
+                    escape_md("Произошла ошибка при получении чата. Попробуйте позже."),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_web_page_preview=True,
+                )
+                return
+            else:
+                normalized_chat_id = chat.id
+                break
+
+        if chat is None:
+            logging.warning(
+                "Не удалось подобрать чат по числовому идентификатору: %s", compact
+            )
+            await message.answer(
+                escape_md("Не удалось получить чат. Проверьте идентификатор и права бота."),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            if last_error is not None:
+                logging.debug("Последняя ошибка Telegram: %s", last_error)
+            return
+    else:
+        if not compact.startswith("@"):
+            compact = f"@{compact}"
+        try:
+            chat = await bot.get_chat(compact)
+        except TelegramBadRequest:
+            await message.answer(
+                escape_md("Не удалось получить чат. Проверьте идентификатор и права бота."),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            return
+        except TelegramForbiddenError:
+            await message.answer(
+                escape_md("Бот не имеет доступа к чату. Назначьте его администратором."),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception:
+            await message.answer(
+                escape_md("Произошла ошибка при получении чата. Попробуйте позже."),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            return
+
+        normalized_chat_id = chat.id
+
+    if normalized_chat_id is None or chat is None:
+        await message.answer(
+            escape_md("Не удалось определить чат. Проверьте введённые данные."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
     try:
-        chat = await bot.get_chat(text)
-    except TelegramBadRequest:
+        me = await bot.me()
+        member = await bot.get_chat_member(chat.id, me.id)
+    except TelegramForbiddenError:
         await message.answer(
-            escape_md("Не удалось получить чат. Проверьте username и права бота."),
+            escape_md(
+                "Бот не является администратором в чате. Выдайте права администратора."
+            ),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
         return
-    except Exception:
+    except TelegramBadRequest as err:
+        logging.exception("Ошибка при проверке прав бота", exc_info=err)
         await message.answer(
-            escape_md("Произошла ошибка при получении чата. Попробуйте позже."),
+            escape_md("Не удалось проверить права бота. Проверьте настройки чата."),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
         return
+    except Exception as err:
+        logging.exception("Неожиданная ошибка при проверке прав бота", exc_info=err)
+        await message.answer(
+            escape_md("Не удалось проверить права бота. См. логи."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
+    member_status = getattr(member, "status", "")
+    status_value = member_status.value if hasattr(member_status, "value") else str(member_status)
+    if status_value not in {"administrator", "creator"}:
+        await message.answer(
+            escape_md("Бот не администратор в чате. Назначьте права и повторите."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
+    invite_allowed = getattr(member, "can_invite_users", None)
+    if invite_allowed is False:
+        await message.answer(
+            escape_md(
+                "У бота нет права на создание пригласительных ссылок. Включите его."
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
     stored_username = getattr(chat, "username", None)
     if stored_username:
-        stored_value = f"@{stored_username}"
+        username_to_store = f"@{stored_username}"
     else:
-        stored_value = text
-    await db.set_target_chat_username(stored_value)
-    await db.set_target_chat_id(chat.id)
+        username_to_store = ""
+
+    await db.set_target_chat_username(username_to_store)
+    await db.set_target_chat_id(normalized_chat_id)
+
+    if username_to_store:
+        chat_repr = f"{username_to_store} (id {normalized_chat_id})"
+    else:
+        chat_repr = f"(id {normalized_chat_id})"
+
     await message.answer(
-        escape_md(f"✅ Чат {stored_value} (id {chat.id}) привязан."),
+        escape_md(f"✅ Чат {chat_repr} привязан."),
         reply_markup=ReplyKeyboardRemove(),
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
