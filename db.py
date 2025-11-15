@@ -487,6 +487,52 @@ class DB:
             cur = await db.execute("SELECT * FROM users WHERE expires_at<?", (now_ts,))
             return await cur.fetchall()
 
+    async def use_coupon(self, code: str, user_id: int) -> tuple[bool, str, str | None]:
+        """Попытаться применить промокод пользователя."""
+
+        normalized = self._normalize_code(code)
+        if not normalized:
+            return False, "Промокод не должен быть пустым.", None
+
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM coupons WHERE code=?", (normalized,))
+            row = await cur.fetchone()
+            if row is None:
+                return False, "Промокод недействителен или уже использован.", None
+
+            now_ts = int(time.time())
+            keys = set(row.keys())
+            expires_raw = None
+            for candidate in ("expires_at", "valid_until", "valid_till"):
+                if candidate in keys:
+                    expires_raw = row[candidate]
+                    break
+            expires_at: Optional[int] = None
+            if expires_raw not in (None, ""):
+                try:
+                    expires_at = int(expires_raw)
+                except (TypeError, ValueError):
+                    logging.warning("Некорректное значение срока действия промокода %s: %s", normalized, expires_raw)
+            if expires_at is not None and expires_at < now_ts:
+                return False, "Промокод недействителен или уже использован.", row["kind"]
+
+            used_raw = row["used_at"]
+            if used_raw not in (None, ""):
+                return False, "Промокод недействителен или уже использован.", row["kind"]
+
+            kind = row["kind"]
+
+            await db.execute(
+                "UPDATE coupons SET used_by=?, used_at=? WHERE code=?",
+                (user_id, now_ts, normalized),
+            )
+            # Здесь можно расширить логику для разных типов купонов (скидки, бонусы и т.д.)
+            await db.commit()
+
+        logging.info("Промокод %s применён пользователем %s как тип %s", normalized, user_id, kind)
+        return True, "Промокод успешно активирован.", kind
+
     async def gen_coupons(self, kind: str, count: int) -> List[str]:
         if count <= 0:
             return []
