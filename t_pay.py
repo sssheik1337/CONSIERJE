@@ -1,43 +1,74 @@
-import os
+import asyncio
 import hashlib
 import json
-from typing import Any, Dict, Optional
+import logging
+import os
+import socket
+from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
+from dotenv import load_dotenv
+
+
+class TBankHttpError(RuntimeError):
+    """Ошибка HTTP уровня при обращении к T-Bank."""
+
+
+class TBankApiError(RuntimeError):
+    """Ошибка бизнес-логики, возвращённая T-Bank API."""
+
+    def __init__(self, code: str, message: str, details: Optional[str] = None):
+        self.code = code
+        self.details = details
+        base_message = f"[{code}] {message}"
+        if details:
+            base_message = f"{base_message} | {details}"
+        super().__init__(base_message)
+
+load_dotenv()
 
 """
 Этот модуль инкапсулирует работу с API интернет‑эквайринга T‑Bank (Tinkoff).
-Для всех вызовов необходим TerminalKey и пароль, которые выдаются в
-личном кабинете. Они считываются из переменных окружения:
+Для всех вызовов необходим TerminalKey и пароль, которые считываются из
+переменных окружения. Дополнительно можно задавать success/fail URL, URL
+уведомлений и API токен.
 
-  T_PAY_BASE_URL      – базовый URL для запросов (по умолчанию https://securepay.tinkoff.ru/v2)
-  T_PAY_TERMINAL_KEY  – идентификатор терминала
-  T_PAY_PASSWORD      – пароль терминала для генерации токена
-  T_PAY_API_TOKEN     – API-токен (опционально). Если указан, передаётся в заголовке Authorization.
-  T_PAY_NOTIFICATION_URL – URL для уведомлений о состоянии платежей (опционально)
-  T_PAY_SUCCESS_URL       – URL для перенаправления клиента при успешной оплате (опционально)
-  T_PAY_FAIL_URL          – URL для перенаправления клиента при неудачной оплате (опционально)
-
-Примечание: сумма передается в копейках (например, 100₽ = 10000).
+Примечание: сумма передаётся в копейках (например, 100₽ = 10000).
 """
 
-# Читаем настройки из окружения
-T_PAY_BASE_URL: str = os.getenv("T_PAY_BASE_URL", "https://securepay.tinkoff.ru/v2").rstrip("/")
-T_PAY_TERMINAL_KEY: str = os.getenv("T_PAY_TERMINAL_KEY", "")
-T_PAY_PASSWORD: str = os.getenv("T_PAY_PASSWORD", "")
-T_PAY_API_TOKEN: Optional[str] = os.getenv("T_PAY_API_TOKEN") or None
-T_PAY_NOTIFICATION_URL: Optional[str] = os.getenv("T_PAY_NOTIFICATION_URL") or None
-T_PAY_SUCCESS_URL: Optional[str] = os.getenv("T_PAY_SUCCESS_URL") or None
-T_PAY_FAIL_URL: Optional[str] = os.getenv("T_PAY_FAIL_URL") or None
+
+def _read_env() -> Tuple[str, str, str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Прочитать и провалидировать настройки окружения для T-Bank."""
+
+    base_url = (os.getenv("T_PAY_BASE_URL") or "https://securepay.tinkoff.ru/v2").rstrip("/")
+    terminal_key = (os.getenv("T_PAY_TERMINAL_KEY", "") or "").strip()
+    password = (os.getenv("T_PAY_PASSWORD", "") or "").strip()
+    if not terminal_key or not password:
+        raise RuntimeError("T_PAY_TERMINAL_KEY/T_PAY_PASSWORD не заданы")
+
+    success_url = (os.getenv("T_PAY_SUCCESS_URL") or "").strip() or None
+    fail_url = (os.getenv("T_PAY_FAIL_URL") or "").strip() or None
+    notification_url = (os.getenv("T_PAY_NOTIFICATION_URL") or "").strip() or None
+    api_token = (os.getenv("T_PAY_API_TOKEN") or "").strip() or None
+
+    return (
+        base_url,
+        terminal_key,
+        password,
+        success_url,
+        fail_url,
+        notification_url,
+        api_token,
+    )
 
 
-def _generate_token(payload: Dict[str, Any]) -> str:
+def _generate_token(payload: Dict[str, Any], password: str) -> str:
     """
     Сформировать токен подписи запроса согласно документации T‑Bank.
 
     Алгоритм:
       1. Взять только параметры корневого объекта (исключить вложенные словари и списки).
-      2. Добавить пару {"Password": T_PAY_PASSWORD}.
+      2. Добавить пару {"Password": пароль терминала}.
       3. Отсортировать пары по ключу в алфавитном порядке.
       4. Сконкатенировать значения пар в одну строку.
       5. Посчитать SHA‑256 от строки и вернуть шестнадцатеричное представление.
@@ -55,7 +86,7 @@ def _generate_token(payload: Dict[str, Any]) -> str:
             continue
         items.append((key, str(value)))
     # Добавляем секретный пароль
-    items.append(("Password", T_PAY_PASSWORD))
+    items.append(("Password", password))
     # Сортировка по ключу
     items.sort(key=lambda x: x[0])
     # Конкатенация только значений
@@ -64,7 +95,15 @@ def _generate_token(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(token_string.encode("utf-8")).hexdigest()
 
 
-async def _post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+async def _post(
+    endpoint: str,
+    payload: Dict[str, Any],
+    *,
+    base_url: str,
+    terminal_key: str,
+    password: str,
+    api_token: Optional[str],
+) -> Dict[str, Any]:
     """
     Общий метод для выполнения POST‑запроса к T‑Bank.
 
@@ -74,26 +113,90 @@ async def _post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     :return: JSON‑ответ сервера.
     :raises aiohttp.ClientError: при сетевой ошибке.
     """
-    url = f"{T_PAY_BASE_URL}/{endpoint.lstrip('/')}"
-    # Устанавливаем обязательные поля
-    payload = payload.copy()
-    payload.setdefault("TerminalKey", T_PAY_TERMINAL_KEY)
-    # Генерируем подпись
-    payload["Token"] = _generate_token(payload)
+    url = f"{base_url}/{endpoint.lstrip('/')}"
+    body = payload.copy()
+    body.setdefault("TerminalKey", terminal_key)
+    terminal_key_value = str(body["TerminalKey"]).strip()
+    if not (1 <= len(terminal_key_value) <= 64):
+        raise RuntimeError("Некорректное значение TerminalKey")
+    body["TerminalKey"] = terminal_key_value
+    body["Token"] = _generate_token(body, password)
     headers = {
         "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "ConciergeBot/1.0",
     }
-    if T_PAY_API_TOKEN:
-        headers["Authorization"] = f"Bearer {T_PAY_API_TOKEN}"
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, headers=headers) as resp:
-            # попытаться вернуть json, даже если статус код != 200
-            try:
-                data = await resp.json()
-            except Exception:
+        async with session.post(url, json=body, headers=headers) as resp:
+            if resp.status != 200:
                 text = await resp.text()
-                raise RuntimeError(f"Unexpected response from {url}: {text}")
+                raise TBankHttpError(
+                    f"HTTP {resp.status} {resp.content_type}: {text[:500]}"
+                )
+            if resp.content_type != "application/json":
+                text = await resp.text()
+                raise TBankHttpError(
+                    f"Unexpected content-type {resp.content_type}: {text[:500]}"
+                )
+            data = await resp.json()
+            if isinstance(data, dict) and data.get("Success") is False:
+                raise TBankApiError(
+                    str(data.get("ErrorCode", "")),
+                    data.get("Message", ""),
+                    data.get("Details"),
+                )
             return data
+
+
+async def net_diagnostics() -> Dict[str, Any]:
+    """Выполнить сетевую диагностику доступности T-Bank."""
+
+    result: Dict[str, Any] = {}
+    try:
+        result["local_ip"] = socket.gethostbyname(socket.gethostname())
+    except Exception as err:  # noqa: BLE001
+        result["local_ip"] = f"unresolved: {err}"
+
+    try:
+        loop = asyncio.get_running_loop()
+        result["event_loop"] = str(loop)
+    except RuntimeError:
+        result["event_loop"] = "loop not running"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.ipify.org", timeout=5) as resp:
+                result["external_ip_status"] = resp.status
+                result["external_ip"] = await resp.text()
+    except Exception as err:  # noqa: BLE001
+        result["external_ip_error"] = str(err)
+
+    base_url = (os.getenv("T_PAY_BASE_URL") or "https://securepay.tinkoff.ru/v2").rstrip("/")
+    host = base_url.split("//", 1)[1].split("/", 1)[0]
+    result["base_url"] = base_url
+    result["base_host"] = host
+
+    try:
+        dns_entries = socket.getaddrinfo("rest-api-test.tinkoff.ru", 443)
+        result["sandbox_dns_ok"] = True
+        result["sandbox_dns"] = list({entry[4][0] for entry in dns_entries})
+    except Exception as err:  # noqa: BLE001
+        result["sandbox_dns_ok"] = False
+        result["sandbox_dns_error"] = str(err)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{base_url}/Init", timeout=5) as resp:
+                result["probe_status"] = resp.status
+                result["probe_ct"] = resp.headers.get("Content-Type")
+                result["probe_body_peek"] = (await resp.text())[:200]
+    except Exception as err:  # noqa: BLE001
+        result["probe_error"] = str(err)
+
+    logging.info("[NET] diag: %s", json.dumps(result, ensure_ascii=False))
+    return result
 
 
 async def init_payment(
@@ -135,6 +238,22 @@ async def init_payment(
     :param extra: (опционально) дополнительные поля (будут вложены в DATA).
     :return: ответ метода Init (словарь). Полезные поля: PaymentURL, PaymentId, Status.
     """
+    (
+        base_url,
+        terminal_key,
+        password,
+        success_url_env,
+        fail_url_env,
+        notification_url_env,
+        api_token,
+    ) = _read_env()
+
+    logging.info(
+        "Init to %s | term_key_len=%s",
+        f"{base_url}/Init",
+        len(terminal_key),
+    )
+
     payload: Dict[str, Any] = {
         "Amount": amount,
         "OrderId": order_id,
@@ -148,12 +267,12 @@ async def init_payment(
         payload["Language"] = language
     if recurrent:
         payload["Recurrent"] = recurrent
-    if notification_url or T_PAY_NOTIFICATION_URL:
-        payload["NotificationURL"] = notification_url or T_PAY_NOTIFICATION_URL
-    if success_url or T_PAY_SUCCESS_URL:
-        payload["SuccessURL"] = success_url or T_PAY_SUCCESS_URL
-    if fail_url or T_PAY_FAIL_URL:
-        payload["FailURL"] = fail_url or T_PAY_FAIL_URL
+    if notification_url or notification_url_env:
+        payload["NotificationURL"] = notification_url or notification_url_env
+    if success_url or success_url_env:
+        payload["SuccessURL"] = success_url or success_url_env
+    if fail_url or fail_url_env:
+        payload["FailURL"] = fail_url or fail_url_env
     # Кастомные параметры в DATA
     if extra:
         payload["DATA"] = extra
@@ -165,7 +284,23 @@ async def init_payment(
         payload.setdefault("DATA", {})["Email"] = email
     if phone:
         payload.setdefault("DATA", {})["Phone"] = phone
-    return await _post("Init", payload)
+    try:
+        response = await _post(
+            "Init",
+            payload,
+            base_url=base_url,
+            terminal_key=terminal_key,
+            password=password,
+            api_token=api_token,
+        )
+    except TBankHttpError as err:
+        logging.error("NETWORK/HTTP: %s (проверьте whitelist/host)", err)
+        raise
+    except TBankApiError as err:
+        logging.error("API: %s", err)
+        raise
+
+    return response
 
 
 async def confirm_payment(
@@ -183,6 +318,16 @@ async def confirm_payment(
     :param ip: (опционально) IP‑адрес покупателя.
     :return: ответ метода Confirm.
     """
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
     payload: Dict[str, Any] = {
         "PaymentId": payment_id,
     }
@@ -192,7 +337,14 @@ async def confirm_payment(
         payload["IP"] = ip
     if receipt:
         payload["Receipt"] = receipt
-    return await _post("Confirm", payload)
+    return await _post(
+        "Confirm",
+        payload,
+        base_url=base_url,
+        terminal_key=terminal_key,
+        password=password,
+        api_token=api_token,
+    )
 
 
 async def get_payment_state(payment_id: str, ip: Optional[str] = None) -> Dict[str, Any]:
@@ -203,12 +355,36 @@ async def get_payment_state(payment_id: str, ip: Optional[str] = None) -> Dict[s
     :param ip: (опционально) IP‑адрес покупателя.
     :return: словарь с полями Status, ErrorCode, OrderId и т.п.
     """
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
     payload: Dict[str, Any] = {
         "PaymentId": payment_id,
     }
     if ip:
         payload["IP"] = ip
-    return await _post("GetState", payload)
+    try:
+        return await _post(
+            "GetState",
+            payload,
+            base_url=base_url,
+            terminal_key=terminal_key,
+            password=password,
+            api_token=api_token,
+        )
+    except TBankHttpError as err:
+        logging.error("NETWORK/HTTP: %s (проверьте whitelist/host)", err)
+        raise
+    except TBankApiError as err:
+        logging.error("API: %s", err)
+        raise
 
 
 async def finish_authorize(
@@ -236,6 +412,16 @@ async def finish_authorize(
     :param three_ds_v2: (опционально) параметры 3DS v2, если требуется аутентификация.
     :return: ответ метода FinishAuthorize.
     """
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
     payload: Dict[str, Any] = {
         "PaymentId": payment_id,
         "CardData": card_data,
@@ -251,12 +437,22 @@ async def finish_authorize(
     if three_ds_v2:
         # Параметры 3DS v2 должны быть плоскими полями, поэтому просто обновляем словарь
         payload.update(three_ds_v2)
-    return await _post("FinishAuthorize", payload)
+    return await _post(
+        "FinishAuthorize",
+        payload,
+        base_url=base_url,
+        terminal_key=terminal_key,
+        password=password,
+        api_token=api_token,
+    )
 
 
 __all__ = [
+    "TBankApiError",
+    "TBankHttpError",
     "init_payment",
     "confirm_payment",
     "get_payment_state",
     "finish_authorize",
+    "net_diagnostics",
 ]

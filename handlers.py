@@ -13,6 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    ChatMember,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
@@ -23,7 +24,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import config, get_docs_map
 from db import DB
-from payments import process_payment
+from payments import check_payment_status, create_payment
+from scheduler import daily_check
 
 router = Router()
 
@@ -34,7 +36,11 @@ COUPON_KIND_TRIAL = "trial"
 MD_V2_SPECIAL = set("_*[]()~`>#+-=|{}.!\\")
 
 CANCEL_REPLY = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Отмена")]],
+    keyboard=[
+        [KeyboardButton(text="⬅️ Назад")],
+        [KeyboardButton(text="🏠 Главное меню")],
+        [KeyboardButton(text="Отмена")],
+    ],
     resize_keyboard=True,
 )
 
@@ -42,7 +48,7 @@ START_TEXT = "🎟️ Доступ в канал\nВыберите действ�
 
 
 class BindChat(StatesGroup):
-    """Состояния для привязки чата по username."""
+    """Состояния для привязки чата по идентификатору."""
 
     wait_username = State()
 
@@ -81,6 +87,12 @@ def format_expiry(ts: int) -> str:
     return datetime.utcfromtimestamp(ts).strftime("%d.%m.%Y %H:%M UTC")
 
 
+def format_short_date(ts: int) -> str:
+    """Отформатировать дату в коротком виде ДД.ММ.ГГГГ."""
+
+    return datetime.utcfromtimestamp(ts).strftime("%d.%m.%Y")
+
+
 def is_super_admin(user_id: int) -> bool:
     """Проверить, является ли пользователь суперадмином."""
 
@@ -93,18 +105,46 @@ def inline_emoji(flag: bool) -> str:
     return "✅" if flag else "❌"
 
 
+def _normalize_control_text(text: str | None) -> str:
+    """Нормализовать текст кнопок управления для сравнения."""
+
+    if text is None:
+        return ""
+    cleaned = (
+        text.replace("🏠", "")
+        .replace("⬅️", "")
+        .replace("✅", "")
+        .replace("❌", "")
+        .strip()
+        .lower()
+    )
+    return cleaned
+
+
 def is_cancel(text: str | None) -> bool:
     """Понять, хочет ли пользователь отменить ввод."""
 
-    if text is None:
-        return False
-    return text.strip().lower() == "отмена"
+    cleaned = _normalize_control_text(text)
+    return cleaned in {"отмена", "назад"}
+
+
+def is_go_home(text: str | None) -> bool:
+    """Понять, хочет ли пользователь вернуться в главное меню."""
+
+    cleaned = _normalize_control_text(text)
+    return cleaned in {"главное меню", "домой"}
 
 
 async def has_trial_coupon(db: DB, user_id: int) -> bool:
     """Проверить, применял ли пользователь пробный промокод."""
 
     async with aiosqlite.connect(db.path) as conn:
+        cur = await conn.execute(
+            "SELECT 1 FROM coupon_usages WHERE kind=? AND user_id=? LIMIT 1",
+            (COUPON_KIND_TRIAL, user_id),
+        )
+        if await cur.fetchone() is not None:
+            return True
         cur = await conn.execute(
             "SELECT 1 FROM coupons WHERE kind=? AND used_by=? LIMIT 1",
             (COUPON_KIND_TRIAL, user_id),
@@ -185,6 +225,15 @@ async def make_one_time_invite(
             chat_id,
             member_limit=int(member_limit),
             expire_date=expire_ts,
+            creates_join_request=False,
+        )
+        logging.info(
+            "Создана одноразовая ссылка: chat_id=%s limit=%s expire=%s join_request=%s link=%s",
+            chat_id,
+            getattr(link, "member_limit", None),
+            getattr(link, "expire_date", None),
+            getattr(link, "creates_join_request", None),
+            link.invite_link,
         )
         return True, link.invite_link, ""
     except TelegramForbiddenError:
@@ -237,13 +286,59 @@ async def make_one_time_invite(
         )
 
 
-def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMarkup:
-    """Создать инлайн-кнопку для перехода по ссылке."""
+def main_menu_markup() -> InlineKeyboardMarkup:
+    """Создать клавиатуру с переходом в главное меню."""
 
     builder = InlineKeyboardBuilder()
-    text = "🔗 Войти в канал" if not permanent else "⚠️ Постоянная ссылка"
-    builder.button(text=text, url=link)
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
     builder.adjust(1)
+    return builder.as_markup()
+
+
+async def send_main_menu_screen(
+    message: Message,
+    db: DB,
+    notice: str | None = None,
+) -> None:
+    """Показать главное меню пользователю с удалением реплай-клавиатуры."""
+
+    notice_text = notice or "Возвращаю в главное меню."
+    await message.answer(
+        escape_md(notice_text),
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    menu = await get_user_menu(db, message.from_user.id)
+    main_text = await compose_main_menu_text(db, message.from_user.id)
+    await message.answer(
+        escape_md(main_text),
+        reply_markup=menu,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+
+
+async def go_home_from_state(
+    message: Message,
+    state: FSMContext,
+    db: DB,
+    notice: str | None = None,
+) -> None:
+    """Очистить состояние и вернуть пользователя в главное меню."""
+
+    await state.clear()
+    await send_main_menu_screen(message, db, notice)
+
+
+def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMarkup:
+    """Создать инлайн-кнопку для перехода по ссылке с возвратом в меню."""
+
+    builder = InlineKeyboardBuilder()
+    text = "➡️ Войти в канал" if not permanent else "⚠️ Постоянная ссылка"
+    builder.button(text=text, url=link)
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
+    builder.adjust(2)
     return builder.as_markup()
 
 
@@ -296,6 +391,10 @@ def build_user_menu_keyboard(
             callback_data=f"buy:months:{months}",
         )
     builder.button(
+        text="💳 Оплатить подписку",
+        callback_data="buy:open",
+    )
+    builder.button(
         text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
         callback_data="ar:toggle",
     )
@@ -315,6 +414,27 @@ async def get_user_menu(db: DB, user_id: int) -> InlineKeyboardMarkup:
     auto_flag = bool(user and user["auto_renew"])
     price_months = [months for months, _ in await db.get_all_prices()]
     return build_user_menu_keyboard(auto_flag, is_super_admin(user_id), price_months)
+
+
+async def compose_main_menu_text(db: DB, user_id: int) -> str:
+    """Сформировать текст главного меню с указанием статуса доступа."""
+
+    now_ts = int(datetime.utcnow().timestamp())
+    user = await db.get_user(user_id)
+    trial_end = 0
+    if user and hasattr(user, "keys") and "trial_end" in user.keys():
+        try:
+            trial_end = int(user["trial_end"] or 0)
+        except (TypeError, ValueError):
+            trial_end = 0
+    subscription_end = await db.get_subscription_end(user_id) or 0
+    if trial_end and now_ts < trial_end:
+        status_line = f"🧪 Пробный период до: {format_short_date(trial_end)}"
+    elif subscription_end and now_ts < subscription_end:
+        status_line = f"✅ Подписка активна до: {format_short_date(subscription_end)}"
+    else:
+        status_line = "⛔ Нет активной подписки. Доступ к каналу закрыт."
+    return f"{status_line}\n\n{START_TEXT}"
 
 
 async def refresh_user_menu(message: Message, db: DB, user_id: int) -> None:
@@ -555,24 +675,47 @@ async def apply_trial_coupon(db: DB, user_id: int) -> tuple[bool, str]:
     trial_seconds = int(timedelta(days=trial_days).total_seconds())
     now_ts = int(datetime.utcnow().timestamp())
     user = await db.get_user(user_id)
+    subscription_end = await db.get_subscription_end(user_id) or 0
+    trial_end_existing = 0
+    if user and hasattr(user, "keys") and "trial_end" in user.keys():
+        try:
+            trial_end_existing = int(user["trial_end"] or 0)
+        except (TypeError, ValueError):
+            trial_end_existing = 0
+
     if user is None:
         auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
         await db.upsert_user(user_id, now_ts, trial_days, auto_default, False)
-        await db.set_paid_only(user_id, False)
-        expires_at = now_ts + trial_seconds
-        return True, f"✅ Пробный доступ активирован до {format_expiry(expires_at)}."
-    expires_at = user["expires_at"] or 0
-    if expires_at <= now_ts:
-        new_exp = now_ts + trial_seconds
+        end_ts = now_ts + trial_seconds
         async with aiosqlite.connect(db.path) as conn:
             await conn.execute(
-                "UPDATE users SET expires_at=?, paid_only=0 WHERE user_id=?",
-                (new_exp, user_id),
+                """
+                UPDATE users
+                SET trial_start=?, trial_end=?, expires_at=?, paid_only=0, invite_issued=0
+                WHERE user_id=?
+                """,
+                (now_ts, end_ts, max(end_ts, subscription_end), user_id),
             )
             await conn.commit()
-        return True, f"✅ Пробный доступ активирован до {format_expiry(new_exp)}."
+        return True, f"✅ Пробный доступ активирован до {format_expiry(end_ts)}."
+
+    current_access = max(subscription_end, trial_end_existing)
+    if current_access <= now_ts:
+        new_end = now_ts + trial_seconds
+        async with aiosqlite.connect(db.path) as conn:
+            await conn.execute(
+                """
+                UPDATE users
+                SET trial_start=?, trial_end=?, expires_at=?, paid_only=0, invite_issued=0
+                WHERE user_id=?
+                """,
+                (now_ts, new_end, max(new_end, subscription_end), user_id),
+            )
+            await conn.commit()
+        return True, f"✅ Пробный доступ активирован до {format_expiry(new_end)}."
+
     await db.set_paid_only(user_id, False)
-    return True, f"✅ Промокод принят. Подписка активна до {format_expiry(expires_at)}."
+    return True, f"✅ Промокод принят. Подписка активна до {format_expiry(current_access)}."
 
 
 async def redeem_promo_code(
@@ -666,11 +809,79 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
         )
         return
     menu = await get_user_menu(db, user_id)
+    main_text = await compose_main_menu_text(db, user_id)
     await message.answer(
-        escape_md(START_TEXT),
+        escape_md(main_text),
         reply_markup=menu,
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data == "menu:home")
+async def handle_menu_home(callback: CallbackQuery, state: FSMContext, db: DB) -> None:
+    """Вернуть пользователя в главное меню по кнопке."""
+
+    await state.clear()
+    user_id = callback.from_user.id
+    user = await db.get_user(user_id)
+    if user is None:
+        if callback.message:
+            await callback.message.answer(
+                "Сначала выполните /start.",
+                reply_markup=None,
+            )
+        await callback.answer("Требуется команда /start", show_alert=True)
+        return
+
+    if not await db.has_accepted_legal(user_id):
+        if callback.message:
+            text, markup = build_welcome_with_legal()
+            await callback.message.answer(
+                text,
+                reply_markup=markup,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+        await callback.answer()
+        return
+
+    menu = await get_user_menu(db, user_id)
+    if callback.message:
+        main_text = await compose_main_menu_text(db, user_id)
+        await callback.message.answer(
+            escape_md(main_text),
+            reply_markup=menu,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.message(Command("test_expire_me"))
+async def cmd_test_expire_me(message: Message, db: DB, bot: Bot) -> None:
+    """Принудительно завершить подписку и триал для самотестирования суперадмина."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer(
+            escape_md("❌ Команда доступна только суперадминистратору."),
+            reply_markup=main_menu_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
+    past_dt = datetime.utcnow() - timedelta(minutes=1)
+    await db.set_subscription_end(message.from_user.id, past_dt)
+    await db.set_trial_end(message.from_user.id, past_dt)
+    try:
+        await daily_check(bot, db)
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Сбой тестовой проверки истечения подписки", exc_info=err)
+    await send_main_menu_screen(
+        message,
+        db,
+        notice="Тест: подписка и триал завершены, проверка истечения выполнена.",
     )
 
 
@@ -771,10 +982,11 @@ async def legal_accept(callback: CallbackQuery, bot: Bot, state: FSMContext, db:
                 disable_web_page_preview=True,
             )
     menu = await get_user_menu(db, user_id)
+    main_text = await compose_main_menu_text(db, user_id)
     if callback.message:
         try:
             await callback.message.answer(
-                escape_md(START_TEXT),
+                escape_md(main_text),
                 reply_markup=menu,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,
@@ -782,7 +994,7 @@ async def legal_accept(callback: CallbackQuery, bot: Bot, state: FSMContext, db:
         except TelegramBadRequest:
             await bot.send_message(
                 callback.message.chat.id,
-                escape_md(START_TEXT),
+                escape_md(main_text),
                 reply_markup=menu,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,
@@ -790,7 +1002,7 @@ async def legal_accept(callback: CallbackQuery, bot: Bot, state: FSMContext, db:
     else:
         await bot.send_message(
             user_id,
-            escape_md(START_TEXT),
+            escape_md(main_text),
             reply_markup=menu,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
@@ -836,20 +1048,58 @@ async def docs_back(callback: CallbackQuery, db: DB) -> None:
 
     if callback.message:
         menu = await get_user_menu(db, callback.from_user.id)
+        main_text = await compose_main_menu_text(db, callback.from_user.id)
         try:
             await callback.message.edit_text(
-                escape_md(START_TEXT),
+                escape_md(main_text),
                 reply_markup=menu,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,
             )
         except TelegramBadRequest:
             await callback.message.answer(
-                escape_md(START_TEXT),
+                escape_md(main_text),
                 reply_markup=menu,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,
             )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "buy:open")
+async def handle_buy_open(callback: CallbackQuery, db: DB) -> None:
+    """Показать пользователю список тарифов для оплаты."""
+
+    prices = await db.get_all_prices()
+    if not prices:
+        await callback.answer("Тарифы пока не настроены.", show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    for months, price in prices[:6]:
+        builder.button(
+            text=f"{months} мес — {price}₽",
+            callback_data=f"buy:months:{months}",
+        )
+    builder.button(text="❌ Отмена", callback_data="buy:cancel")
+    builder.adjust(1)
+    if callback.message:
+        await callback.message.answer(
+            "Выберите срок подписки для оплаты:",
+            reply_markup=builder.as_markup(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "buy:cancel")
+async def handle_buy_cancel(callback: CallbackQuery) -> None:
+    """Закрыть сообщение с выбором срока подписки."""
+
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            await callback.answer("Сообщение уже закрыто.", show_alert=True)
+            return
     await callback.answer()
 
 
@@ -869,25 +1119,81 @@ async def handle_buy(callback: CallbackQuery, db: DB) -> None:
     if price is None:
         await callback.answer("Тариф не найден.", show_alert=True)
         return
-    success, payment_text = await process_payment(user_id, months, prices)
-    if not success:
-        await callback.answer(payment_text, show_alert=True)
+    try:
+        payment_url = await create_payment(user_id, price, months)
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Не удалось создать платёж", exc_info=err)
+        await callback.answer("Не удалось создать платёж. Попробуйте позже.", show_alert=True)
         return
+
+    payment = await db.get_latest_payment(user_id, status="PENDING")
+    payment_id = payment["payment_id"] if payment else None
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Перейти к оплате 💳", url=payment_url)
+    if payment_id:
+        builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
+    builder.adjust(1)
+    if callback.message:
+        text_lines = [
+            f"💳 Оплата подписки на {months} мес.",
+            f"Сумма к оплате: {price}₽.",
+            "Нажмите кнопку ниже, чтобы перейти к платёжной странице.",
+        ]
+        await callback.message.answer(
+            "\n".join(text_lines),
+            reply_markup=builder.as_markup(),
+            disable_web_page_preview=True,
+        )
+    await callback.answer("Ссылка на оплату готова.")
+
+
+@router.callback_query(F.data.startswith("payment:check:"))
+async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
+    """Проверить статус платежа и продлить подписку."""
+
+    parts = (callback.data or "").split(":")
+    try:
+        payment_id = parts[2]
+    except IndexError:
+        await callback.answer("Не удалось определить платёж.", show_alert=True)
+        return
+
+    payment = await db.get_payment_by_id(payment_id)
+    if payment is None:
+        await callback.answer("Платёж не найден. Свяжитесь с поддержкой.", show_alert=True)
+        return
+
+    try:
+        confirmed = await check_payment_status(payment_id)
+    except RuntimeError as err:
+        await callback.answer(str(err), show_alert=True)
+        return
+
+    if not confirmed:
+        await callback.answer("Платёж ещё обрабатывается. Попробуйте чуть позже.", show_alert=True)
+        return
+
+    user_id = int(payment["user_id"])
+    months = int(payment["months"])
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
-    user_after = await db.get_user(user_id)
-    expires_at = user_after["expires_at"] if user_after else 0
-    formatted_expiry = format_expiry(expires_at) if expires_at else None
+    await db.set_payment_status(payment_id, "CONFIRMED")
+
+    subscription_end = await db.get_subscription_end(user_id) or 0
+    formatted_expiry = format_expiry(subscription_end) if subscription_end else None
+
     if callback.message:
         if formatted_expiry:
             display_text = (
-                f"✅ Оплата {price}₽ за {months} мес.\n"
-                f"Подписка активна до {formatted_expiry}."
+                f"✅ Оплата подтверждена. Подписка продлена на {months} мес.\n"
+                f"Новая дата окончания: {formatted_expiry}."
             )
         else:
-            display_text = f"✅ Оплата {price}₽ за {months} мес."
+            display_text = "✅ Оплата подтверждена и подписка продлена."
         await callback.message.answer(
             escape_md(display_text),
+            reply_markup=main_menu_markup(),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
@@ -919,34 +1225,152 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     if not await db.has_accepted_legal(callback.from_user.id):
         await callback.answer("Сначала подтвердите согласие.", show_alert=True)
         return
+
+    user = await db.get_user(callback.from_user.id)
+
+    async def send_invite_failure(info_text: str, hint_text: str | None) -> None:
+        """Отправить пользователю сообщение о невозможности выдать ссылку."""
+
+        if not callback.message:
+            return
+        hint_value = hint_text or ""
+        hint_lower = hint_value.lower()
+        hint_is_link = hint_lower.startswith("http://") or hint_lower.startswith("https://")
+        lines: list[str] = []
+        if info_text:
+            lines.append(escape_md(info_text))
+        if hint_text and not hint_is_link:
+            lines.append(escape_md(hint_value))
+        combined_lower = " ".join(lines).lower()
+        expired_line = escape_md("Ссылка устарела, запросите новую")
+        if "устарел" not in combined_lower:
+            lines.append(expired_line)
+        text = "\n".join(lines) if lines else expired_line
+        reply_markup = (
+            invite_button_markup(hint_value, permanent=True) if hint_is_link else main_menu_markup()
+        )
+        await callback.message.answer(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
+    now_ts = int(datetime.utcnow().timestamp())
+    subscription_end = await db.get_subscription_end(callback.from_user.id) or 0
+    trial_end = 0
+    if user and hasattr(user, "keys") and "trial_end" in user.keys():
+        try:
+            trial_end = int(user["trial_end"] or 0)
+        except (TypeError, ValueError):
+            trial_end = 0
+    has_active_subscription = subscription_end > now_ts
+    has_active_trial = trial_end > now_ts
+
+    if not has_active_subscription and not has_active_trial:
+        if callback.message:
+            builder = InlineKeyboardBuilder()
+            builder.button(text="💳 Купить доступ", callback_data="buy:open")
+            builder.button(text="🎟 Ввести промокод", callback_data="promo:enter")
+            builder.button(text="🏠 Главное меню", callback_data="menu:home")
+            builder.adjust(1)
+            await callback.message.answer(
+                escape_md("У вас нет активной подписки. Оформите доступ или введите промокод."),
+                reply_markup=builder.as_markup(),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        await callback.answer("Нет активной подписки", show_alert=True)
+        return
+    chat_id = await db.get_target_chat_id()
+    if chat_id is None:
+        ok, info, hint = await make_one_time_invite(bot, db)
+        await send_invite_failure(info, hint)
+        await callback.answer("Чат не привязан", show_alert=True)
+        return
+
+    member: ChatMember | None = None
+    try:
+        member = await bot.get_chat_member(chat_id, callback.from_user.id)
+    except TelegramForbiddenError as err:
+        logging.warning("Не удалось проверить участие пользователя %s: %s", callback.from_user.id, err)
+        ok, info, hint = await make_one_time_invite(bot, db)
+        await send_invite_failure(info, hint)
+        await callback.answer("Бот не имеет доступа к чату", show_alert=True)
+        return
+    except TelegramBadRequest as err:
+        logging.warning(
+            "Ошибка Telegram при проверке участия пользователя %s: %s",
+            callback.from_user.id,
+            err,
+        )
+        ok, info, hint = await make_one_time_invite(bot, db)
+        await send_invite_failure(info, hint)
+        await callback.answer("Не удалось проверить участие", show_alert=True)
+        return
+    except Exception as err:  # noqa: BLE001
+        logging.exception(
+            "Сбой при проверке участия пользователя %s в канале", callback.from_user.id, exc_info=err
+        )
+        if callback.message:
+            await callback.message.answer(
+                escape_md(
+                    "Не удалось проверить участие в канале. Попробуйте позже или обратитесь к администратору."
+                ),
+                reply_markup=main_menu_markup(),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        await callback.answer("Ошибка проверки участия", show_alert=True)
+        return
+
+    status_raw = getattr(member, "status", "") if member else ""
+    status_value = status_raw.value if hasattr(status_raw, "value") else str(status_raw)
+    if status_value.lower() in {"member", "administrator", "creator", "owner"}:
+        if callback.message:
+            await callback.message.answer(
+                escape_md("Вы уже являетесь участником канала, пригласительная ссылка вам не нужна."),
+                reply_markup=main_menu_markup(),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        await callback.answer()
+        return
+
+    invite_flag = 0
+    if user and hasattr(user, "keys") and "invite_issued" in user.keys():
+        try:
+            invite_flag = int(user["invite_issued"] or 0)
+        except (TypeError, ValueError):
+            invite_flag = 0
+    if invite_flag:
+        if callback.message:
+            await callback.message.answer(
+                escape_md(
+                    "Вы уже использовали свою одноразовую ссылку. Если вы вышли из канала, свяжитесь с администратором"
+                    " для восстановления доступа."
+                ),
+                reply_markup=main_menu_markup(),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+        await callback.answer("Ссылка уже выдавалась", show_alert=True)
+        return
+
     ok, info, hint = await make_one_time_invite(bot, db)
+    if ok:
+        await db.set_invite_issued(callback.from_user.id, True)
+
     if callback.message:
         if ok:
             await callback.message.answer(
-                escape_md("🔗 Ссылка готова. Нажмите кнопку ниже."),
+                escape_md("Ваша ссылка (действует 24ч, одноразовая)."),
                 reply_markup=invite_button_markup(info),
                 parse_mode=ParseMode.MARKDOWN_V2,
                 disable_web_page_preview=True,
             )
         else:
-            hint_value = hint or ""
-            hint_lower = hint_value.lower()
-            hint_is_link = hint_lower.startswith("http://") or hint_lower.startswith("https://")
-            lines = []
-            if info:
-                lines.append(escape_md(info))
-            if hint and not hint_is_link:
-                lines.append(escape_md(hint))
-            text = "\n".join(lines) or escape_md("❗ Не удалось создать ссылку.")
-            reply_markup = (
-                invite_button_markup(hint_value, permanent=True) if hint_is_link else None
-            )
-            await callback.message.answer(
-                text,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN_V2,
-                disable_web_page_preview=True,
-            )
+            await send_invite_failure(info, hint)
     if ok:
         await callback.answer()
     else:
@@ -973,20 +1397,11 @@ async def handle_promo_input(message: Message, state: FSMContext, db: DB) -> Non
     """Обработать ввод промокода пользователем."""
 
     text = message.text or ""
+    if is_go_home(text):
+        await go_home_from_state(message, state, db, "Возвращаю вас в главное меню.")
+        return
     if is_cancel(text):
-        await state.clear()
-        await message.answer(
-            escape_md("Ввод промокода отменён."),
-            reply_markup=ReplyKeyboardRemove(),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
-        await message.answer(
-            escape_md("Меню обновлено."),
-            reply_markup=await get_user_menu(db, message.from_user.id),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
+        await go_home_from_state(message, state, db, "Ввод промокода отменён.")
         return
     await redeem_promo_code(message, db, text, remove_keyboard=True)
     await state.clear()
@@ -1022,7 +1437,7 @@ async def open_admin_panel(callback: CallbackQuery, db: DB) -> None:
 
 @router.callback_query(F.data == "admin:bind_chat")
 async def admin_bind_chat(callback: CallbackQuery, state: FSMContext) -> None:
-    """Запросить у администратора username целевого чата."""
+    """Запросить у администратора идентификатор целевого чата."""
 
     if not is_super_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
@@ -1034,7 +1449,10 @@ async def admin_bind_chat(callback: CallbackQuery, state: FSMContext) -> None:
             panel_message_id=callback.message.message_id,
         )
         await callback.message.answer(
-            escape_md("Пришлите @username канала или группы."),
+            escape_md(
+                "Пришлите @username, username или chat_id канала/группы.\n\n"
+                "Можно нажать «⬅️ Назад» или «🏠 Главное меню»."
+            ),
             reply_markup=CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
@@ -1049,12 +1467,15 @@ async def process_bind_username(
     db: DB,
     state: FSMContext,
 ) -> None:
-    """Привязать чат по присланному username."""
+    """Привязать чат по присланному идентификатору."""
 
     if not is_super_admin(message.from_user.id):
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Привязка отменена."),
@@ -1064,38 +1485,198 @@ async def process_bind_username(
         )
         await state.clear()
         return
-    if not text.startswith("@") or len(text) < 2:
+    compact = "".join(text.split())
+    if not compact:
         await message.answer(
-            escape_md("Нужен username в формате @example."),
+            escape_md("Введите идентификатор чата или отмените команду."),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
         return
+
+    is_numeric_candidate = False
+    if compact.startswith("-"):
+        is_numeric_candidate = compact[1:].isdigit()
+    elif compact.isdigit():
+        is_numeric_candidate = True
+
+    normalized_chat_id: int | None = None
+    chat = None
+
+    if is_numeric_candidate:
+        digits = compact
+        numeric_candidates: list[int] = []
+
+        if digits.startswith("-"):
+            try:
+                numeric_candidates.append(int(digits))
+            except ValueError:
+                numeric_candidates = []
+        else:
+            try:
+                value = int(digits)
+            except ValueError:
+                numeric_candidates = []
+            else:
+                if len(digits) >= 11 and digits.startswith("100"):
+                    numeric_candidates.append(-value)
+                try:
+                    numeric_candidates.append(int(f"-100{digits}"))
+                except ValueError:
+                    pass
+                numeric_candidates.append(-value)
+                numeric_candidates.append(value)
+
+        seen_candidates: set[int] = set()
+        ordered_candidates: list[int] = []
+        for candidate in numeric_candidates:
+            if candidate not in seen_candidates:
+                seen_candidates.add(candidate)
+                ordered_candidates.append(candidate)
+
+        last_error: Exception | None = None
+        for candidate in ordered_candidates:
+            try:
+                chat = await bot.get_chat(candidate)
+            except TelegramForbiddenError:
+                await message.answer(
+                    escape_md(
+                        "Бот не имеет доступа к чату. Назначьте его администратором."
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_web_page_preview=True,
+                )
+                return
+            except TelegramBadRequest as err:
+                last_error = err
+                continue
+            except Exception as err:
+                logging.exception("Ошибка при получении чата", exc_info=err)
+                await message.answer(
+                    escape_md("Произошла ошибка при получении чата. Попробуйте позже."),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_web_page_preview=True,
+                )
+                return
+            else:
+                normalized_chat_id = chat.id
+                break
+
+        if chat is None:
+            logging.warning(
+                "Не удалось подобрать чат по числовому идентификатору: %s", compact
+            )
+            await message.answer(
+                escape_md("Не удалось получить чат. Проверьте идентификатор и права бота."),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            if last_error is not None:
+                logging.debug("Последняя ошибка Telegram: %s", last_error)
+            return
+    else:
+        if not compact.startswith("@"):
+            compact = f"@{compact}"
+        try:
+            chat = await bot.get_chat(compact)
+        except TelegramBadRequest:
+            await message.answer(
+                escape_md("Не удалось получить чат. Проверьте идентификатор и права бота."),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            return
+        except TelegramForbiddenError:
+            await message.answer(
+                escape_md("Бот не имеет доступа к чату. Назначьте его администратором."),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception:
+            await message.answer(
+                escape_md("Произошла ошибка при получении чата. Попробуйте позже."),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            return
+
+        normalized_chat_id = chat.id
+
+    if normalized_chat_id is None or chat is None:
+        await message.answer(
+            escape_md("Не удалось определить чат. Проверьте введённые данные."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
     try:
-        chat = await bot.get_chat(text)
-    except TelegramBadRequest:
+        me = await bot.me()
+        member = await bot.get_chat_member(chat.id, me.id)
+    except TelegramForbiddenError:
         await message.answer(
-            escape_md("Не удалось получить чат. Проверьте username и права бота."),
+            escape_md(
+                "Бот не является администратором в чате. Выдайте права администратора."
+            ),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
         return
-    except Exception:
+    except TelegramBadRequest as err:
+        logging.exception("Ошибка при проверке прав бота", exc_info=err)
         await message.answer(
-            escape_md("Произошла ошибка при получении чата. Попробуйте позже."),
+            escape_md("Не удалось проверить права бота. Проверьте настройки чата."),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
         return
+    except Exception as err:
+        logging.exception("Неожиданная ошибка при проверке прав бота", exc_info=err)
+        await message.answer(
+            escape_md("Не удалось проверить права бота. См. логи."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
+    member_status = getattr(member, "status", "")
+    status_value = member_status.value if hasattr(member_status, "value") else str(member_status)
+    if status_value not in {"administrator", "creator"}:
+        await message.answer(
+            escape_md("Бот не администратор в чате. Назначьте права и повторите."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
+    invite_allowed = getattr(member, "can_invite_users", None)
+    if invite_allowed is False:
+        await message.answer(
+            escape_md(
+                "У бота нет права на создание пригласительных ссылок. Включите его."
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
     stored_username = getattr(chat, "username", None)
     if stored_username:
-        stored_value = f"@{stored_username}"
+        username_to_store = f"@{stored_username}"
     else:
-        stored_value = text
-    await db.set_target_chat_username(stored_value)
-    await db.set_target_chat_id(chat.id)
+        username_to_store = ""
+
+    await db.set_target_chat_username(username_to_store)
+    await db.set_target_chat_id(normalized_chat_id)
+
+    if username_to_store:
+        chat_repr = f"{username_to_store} (id {normalized_chat_id})"
+    else:
+        chat_repr = f"(id {normalized_chat_id})"
+
     await message.answer(
-        escape_md(f"✅ Чат {stored_value} (id {chat.id}) привязан."),
+        escape_md(f"✅ Чат {chat_repr} привязан."),
         reply_markup=ReplyKeyboardRemove(),
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
@@ -1248,6 +1829,9 @@ async def price_add_months(message: Message, state: FSMContext, db: DB, bot: Bot
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Создание тарифа отменено."),
@@ -1291,6 +1875,9 @@ async def price_add_price(message: Message, state: FSMContext, db: DB, bot: Bot)
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Создание тарифа отменено."),
@@ -1395,6 +1982,9 @@ async def price_edit_price_input(message: Message, state: FSMContext, db: DB, bo
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Изменение отменено."),
@@ -1481,6 +2071,9 @@ async def price_edit_months_input(message: Message, state: FSMContext, db: DB, b
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Изменение отменено."),
@@ -1622,6 +2215,9 @@ async def admin_set_trial_days(message: Message, state: FSMContext, db: DB, bot:
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Изменение отменено."),
@@ -1701,6 +2297,9 @@ async def admin_save_custom_code(message: Message, state: FSMContext, db: DB, bo
         await state.clear()
         return
     text = (message.text or "").strip()
+    if is_go_home(text):
+        await go_home_from_state(message, state, db)
+        return
     if is_cancel(text):
         await message.answer(
             escape_md("Создание промокода отменено."),

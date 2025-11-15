@@ -1,15 +1,43 @@
 from dataclasses import dataclass, field
 import os
+from typing import Optional
+
 from dotenv import load_dotenv
+
+import t_pay  # noqa: F401  # Импортируем для инициализации настроек платежей
 
 # Загружаем значения из файла окружения
 load_dotenv()
+
+# URL для уведомлений от T-Bank
+TINKOFF_NOTIFY_URL: str = os.getenv("TINKOFF_NOTIFY_URL", "")
 
 
 def _parse_ids(raw: str) -> set[int]:
     """Разбираем список идентификаторов администраторов."""
 
     return {int(part.strip()) for part in raw.split(",") if part.strip()} if raw else set()
+
+
+def _env_int(name: str, default: int) -> int:
+    """Считать целое значение из окружения с запасным вариантом."""
+
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _optional_env(name: str) -> Optional[str]:
+    """Вернуть строку из окружения или None, если значение пустое."""
+
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    return raw
 
 
 @dataclass(frozen=True)
@@ -27,6 +55,16 @@ class Config:
     DOCS_PD_CONSENT_URL: str = os.getenv("DOCS_PD_CONSENT_URL", "")
     DOCS_PD_POLICY_URL: str = os.getenv("DOCS_PD_POLICY_URL", "")
     DOCS_OFFER_URL: str = os.getenv("DOCS_OFFER_URL", "")
+
+    T_PAY_TERMINAL_KEY: str = os.getenv("T_PAY_TERMINAL_KEY", "")
+    T_PAY_PASSWORD: str = os.getenv("T_PAY_PASSWORD", "")
+    T_PAY_SUCCESS_URL: str = os.getenv("T_PAY_SUCCESS_URL", "")
+    T_PAY_FAIL_URL: str = os.getenv("T_PAY_FAIL_URL", "")
+
+    TINKOFF_NOTIFY_URL: str = TINKOFF_NOTIFY_URL
+    WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")
+    WEBHOOK_PORT: int = _env_int("WEBHOOK_PORT", 8080)
+    TINKOFF_WEBHOOK_SECRET: Optional[str] = _optional_env("TINKOFF_WEBHOOK_SECRET")
 
 
 config = Config()
