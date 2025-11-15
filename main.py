@@ -15,6 +15,7 @@ from typing import Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import payments
@@ -266,6 +267,9 @@ async def main() -> None:
     payments.set_db(db)
 
     bot = Bot(config.BOT_TOKEN)
+    await bot.set_my_commands(
+        [BotCommand(command="start", description="Главное меню")]
+    )
     dp = Dispatcher(storage=MemoryStorage())
 
     dp["db"] = db
