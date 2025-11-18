@@ -1,10 +1,208 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+import json
+import logging
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from datetime import datetime
-import logging
 import pytz
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
 from db import DB
+from t_pay import TBankApiError, TBankHttpError, charge_payment
+
+DEFAULT_RECURRENT_IP = "127.0.0.1"
+RETRY_PAYMENT_CALLBACK = "payment:retry"
+
+def _retry_markup() -> InlineKeyboardMarkup:
+    """Построить клавиатуру для повторного списания."""
+
+    button = InlineKeyboardButton(text="🔄 Повторить платёж", callback_data=RETRY_PAYMENT_CALLBACK)
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+
+def _format_date(ts: int) -> str:
+    """Вернуть строку даты в формате ДД.ММ.ГГГГ."""
+
+    return datetime.utcfromtimestamp(ts).strftime("%d.%m.%Y")
+
+
+def _next_month_date(now_ts: int) -> int:
+    """Вернуть таймстамп через условные 30 дней от указанного момента."""
+
+    future = datetime.utcfromtimestamp(now_ts) + timedelta(days=30)
+    return int(future.timestamp())
+
+
+async def try_auto_renew(
+    bot: Bot,
+    db: DB,
+    user_row,
+    now_ts: int | None = None,
+    *,
+    ip: str | None = None,
+    force: bool = False,
+) -> bool:
+    """Попытаться продлить подписку пользователя через автосписание."""
+
+    # Параметр force позволяет запускать списание вручную, даже если флаг auto_renew снят.
+
+    row_dict = dict(user_row)
+    user_id = int(row_dict.get("user_id", 0))
+    auto_renew_flag = bool(row_dict.get("auto_renew"))
+    rebill_id = (row_dict.get("rebill_id") or "").strip()
+    parent_payment = (row_dict.get("rebill_parent_payment") or "").strip()
+    if user_id <= 0:
+        return False
+    should_attempt = auto_renew_flag or force
+    if not should_attempt:
+        return False
+    customer_key = (row_dict.get("customer_key") or "").strip()
+    if should_attempt and not customer_key:
+        customer_key = str(user_id)
+        try:
+            await db.set_customer_key(user_id, customer_key)
+        except Exception:  # noqa: BLE001
+            logging.debug(
+                "Не удалось автоматически сохранить CustomerKey для пользователя %s", user_id
+            )
+
+    parent_amount = 0
+    parent_months = 1
+    parent_payment_row = None
+    if parent_payment:
+        try:
+            parent_payment_row = await db.get_payment_by_payment_id(parent_payment)
+        except Exception:  # noqa: BLE001
+            parent_payment_row = None
+        if parent_payment_row is not None:
+            row_data = dict(parent_payment_row)
+            try:
+                parent_amount = int(row_data.get("amount", 0))  # type: ignore[arg-type]
+            except Exception:  # noqa: BLE001
+                parent_amount = 0
+            try:
+                parent_months = int(row_data.get("months", 1))  # type: ignore[arg-type]
+            except Exception:  # noqa: BLE001
+                parent_months = 1
+            if parent_months <= 0:
+                parent_months = 1
+
+    if not rebill_id or not customer_key or not parent_payment:
+        if should_attempt:
+            missing = []
+            if not rebill_id:
+                missing.append("RebillId")
+            if not customer_key:
+                missing.append("CustomerKey")
+            if not parent_payment:
+                missing.append("родительский платёж")
+            reason = "Недостаточно данных для автосписания"
+            if missing:
+                reason = f"{reason}: {', '.join(missing)}"
+            await db.log_payment_attempt(user_id, "SKIPPED", reason, payment_type="card")
+        return False
+
+    if now_ts is None:
+        now_ts = int(datetime.utcnow().timestamp())
+
+    try:
+        response = await charge_payment(
+            payment_id=parent_payment,
+            rebill_id=rebill_id,
+            customer_key=customer_key,
+            ip=ip or DEFAULT_RECURRENT_IP,
+        )
+    except (TBankHttpError, TBankApiError) as err:
+        logging.warning("Автосписание отклонено: user=%s | %s", user_id, err)
+        await db.set_auto_renew(user_id, False)
+        await db.log_payment_attempt(user_id, "FAILED", str(err), payment_type="card")
+        try:
+            await bot.send_message(
+                user_id,
+                "⚠️ Не удалось продлить подписку. Проверьте данные карты или оплатите вручную.",
+                reply_markup=_retry_markup(),
+            )
+        except Exception:
+            logging.debug("Не удалось уведомить пользователя %s об ошибке автосписания", user_id)
+        return False
+    except Exception as err:  # noqa: BLE001
+        logging.exception("Неожиданная ошибка автосписания для пользователя %s", user_id, exc_info=err)
+        await db.set_auto_renew(user_id, False)
+        await db.log_payment_attempt(user_id, "ERROR", str(err), payment_type="card")
+        try:
+            await bot.send_message(
+                user_id,
+                "⚠️ Не удалось продлить подписку. Проверьте данные карты или оплатите вручную.",
+                reply_markup=_retry_markup(),
+            )
+        except Exception:
+            logging.debug("Не удалось уведомить пользователя %s об исключении автосписания", user_id)
+        return False
+
+    status = (response.get("Status") or "").upper()
+    success_flag = bool(response.get("Success"))
+    if status not in {"CONFIRMED", "COMPLETED"} and not success_flag:
+        info = json.dumps(response, ensure_ascii=False)[:500]
+        logging.warning("Автосписание неуспешно: user=%s | %s", user_id, info)
+        await db.set_auto_renew(user_id, False)
+        await db.log_payment_attempt(user_id, "FAILED", info, payment_type="card")
+        try:
+            await bot.send_message(
+                user_id,
+                "⚠️ Не удалось продлить подписку. Проверьте данные карты или оплатите вручную.",
+                reply_markup=_retry_markup(),
+            )
+        except Exception:
+            logging.debug("Не удалось уведомить пользователя %s о провале автосписания", user_id)
+        return False
+
+    new_parent_payment = response.get("PaymentId") or parent_payment
+    new_payment_id_str = str(new_parent_payment).strip() if new_parent_payment else ""
+    if new_payment_id_str:
+        await db.set_rebill_parent_payment(user_id, new_payment_id_str)
+
+    months_to_extend = max(1, parent_months)
+    await db.extend_subscription(user_id, months_to_extend)
+    extended_until = await db.get_subscription_end(user_id)
+    if not extended_until:
+        extended_until = _next_month_date(now_ts)
+
+    if new_payment_id_str and new_payment_id_str != parent_payment:
+        order_id = f"auto_{user_id}_{now_ts}"
+        try:
+            await db.add_payment(
+                user_id=user_id,
+                payment_id=new_payment_id_str,
+                order_id=order_id,
+                amount=parent_amount,
+                months=months_to_extend,
+                status="CONFIRMED",
+                method="card",
+            )
+        except Exception as err:  # noqa: BLE001
+            logging.debug("Не удалось сохранить запись об автосписании: %s", err)
+
+    await db.log_payment_attempt(
+        user_id,
+        "SUCCESS",
+        json.dumps(response, ensure_ascii=False)[:500],
+        payment_type="card",
+    )
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"✅ Подписка успешно продлена до {_format_date(extended_until)}",
+        )
+    except Exception:
+        logging.debug("Не удалось отправить сообщение об успешном продлении пользователю %s", user_id)
+
+    logging.info("Автопродление успешно: user=%s до %s", user_id, extended_until)
+    return True
+
 
 async def daily_check(bot: Bot, db: DB):
     now_ts = int(datetime.utcnow().timestamp())
@@ -12,30 +210,53 @@ async def daily_check(bot: Bot, db: DB):
     if target_chat_id is None:
         logging.info("Пропуск проверки подписок: чат ещё не привязан.")
         return
+
     expired = await db.list_expired(now_ts)
     for row in expired:
-        user_id = row["user_id"]
-        if row["auto_renew"]:
-            await db.extend_subscription(user_id, months=1)
-            try:
-                await bot.send_message(user_id, "Подписка автопродлена на 1 месяц (заглушка оплаты).")
-            except Exception:
-                pass
+        user_id = int(row["user_id"])
+
+        renewed = await try_auto_renew(bot, db, row, now_ts)
+        if renewed:
             continue
+
+        row_dict = dict(row)
+        if bool(row_dict.get("auto_renew")):
+            await db.set_auto_renew(user_id, False)
+
+        try:
+            await db.log_payment_attempt(
+                user_id,
+                "EXPIRED",
+                "Подписка неактивна, пользователь будет удалён",
+                payment_type="card",
+            )
+        except Exception:
+            logging.debug("Не удалось записать лог об удалении пользователя %s", user_id)
 
         try:
             await bot.ban_chat_member(target_chat_id, user_id)
-            await bot.unban_chat_member(target_chat_id, user_id)  # чтобы мог войти позже по новой ссылке
+            await bot.unban_chat_member(target_chat_id, user_id)
         except Exception:
-            pass
+            logging.debug("Не удалось удалить пользователя %s из канала", user_id)
         try:
-            await bot.send_message(user_id, "Срок подписки истёк. Оплатите, чтобы вернуться в канал.")
+            await bot.send_message(
+                user_id,
+                "🔴 Подписка неактивна. Для доступа оформите её заново.",
+            )
         except Exception:
-            pass
+            logging.debug("Не удалось уведомить пользователя %s об окончании подписки", user_id)
+
 
 def setup_scheduler(bot: Bot, db: DB, tz_name: str = "Europe/Moscow") -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=pytz.timezone(tz_name))
-    # Каждый день в 03:10 по локальному часовому поясу
     scheduler.add_job(daily_check, CronTrigger(hour=3, minute=10), kwargs={"bot": bot, "db": db})
     scheduler.start()
     return scheduler
+
+
+__all__ = [
+    "daily_check",
+    "setup_scheduler",
+    "try_auto_renew",
+    "RETRY_PAYMENT_CALLBACK",
+]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import urllib.parse
 
 import logging
 
@@ -25,7 +26,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import config, get_docs_map
 from db import DB
 from payments import check_payment_status, create_payment
-from scheduler import daily_check
+from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
+from t_pay import TBankApiError, TBankHttpError, add_card, get_add_card_state
 
 router = Router()
 
@@ -34,6 +36,8 @@ DEFAULT_AUTO_RENEW = True
 COUPON_KIND_TRIAL = "trial"
 
 MD_V2_SPECIAL = set("_*[]()~`>#+-=|{}.!\\")
+
+DEFAULT_CARD_BIND_IP = "127.0.0.1"
 
 CANCEL_REPLY = ReplyKeyboardMarkup(
     keyboard=[
@@ -45,6 +49,64 @@ CANCEL_REPLY = ReplyKeyboardMarkup(
 )
 
 START_TEXT = "🎟️ Доступ в канал\nВыберите действие ниже.\n\nℹ️ Пробный период доступен по промокоду."
+
+
+def _safe_int(value: object) -> int:
+    """Безопасно преобразовать значение в int."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _row_to_dict(row: aiosqlite.Row | None) -> dict[str, object]:
+    """Преобразовать строку БД в словарь."""
+
+    if row is None:
+        return {}
+    if hasattr(row, "keys"):
+        return {key: row[key] for key in row.keys()}
+    return dict(row)
+
+
+async def _ensure_subscription_state(
+    bot: Bot | None,
+    db: DB,
+    user_row: aiosqlite.Row | None,
+) -> tuple[aiosqlite.Row | None, bool]:
+    """Проверить актуальность подписки и при необходимости инициировать автосписание."""
+
+    if user_row is None:
+        return None, True
+
+    row_data = _row_to_dict(user_row)
+    user_id = _safe_int(row_data.get("user_id"))
+    now_ts = int(datetime.utcnow().timestamp())
+    expires_at = _safe_int(row_data.get("expires_at"))
+    auto_flag = bool(row_data.get("auto_renew"))
+
+    if expires_at and expires_at < now_ts and auto_flag:
+        if bot is None:
+            logging.warning(
+                "Не удалось инициировать автосписание при входе пользователя %s: бот отсутствует.",
+                user_id,
+            )
+        else:
+            try:
+                await try_auto_renew(bot, db, user_row, now_ts)
+            except Exception as err:  # noqa: BLE001
+                logging.exception(
+                    "Ошибка при запуске автопродления для пользователя %s", user_id, exc_info=err
+                )
+        user_row = await db.get_user(user_id)
+        row_data = _row_to_dict(user_row)
+        auto_flag = bool(row_data.get("auto_renew"))
+        expires_at = _safe_int(row_data.get("expires_at"))
+        now_ts = int(datetime.utcnow().timestamp())
+
+    blocked = expires_at <= now_ts and not auto_flag
+    return user_row, blocked
 
 
 class BindChat(StatesGroup):
@@ -299,6 +361,8 @@ async def send_main_menu_screen(
     message: Message,
     db: DB,
     notice: str | None = None,
+    *,
+    bot: Bot | None = None,
 ) -> None:
     """Показать главное меню пользователю с удалением реплай-клавиатуры."""
 
@@ -309,8 +373,21 @@ async def send_main_menu_screen(
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
-    menu = await get_user_menu(db, message.from_user.id)
-    main_text = await compose_main_menu_text(db, message.from_user.id)
+    effective_bot = bot or getattr(message, "bot", None)
+    user = await db.get_user(message.from_user.id)
+    user, blocked = await _ensure_subscription_state(effective_bot, db, user)
+    menu = await get_user_menu(
+        db,
+        message.from_user.id,
+        cached_user=user,
+        blocked=blocked,
+    )
+    main_text = await compose_main_menu_text(
+        db,
+        message.from_user.id,
+        cached_user=user,
+        blocked=blocked,
+    )
     await message.answer(
         escape_md(main_text),
         reply_markup=menu,
@@ -324,11 +401,13 @@ async def go_home_from_state(
     state: FSMContext,
     db: DB,
     notice: str | None = None,
+    *,
+    bot: Bot | None = None,
 ) -> None:
     """Очистить состояние и вернуть пользователя в главное меню."""
 
     await state.clear()
-    await send_main_menu_screen(message, db, notice)
+    await send_main_menu_screen(message, db, notice, bot=bot)
 
 
 def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMarkup:
@@ -398,6 +477,10 @@ def build_user_menu_keyboard(
         text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
         callback_data="ar:toggle",
     )
+    builder.button(
+        text="💳 Привязать карту",
+        callback_data="card:bind",
+    )
     builder.button(text="🔗 Получить ссылку", callback_data="invite:once")
     builder.button(text="🏷️ Ввести промокод", callback_data="promo:enter")
     builder.button(text="📄 Документы", callback_data="docs:open")
@@ -407,20 +490,51 @@ def build_user_menu_keyboard(
     return builder.as_markup()
 
 
-async def get_user_menu(db: DB, user_id: int) -> InlineKeyboardMarkup:
+def build_subscription_purchase_menu() -> InlineKeyboardMarkup:
+    """Построить меню для пользователя без активной подписки."""
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Оформить подписку", callback_data="buy:open")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+async def get_user_menu(
+    db: DB,
+    user_id: int,
+    *,
+    cached_user: aiosqlite.Row | None = None,
+    blocked: bool | None = None,
+) -> InlineKeyboardMarkup:
     """Получить клавиатуру пользователя с актуальными данными."""
 
-    user = await db.get_user(user_id)
+    user = cached_user or await db.get_user(user_id)
+    now_ts = int(datetime.utcnow().timestamp())
     auto_flag = bool(user and user["auto_renew"])
+    if blocked is None:
+        expires_at = _safe_int(user["expires_at"]) if user else 0
+        blocked = expires_at <= now_ts and not auto_flag
+    if blocked:
+        return build_subscription_purchase_menu()
     price_months = [months for months, _ in await db.get_all_prices()]
     return build_user_menu_keyboard(auto_flag, is_super_admin(user_id), price_months)
 
 
-async def compose_main_menu_text(db: DB, user_id: int) -> str:
+async def compose_main_menu_text(
+    db: DB,
+    user_id: int,
+    *,
+    cached_user: aiosqlite.Row | None = None,
+    blocked: bool | None = None,
+) -> str:
     """Сформировать текст главного меню с указанием статуса доступа."""
 
     now_ts = int(datetime.utcnow().timestamp())
-    user = await db.get_user(user_id)
+    user = cached_user or await db.get_user(user_id)
+    auto_flag = bool(user and user["auto_renew"])
+    if blocked is None:
+        expires_at = _safe_int(user["expires_at"]) if user else 0
+        blocked = expires_at <= now_ts and not auto_flag
     trial_end = 0
     if user and hasattr(user, "keys") and "trial_end" in user.keys():
         try:
@@ -428,10 +542,14 @@ async def compose_main_menu_text(db: DB, user_id: int) -> str:
         except (TypeError, ValueError):
             trial_end = 0
     subscription_end = await db.get_subscription_end(user_id) or 0
-    if trial_end and now_ts < trial_end:
+    if blocked:
+        status_line = "⛔ Подписка неактивна. Нажмите «Оформить подписку», чтобы восстановить доступ."
+    elif trial_end and now_ts < trial_end:
         status_line = f"🧪 Пробный период до: {format_short_date(trial_end)}"
     elif subscription_end and now_ts < subscription_end:
         status_line = f"✅ Подписка активна до: {format_short_date(subscription_end)}"
+    elif auto_flag:
+        status_line = "⏳ Выполняется автопродление. Повторите попытку через пару минут."
     else:
         status_line = "⛔ Нет активной подписки. Доступ к каналу закрыт."
     return f"{status_line}\n\n{START_TEXT}"
@@ -808,8 +926,14 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
             disable_web_page_preview=True,
         )
         return
-    menu = await get_user_menu(db, user_id)
-    main_text = await compose_main_menu_text(db, user_id)
+    user, blocked = await _ensure_subscription_state(message.bot, db, user)
+    menu = await get_user_menu(db, user_id, cached_user=user, blocked=blocked)
+    main_text = await compose_main_menu_text(
+        db,
+        user_id,
+        cached_user=user,
+        blocked=blocked,
+    )
     await message.answer(
         escape_md(main_text),
         reply_markup=menu,
@@ -846,9 +970,15 @@ async def handle_menu_home(callback: CallbackQuery, state: FSMContext, db: DB) -
         await callback.answer()
         return
 
-    menu = await get_user_menu(db, user_id)
+    user, blocked = await _ensure_subscription_state(callback.bot, db, user)
+    menu = await get_user_menu(db, user_id, cached_user=user, blocked=blocked)
     if callback.message:
-        main_text = await compose_main_menu_text(db, user_id)
+        main_text = await compose_main_menu_text(
+            db,
+            user_id,
+            cached_user=user,
+            blocked=blocked,
+        )
         await callback.message.answer(
             escape_md(main_text),
             reply_markup=menu,
@@ -882,6 +1012,7 @@ async def cmd_test_expire_me(message: Message, db: DB, bot: Bot) -> None:
         message,
         db,
         notice="Тест: подписка и триал завершены, проверка истечения выполнена.",
+        bot=bot,
     )
 
 
@@ -1201,6 +1332,60 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
     await callback.answer("Оплата подтверждена.")
 
 
+@router.callback_query(F.data == RETRY_PAYMENT_CALLBACK)
+async def handle_retry_payment(callback: CallbackQuery, db: DB) -> None:
+    """Повторить списание через сохранённую карту."""
+
+    user_id = callback.from_user.id
+    user = await db.get_user(user_id)
+    if user is None:
+        await callback.answer("Сначала выполните /start.", show_alert=True)
+        return
+
+    row = dict(user)
+    rebill_id = (row.get("rebill_id") or "").strip()
+    customer_key = (row.get("customer_key") or "").strip()
+    parent_payment = (row.get("rebill_parent_payment") or "").strip()
+
+    missing = []
+    if not rebill_id:
+        missing.append("RebillId")
+    if not customer_key:
+        missing.append("CustomerKey")
+    if not parent_payment:
+        missing.append("родительский платёж")
+
+    if missing:
+        message = (
+            "⚠️ Не удалось выполнить повторное списание: отсутствуют сохранённые данные карты. "
+            "Привяжите карту заново через «💳 Привязать карту» или оплатите вручную."
+        )
+        if callback.message:
+            await callback.message.answer(message)
+        await callback.answer("Нет сохранённых данных для списания.", show_alert=True)
+        return
+
+    now_ts = int(datetime.utcnow().timestamp())
+    success = await try_auto_renew(
+        callback.bot,
+        db,
+        user,
+        now_ts,
+        force=True,
+    )
+
+    if success:
+        if callback.message:
+            try:
+                await callback.message.edit_reply_markup()
+            except TelegramBadRequest:
+                pass
+        await callback.answer("Подписка продлена.")
+        return
+
+    await callback.answer("Не удалось выполнить списание. Попробуйте позже.", show_alert=True)
+
+
 @router.callback_query(F.data == "ar:toggle")
 async def handle_toggle_autorenew(callback: CallbackQuery, db: DB) -> None:
     """Переключить автопродление пользователя."""
@@ -1216,6 +1401,136 @@ async def handle_toggle_autorenew(callback: CallbackQuery, db: DB) -> None:
     if callback.message:
         await refresh_user_menu(callback.message, db, user_id)
     await callback.answer("Статус обновлён.")
+
+
+@router.callback_query(F.data == "card:bind")
+async def handle_card_binding(callback: CallbackQuery, db: DB) -> None:
+    """Инициировать или проверить привязку карты пользователя."""
+
+    user_id = callback.from_user.id
+    if not await db.has_accepted_legal(user_id):
+        await callback.answer("Сначала подтвердите согласие.", show_alert=True)
+        return
+
+    user = await db.get_user(user_id)
+    if user is None:
+        await callback.answer("Сначала выполните /start.", show_alert=True)
+        return
+
+    terminal_key = (config.T_PAY_TERMINAL_KEY or "").strip()
+    if not terminal_key:
+        await callback.answer("Привязка временно недоступна. Обратитесь в поддержку.", show_alert=True)
+        return
+
+    row = dict(user)
+    rebill_id = (row.get("rebill_id") or "").strip()
+    request_key = (row.get("card_request_key") or "").strip()
+    customer_key = (row.get("customer_key") or "").strip()
+
+    if not customer_key:
+        customer_key = str(user_id)
+        try:
+            await db.set_customer_key(user_id, customer_key)
+        except Exception:  # noqa: BLE001
+            logging.debug(
+                "Не удалось сохранить CustomerKey перед привязкой для пользователя %s", user_id
+            )
+
+    async def send_form_link(active_request_key: str) -> str:
+        params = urllib.parse.urlencode(
+            {"TerminalKey": terminal_key, "RequestKey": active_request_key}
+        )
+        form_url = f"https://securepay.tinkoff.ru/html/payForm.html?{params}"
+        text_lines = [
+            "Откройте форму и введите данные карты для автопродления.",
+            "После подтверждения вернитесь в чат и снова нажмите «Привязать карту», чтобы проверить статус.",
+            form_url,
+        ]
+        if callback.message:
+            await callback.message.answer(
+                "\n\n".join(text_lines),
+                disable_web_page_preview=True,
+            )
+        return form_url
+
+    if request_key:
+        try:
+            state = await get_add_card_state(request_key)
+        except (TBankHttpError, TBankApiError) as err:
+            logging.warning("Не удалось проверить привязку карты пользователя %s: %s", user_id, err)
+            await callback.answer("Не удалось проверить статус привязки. Попробуйте позже.", show_alert=True)
+            return
+        status = (state.get("Status") or "").upper()
+        state_message = state.get("Message") or state.get("Details") or ""
+        state_customer_key = state.get("CustomerKey")
+        if state_customer_key:
+            await db.set_customer_key(user_id, str(state_customer_key))
+        if status == "CONFIRMED":
+            new_rebill = state.get("RebillId") or state.get("CardId")
+            if new_rebill:
+                await db.set_rebill_id(user_id, str(new_rebill))
+            await db.set_card_request_key(user_id, None)
+            success_lines = [
+                "✅ Карта успешно привязана.",
+                "Автопродление будет использовать сохранённую карту при следующем списании.",
+            ]
+            if rebill_id and callback.message:
+                success_lines.append(
+                    "Предыдущая привязанная карта останется активной до первой успешной оплаты новой картой."
+                )
+            if callback.message:
+                await callback.message.answer("\n".join(success_lines))
+                await refresh_user_menu(callback.message, db, user_id)
+            await callback.answer("Карта привязана.")
+            return
+        failure_statuses = {"REJECTED", "DECLINED", "ERROR", "FAILED"}
+        if status in failure_statuses:
+            await db.set_card_request_key(user_id, None)
+            request_key = ""
+            details = state_message or f"Статус: {status}"
+            if callback.message:
+                await callback.message.answer(
+                    "⚠️ Не удалось привязать карту. Попробуйте ещё раз.\n" + details
+                )
+        else:
+            form_url = await send_form_link(request_key)
+            if callback.message:
+                await callback.answer("Перейдите по ссылке и завершите привязку карты.")
+            else:
+                await callback.answer(f"Перейдите по ссылке: {form_url}", show_alert=True)
+            return
+
+    if not request_key:
+        try:
+            response = await add_card(
+                customer_key=customer_key,
+                check_type="NO",
+                ip=DEFAULT_CARD_BIND_IP,
+            )
+        except (TBankHttpError, TBankApiError) as err:
+            logging.warning("Не удалось инициировать привязку карты для пользователя %s: %s", user_id, err)
+            await callback.answer("Не удалось инициировать привязку. Попробуйте позже.", show_alert=True)
+            return
+        except Exception as err:  # noqa: BLE001
+            logging.exception("Неожиданная ошибка при создании привязки карты", exc_info=err)
+            await callback.answer("Привязка временно недоступна. Попробуйте позже.", show_alert=True)
+            return
+
+        new_request_key = str(response.get("RequestKey") or "").strip()
+        if not new_request_key:
+            logging.error("T-Bank не вернул RequestKey при привязке карты: %s", response)
+            await callback.answer("Не удалось получить ссылку для привязки.", show_alert=True)
+            return
+
+        response_customer_key = response.get("CustomerKey")
+        if response_customer_key:
+            await db.set_customer_key(user_id, str(response_customer_key))
+        await db.set_card_request_key(user_id, new_request_key)
+        form_url = await send_form_link(new_request_key)
+        if callback.message:
+            await callback.answer("Ссылка для привязки отправлена.")
+        else:
+            await callback.answer(f"Ссылка: {form_url}", show_alert=True)
 
 
 @router.callback_query(F.data == "invite:once")

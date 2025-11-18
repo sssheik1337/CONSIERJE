@@ -387,6 +387,109 @@ async def get_payment_state(payment_id: str, ip: Optional[str] = None) -> Dict[s
         raise
 
 
+async def charge_payment(
+    *,
+    payment_id: str,
+    rebill_id: str,
+    customer_key: Optional[str] = None,
+    amount: Optional[int] = None,
+    ip: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Выполнить рекуррентное списание через метод Charge."""
+
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
+    payload: Dict[str, Any] = {
+        "PaymentId": payment_id,
+        "RebillId": rebill_id,
+    }
+    if customer_key:
+        payload["CustomerKey"] = customer_key
+    if amount:
+        payload["Amount"] = amount
+    if ip:
+        payload["IP"] = ip
+
+    return await _post(
+        "Charge",
+        payload,
+        base_url=base_url,
+        terminal_key=terminal_key,
+        password=password,
+        api_token=api_token,
+    )
+
+
+async def add_card(
+    customer_key: str,
+    *,
+    check_type: str = "NO",
+    ip: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Инициировать привязку карты для последующих автосписаний."""
+
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
+    payload: Dict[str, Any] = {
+        "CustomerKey": customer_key,
+        "CheckType": check_type or "NO",
+    }
+    if ip:
+        payload["IP"] = ip
+
+    return await _post(
+        "AddCard",
+        payload,
+        base_url=base_url,
+        terminal_key=terminal_key,
+        password=password,
+        api_token=api_token,
+    )
+
+
+async def get_add_card_state(request_key: str) -> Dict[str, Any]:
+    """Проверить состояние привязки карты и получить RebillId."""
+
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
+    payload: Dict[str, Any] = {
+        "RequestKey": request_key,
+    }
+
+    return await _post(
+        "GetAddCardState",
+        payload,
+        base_url=base_url,
+        terminal_key=terminal_key,
+        password=password,
+        api_token=api_token,
+    )
+
+
 async def finish_authorize(
     payment_id: str,
     card_data: Dict[str, Any],
@@ -453,6 +556,9 @@ __all__ = [
     "init_payment",
     "confirm_payment",
     "get_payment_state",
+    "charge_payment",
+    "add_card",
+    "get_add_card_state",
     "finish_authorize",
     "net_diagnostics",
 ]

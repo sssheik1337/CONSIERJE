@@ -182,6 +182,32 @@ async def tbank_notify(request: web.Request) -> web.Response:
                     months = int(payment_row["months"] or 0)
                     if user_id > 0 and months > 0 and not was_confirmed:
                         await _notify_user_payment_confirmed(bot, db, user_id, months)
+                    if user_id > 0:
+                        payment_type = payments.detect_payment_type(data)
+                        try:
+                            await db.set_payment_method(target_payment_id, payment_type)
+                        except Exception as err:  # noqa: BLE001
+                            logging.debug(
+                                "Не удалось сохранить способ оплаты %s для платежа %s: %s",
+                                payment_type,
+                                target_payment_id,
+                                err,
+                            )
+                        if payment_type == "sbp":
+                            await payments.disable_auto_renew_for_sbp(
+                                db,
+                                user_id,
+                                note="Оплата через СБП подтверждена, автопродление отключено.",
+                            )
+                        else:
+                            rebill_id = data.get("RebillId") or data.get("rebill_id")
+                            if rebill_id:
+                                await db.set_rebill_id(user_id, str(rebill_id))
+                            customer_key = data.get("CustomerKey") or data.get("customer_key")
+                            if customer_key:
+                                await db.set_customer_key(user_id, str(customer_key))
+                            if target_payment_id:
+                                await db.set_rebill_parent_payment(user_id, str(target_payment_id))
         elif status_upper:
             if target_payment_id:
                 await db.set_payment_status(target_payment_id, status_upper)
