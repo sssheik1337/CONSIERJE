@@ -174,6 +174,13 @@ async def try_auto_renew(
 
     months_to_extend = max(1, parent_months)
     await db.extend_subscription(user_id, months_to_extend)
+    try:
+        await db.set_paid_only(user_id, False)
+    except Exception:  # noqa: BLE001
+        logging.debug(
+            "Не удалось сбросить флаг paid_only после автопродления для пользователя %s",
+            user_id,
+        )
     extended_until = await db.get_subscription_end(user_id)
     if not extended_until:
         extended_until = _next_month_date(now_ts)
