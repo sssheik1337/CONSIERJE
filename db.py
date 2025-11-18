@@ -76,7 +76,10 @@ CREATE TABLE IF NOT EXISTS payments (
     months INTEGER,
     status TEXT DEFAULT 'PENDING',
     created_at INTEGER,
-    method TEXT DEFAULT 'card'
+    method TEXT DEFAULT 'card',
+    is_sbp INTEGER NOT NULL DEFAULT 0,
+    request_key TEXT,
+    account_token TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_payment_id ON payments(payment_id);
@@ -102,6 +105,18 @@ CREATE TABLE IF NOT EXISTS payment_logs (
     message TEXT,
     payment_type TEXT
 );
+
+CREATE TABLE IF NOT EXISTS sbp_links (
+    user_id INTEGER PRIMARY KEY,
+    request_key TEXT,
+    account_token TEXT,
+    bank_member_id TEXT,
+    bank_member_name TEXT,
+    status TEXT,
+    created_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_sbp_links_request_key ON sbp_links(request_key);
 """
 
 COUPON_CODE_PATTERN = re.compile(r"^[A-Z0-9\-]{4,32}$")
@@ -171,6 +186,11 @@ class DB:
                 "ALTER TABLE subscriptions ADD COLUMN rebill_parent_payment TEXT",
                 "ALTER TABLE payment_logs ADD COLUMN payment_type TEXT",
                 "ALTER TABLE payments ADD COLUMN method TEXT",
+                "ALTER TABLE payments ADD COLUMN is_sbp INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE payments ADD COLUMN request_key TEXT",
+                "ALTER TABLE payments ADD COLUMN account_token TEXT",
+                "CREATE TABLE IF NOT EXISTS sbp_links (user_id INTEGER PRIMARY KEY, request_key TEXT, account_token TEXT, bank_member_id TEXT, bank_member_name TEXT, status TEXT, created_at INTEGER)",
+                "CREATE INDEX IF NOT EXISTS idx_sbp_links_request_key ON sbp_links(request_key)",
             ):
                 try:
                     await db.execute(ddl)
@@ -526,6 +546,163 @@ class DB:
         text = value.strip()
         return text or None
 
+    async def save_request_key(
+        self, user_id: int, request_key: str, *, status: str = "NEW"
+    ) -> None:
+        """Сохранить RequestKey привязки счёта через СБП."""
+
+        if user_id <= 0:
+            return
+        value = (request_key or "").strip()
+        if not value:
+            return
+        normalized_status = (status or "NEW").strip().upper() or "NEW"
+        stamp = int(time.time())
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO sbp_links(user_id, request_key, status, created_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    request_key=excluded.request_key,
+                    status=excluded.status,
+                    created_at=excluded.created_at
+                """,
+                (user_id, value, normalized_status, stamp),
+            )
+            await db.commit()
+
+    async def update_sbp_status(self, user_id: int, status: str) -> None:
+        """Обновить статус привязки счёта через СБП."""
+
+        if user_id <= 0:
+            return
+        normalized_status = (status or "").strip().upper()
+        if not normalized_status:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE sbp_links SET status=? WHERE user_id=?",
+                (normalized_status, user_id),
+            )
+            await db.commit()
+
+    async def save_account_token(
+        self,
+        user_id: int,
+        account_token: str,
+        bank_member_id: Optional[str] = None,
+        bank_member_name: Optional[str] = None,
+    ) -> None:
+        """Сохранить AccountToken и данные банка для пользователя."""
+
+        if user_id <= 0:
+            return
+        token_value = (account_token or "").strip()
+        if not token_value:
+            return
+        member_id = (bank_member_id or "").strip() or None
+        member_name = (bank_member_name or "").strip() or None
+        stamp = int(time.time())
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO sbp_links(user_id, account_token, bank_member_id, bank_member_name, status, created_at)
+                VALUES(?, ?, ?, ?, 'ACTIVE', ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    account_token=excluded.account_token,
+                    bank_member_id=COALESCE(excluded.bank_member_id, sbp_links.bank_member_id),
+                    bank_member_name=COALESCE(excluded.bank_member_name, sbp_links.bank_member_name),
+                    status=excluded.status,
+                    created_at=CASE WHEN sbp_links.created_at IS NULL OR sbp_links.created_at=0 THEN excluded.created_at ELSE sbp_links.created_at END
+                """,
+                (user_id, token_value, member_id, member_name, stamp),
+            )
+            await db.commit()
+
+    async def get_account_token(self, user_id: int) -> Optional[str]:
+        """Получить AccountToken, сохранённый для пользователя."""
+
+        if user_id <= 0:
+            return None
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT account_token FROM sbp_links WHERE user_id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        value = row["account_token"]
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    async def get_user_by_request_key(self, request_key: str) -> Optional[int]:
+        """Найти пользователя по RequestKey привязки счёта."""
+
+        value = (request_key or "").strip()
+        if not value:
+            return None
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT user_id FROM sbp_links WHERE request_key=?",
+                (value,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return int(row["user_id"] or 0)
+
+    async def get_payment_by_request_key(
+        self, request_key: str
+    ) -> Optional[aiosqlite.Row]:
+        """Получить платёж по RequestKey (для СБП-привязок)."""
+
+        value = (request_key or "").strip()
+        if not value:
+            return None
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM payments WHERE request_key=? ORDER BY created_at DESC LIMIT 1",
+                (value,),
+            )
+            return await cur.fetchone()
+
+    async def set_payment_request_key(
+        self, payment_id: str, request_key: Optional[str]
+    ) -> None:
+        """Привязать RequestKey к конкретному платежу."""
+
+        value = (request_key or "").strip()
+        if not payment_id:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE payments SET request_key=? WHERE payment_id=?",
+                (value or None, payment_id),
+            )
+            await db.commit()
+
+    async def set_payment_account_token(
+        self, payment_id: str, account_token: Optional[str]
+    ) -> None:
+        """Сохранить AccountToken для конкретного платежа."""
+
+        if not payment_id:
+            return
+        value = (account_token or "").strip() or None
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE payments SET account_token=? WHERE payment_id=?",
+                (value, payment_id),
+            )
+            await db.commit()
+
     async def log_payment_attempt(
         self,
         user_id: int,
@@ -719,11 +896,17 @@ class DB:
         status: str = "PENDING",
         *,
         method: Optional[str] = None,
+        request_key: Optional[str] = None,
+        account_token: Optional[str] = None,
+        is_sbp: Optional[bool] = None,
     ) -> None:
         """Сохранить платёж в базе данных."""
 
         normalized_status = status.upper() if status else "PENDING"
         normalized_method = (method or "card").strip().lower() or "card"
+        sbp_flag = 1 if (is_sbp if is_sbp is not None else normalized_method == "sbp") else 0
+        request_value = (request_key or "").strip() or None
+        account_value = (account_token or "").strip() or None
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
@@ -735,7 +918,7 @@ class DB:
                 await db.execute(
                     """
                     UPDATE payments
-                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?, method=?
+                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?, method=?, is_sbp=?, request_key=?, account_token=?
                     WHERE id=?
                     """,
                     (
@@ -746,6 +929,9 @@ class DB:
                         months,
                         normalized_status,
                         normalized_method,
+                        sbp_flag,
+                        request_value,
+                        account_value,
                         row["id"],
                     ),
                 )
@@ -753,8 +939,8 @@ class DB:
                 created_at = int(time.time())
                 await db.execute(
                     """
-                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at, method)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at, method, is_sbp, request_key, account_token)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id,
@@ -765,6 +951,9 @@ class DB:
                         normalized_status,
                         created_at,
                         normalized_method,
+                        sbp_flag,
+                        request_value,
+                        account_value,
                     ),
                 )
             await db.commit()

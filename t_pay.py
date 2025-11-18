@@ -326,6 +326,93 @@ async def init_payment(
     return response
 
 
+async def get_qr(payment_id: str, *, data_type: str = "PAYLOAD") -> Dict[str, Any]:
+    """Получить QR-данные для оплаты через СБП."""
+
+    if not payment_id:
+        raise ValueError("PaymentId обязателен для GetQr")
+    (
+        base_url,
+        terminal_key,
+        password,
+        *_
+    ) = _read_env()
+    payload: Dict[str, Any] = {
+        "PaymentId": str(payment_id),
+        "DataType": data_type or "PAYLOAD",
+        "TerminalKey": terminal_key,
+    }
+    payload["Token"] = _generate_token(payload, password)
+    url = f"{base_url}/GetQr"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=15,
+        ) as response:
+            text = await response.text()
+            if response.status != 200:
+                logger.error("GetQr HTTP %s: %s", response.status, text[:200])
+                raise TBankHttpError(f"GetQr HTTP {response.status}: {text[:100]}")
+            data = json.loads(text)
+    if not data.get("Success"):
+        raise TBankApiError(
+            str(data.get("ErrorCode", "GetQr")),
+            data.get("Message") or "GetQr вернул ошибку",
+            data.get("Details"),
+        )
+    return data
+
+
+async def get_add_account_qr_state(request_key: str) -> Dict[str, Any]:
+    """Получить состояние привязки счёта (GetAddAccountQrState)."""
+
+    if not request_key:
+        raise ValueError("RequestKey обязателен для GetAddAccountQrState")
+    (
+        base_url,
+        terminal_key,
+        password,
+        *_
+    ) = _read_env()
+    payload = {
+        "TerminalKey": terminal_key,
+        "RequestKey": request_key,
+    }
+    payload["Token"] = _generate_token(payload, password)
+    url = f"{base_url}/GetAddAccountQrState"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=15,
+        ) as response:
+            text = await response.text()
+            if response.status != 200:
+                logger.error(
+                    "GetAddAccountQrState HTTP %s: %s", response.status, text[:200]
+                )
+                raise TBankHttpError(
+                    f"GetAddAccountQrState HTTP {response.status}: {text[:100]}"
+                )
+            data = json.loads(text)
+    if not data.get("Success"):
+        raise TBankApiError(
+            str(data.get("ErrorCode", "GetAddAccountQrState")),
+            data.get("Message") or "Привязка счёта не подтверждена",
+            data.get("Details"),
+        )
+    return data
+
+
 async def confirm_payment(
     payment_id: str,
     amount: Optional[int] = None,
@@ -1111,6 +1198,8 @@ __all__ = [
     "init_add_card",
     "attach_card",
     "get_add_card_state",
+    "get_qr",
+    "get_add_account_qr_state",
     "get_qr_bank_list",
     "check_tinkoff_pay_availability",
     "add_account_qr",

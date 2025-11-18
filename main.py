@@ -21,7 +21,7 @@ import payments
 import t_pay
 from config import config
 from db import DB
-from handlers import router
+from handlers import handle_sbp_notification_payload, router
 from logger import logger
 from scheduler import setup_scheduler
 
@@ -162,6 +162,7 @@ async def tbank_notify(request: web.Request) -> web.Response:
         event_id = 0
 
     processed = False
+    sbp_link_processed = False
 
     try:
         target_payment_id = payment_id
@@ -169,6 +170,14 @@ async def tbank_notify(request: web.Request) -> web.Response:
             payment_row = await db.get_payment_by_order_id(order_id)
             if payment_row:
                 target_payment_id = payment_row["payment_id"]
+
+        if not sbp_link_processed and (
+            data.get("AccountToken") or data.get("RequestKey")
+        ):
+            try:
+                sbp_link_processed = await handle_sbp_notification_payload(data, db)
+            except Exception as err:  # noqa: BLE001
+                logger.exception("Ошибка обработки AccountToken", exc_info=err)
 
         if status_upper == "CONFIRMED" and target_payment_id:
             payment_before = await db.get_payment_by_payment_id(target_payment_id)

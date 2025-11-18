@@ -11,8 +11,11 @@ from t_pay import (
     TBankApiError,
     TBankHttpError,
     add_customer,
+    charge_qr,
+    get_add_account_qr_state,
     get_customer,
     get_payment_state,
+    get_qr,
     init_payment,
 )
 
@@ -34,6 +37,29 @@ def _get_db() -> DB:
     if _payment_db is not None:
         return _payment_db
     return DB(config.DB_PATH)
+
+
+def _normalize_amount_inputs(
+    months: int, amount: int, *, explicit_db: bool
+) -> tuple[int, int, int]:
+    """Проверить значения срока и суммы, вернуть нормализованные данные."""
+
+    resolved_months = months
+    resolved_amount = amount
+    if not explicit_db and resolved_amount < resolved_months:
+        resolved_amount, resolved_months = resolved_months, resolved_amount
+    if resolved_months <= 0:
+        raise ValueError("Срок подписки должен быть положительным")
+    if resolved_amount <= 0:
+        raise ValueError("Сумма должна быть положительной")
+    amount_minor = resolved_amount if explicit_db else resolved_amount * 100
+    return resolved_months, resolved_amount, amount_minor
+
+
+def _build_order_id(prefix: str, user_id: int, months: int) -> str:
+    """Сформировать order_id с учётом пользователя и срока."""
+
+    return f"{prefix}_{user_id}_{months}_{int(time.time())}"
 
 
 def _extract_row_text(row: Mapping[str, Any] | None, key: str) -> Optional[str]:
@@ -71,6 +97,25 @@ def _extract_row_text(row: Mapping[str, Any] | None, key: str) -> Optional[str]:
         return None
     text = str(value).strip()
     return text or None
+
+
+async def _ensure_customer_key(
+    db: DB, user_id: int, *, user_row: Mapping[str, Any] | None = None
+) -> tuple[Optional[str], Mapping[str, Any] | None]:
+    """Убедиться, что у пользователя сохранён CustomerKey."""
+
+    if user_id <= 0:
+        return None, user_row
+    if user_row is None:
+        user_row = await db.get_user(user_id)
+    customer_key = _extract_row_text(user_row, "customer_key")
+    if not customer_key:
+        customer_key = str(user_id)
+        try:
+            await db.set_customer_key(user_id, customer_key)
+        except Exception:  # noqa: BLE001
+            logger.debug("Не удалось сохранить CustomerKey для пользователя %s", user_id)
+    return customer_key, user_row
 
 
 async def _ensure_customer_registered(
@@ -179,6 +224,234 @@ async def disable_auto_renew_for_sbp(
         )
 
 
+async def init_sbp_payment(
+    user_id: int,
+    months: int,
+    amount: int,
+    *,
+    db: Optional[DB] = None,
+) -> dict[str, Any]:
+    """Создать платёж для СБП с рекуррентной привязкой счёта."""
+
+    if user_id <= 0:
+        raise ValueError("Некорректный идентификатор пользователя")
+    explicit_db = db is not None
+    resolved_db = db or _get_db()
+    resolved_months, _, amount_minor = _normalize_amount_inputs(
+        months, amount, explicit_db=explicit_db
+    )
+    order_id = _build_order_id("sbp", user_id, resolved_months)
+    description = f"Подписка через СБП на {resolved_months} мес. (user {user_id})"
+    customer_key, user_row = await _ensure_customer_key(resolved_db, user_id)
+    if customer_key:
+        await _ensure_customer_registered(
+            resolved_db,
+            user_id,
+            customer_key,
+            user_row=user_row,
+        )
+
+    try:
+        response = await init_payment(
+            amount=amount_minor,
+            order_id=order_id,
+            description=description,
+            customer_key=customer_key or str(user_id),
+            recurrent="Y",
+            pay_type="O",
+            extra={"QR": "true"},
+            notification_url=config.TINKOFF_NOTIFY_URL or None,
+        )
+    except (TBankHttpError, TBankApiError) as err:
+        logger.error("Init для СБП завершился ошибкой: %s", err)
+        raise RuntimeError(str(err)) from err
+
+    payment_id = str(response.get("PaymentId") or "")
+    if not payment_id:
+        raise RuntimeError("Init не вернул идентификатор платежа")
+
+    await resolved_db.add_payment(
+        user_id=user_id,
+        payment_id=payment_id,
+        order_id=order_id,
+        amount=amount_minor,
+        months=resolved_months,
+        method="sbp",
+        is_sbp=True,
+    )
+
+    return {
+        "payment_id": payment_id,
+        "payment_url": response.get("PaymentURL"),
+        "order_id": order_id,
+        "amount": amount_minor,
+    }
+
+
+async def form_sbp_qr(
+    user_id: int,
+    payment_id: str,
+    *,
+    db: Optional[DB] = None,
+    data_type: str = "PAYLOAD",
+) -> dict[str, Any]:
+    """Запросить QR для оплаты через СБП и сохранить RequestKey."""
+
+    if user_id <= 0 or not payment_id:
+        raise ValueError("Некорректные данные для формирования QR")
+    resolved_db = db or _get_db()
+    try:
+        response = await get_qr(payment_id, data_type=data_type)
+    except (TBankApiError, TBankHttpError) as err:
+        logger.error("GetQr завершился ошибкой: %s", err)
+        raise
+
+    params = response.get("Params") or {}
+    payload = (
+        params.get("Data")
+        or params.get("Payload")
+        or response.get("Data")
+        or response.get("Payload")
+    )
+    request_key = params.get("RequestKey") or response.get("RequestKey")
+    if not request_key:
+        raise RuntimeError("GetQr не вернул RequestKey")
+
+    await resolved_db.save_request_key(user_id, request_key, status="NEW")
+    await resolved_db.set_payment_request_key(payment_id, request_key)
+
+    return {
+        "payload": payload,
+        "request_key": request_key,
+        "payment_id": payment_id,
+    }
+
+
+async def get_sbp_link_status(
+    request_key: str,
+    *,
+    user_id: Optional[int] = None,
+    db: Optional[DB] = None,
+) -> dict[str, Any]:
+    """Проверить статус привязки счёта через RequestKey."""
+
+    if not request_key:
+        raise ValueError("RequestKey не указан")
+    resolved_db = db or _get_db()
+    resolved_user = user_id
+    if resolved_user is None:
+        resolved_user = await resolved_db.get_user_by_request_key(request_key)
+    try:
+        response = await get_add_account_qr_state(request_key)
+    except (TBankApiError, TBankHttpError) as err:
+        logger.error("GetAddAccountQrState завершился ошибкой: %s", err)
+        raise
+
+    status = (response.get("Status") or response.get("state") or "").upper()
+    params = response.get("Params") or {}
+    account_token = params.get("AccountToken") or response.get("AccountToken")
+    bank_member_id = params.get("BankMemberId") or response.get("BankMemberId")
+    bank_member_name = params.get("BankMemberName") or response.get("BankMemberName")
+
+    if resolved_user:
+        if status:
+            await resolved_db.update_sbp_status(resolved_user, status)
+        if account_token:
+            await resolved_db.save_account_token(
+                resolved_user,
+                str(account_token),
+                bank_member_id=str(bank_member_id) if bank_member_id else None,
+                bank_member_name=str(bank_member_name) if bank_member_name else None,
+            )
+        payment_row = await resolved_db.get_payment_by_request_key(request_key)
+        if payment_row and account_token:
+            await resolved_db.set_payment_account_token(
+                payment_row["payment_id"], account_token
+            )
+
+    return {
+        "status": status,
+        "account_token": account_token,
+        "bank_member_id": bank_member_id,
+        "bank_member_name": bank_member_name,
+        "user_id": resolved_user,
+    }
+
+
+async def charge_sbp_autopayment(
+    user_id: int,
+    months: int,
+    amount: int,
+    account_token: str,
+    *,
+    db: Optional[DB] = None,
+    ip: str = "127.0.0.1",
+    send_email: bool = False,
+    info_email: Optional[str] = None,
+) -> dict[str, Any]:
+    """Выполнить автосписание через СБП по сохранённому счёту."""
+
+    if user_id <= 0:
+        raise ValueError("Некорректный пользователь для автосписания")
+    explicit_db = db is not None
+    resolved_db = db or _get_db()
+    resolved_months, _, amount_minor = _normalize_amount_inputs(
+        months, amount, explicit_db=explicit_db
+    )
+    customer_key, user_row = await _ensure_customer_key(resolved_db, user_id)
+    if customer_key:
+        await _ensure_customer_registered(
+            resolved_db,
+            user_id,
+            customer_key,
+            user_row=user_row,
+        )
+    order_id = _build_order_id("sbp_auto", user_id, resolved_months)
+    description = f"Автопродление подписки (СБП) на {resolved_months} мес."
+
+    init_response = await init_payment(
+        amount=amount_minor,
+        order_id=order_id,
+        description=description,
+        customer_key=customer_key or str(user_id),
+        recurrent="Y",
+        pay_type="O",
+        extra={"QR": "true"},
+        notification_url=config.TINKOFF_NOTIFY_URL or None,
+    )
+    payment_id = str(init_response.get("PaymentId") or "")
+    if not payment_id:
+        raise RuntimeError("ChargeQr: Init не вернул PaymentId")
+
+    await resolved_db.add_payment(
+        user_id=user_id,
+        payment_id=payment_id,
+        order_id=order_id,
+        amount=amount_minor,
+        months=resolved_months,
+        method="sbp",
+        is_sbp=True,
+        account_token=account_token,
+    )
+
+    charge_response = await charge_qr(
+        payment_id,
+        account_token,
+        ip,
+        send_email=send_email,
+        info_email=info_email,
+    )
+    status = charge_response.get("Status") or "PENDING"
+    await resolved_db.set_payment_status(payment_id, str(status).upper())
+    await resolved_db.set_payment_account_token(payment_id, account_token)
+
+    return {
+        "payment_id": payment_id,
+        "status": status,
+        "charge_response": charge_response,
+    }
+
+
 async def create_payment(
     user_id: int,
     months: int,
@@ -192,19 +465,14 @@ async def create_payment(
 
     if user_id <= 0:
         raise ValueError("Некорректный идентификатор пользователя")
-    if months <= 0:
-        raise ValueError("Срок подписки должен быть положительным")
-    if amount <= 0:
-        raise ValueError("Сумма должна быть положительной")
 
     explicit_db = db is not None
     db_instance = db or _get_db()
 
     # Поддержка старого порядка аргументов: create_payment(user_id, price, months)
-    resolved_months = months
-    resolved_amount = amount
-    if not explicit_db and resolved_amount < resolved_months:
-        resolved_amount, resolved_months = resolved_months, resolved_amount
+    resolved_months, resolved_amount, amount_minor = _normalize_amount_inputs(
+        months, amount, explicit_db=explicit_db
+    )
 
     order_id = f"{user_id}_{resolved_months}_{int(time.time())}"
     description = f"Подписка на {resolved_months} мес. (user {user_id})"
@@ -253,12 +521,6 @@ async def create_payment(
             customer_key_value,
             user_row=user_row,
         )
-
-    # Если БД не передали явно, предполагаем, что сумма указана в рублях и переводим в копейки
-    if explicit_db:
-        amount_minor = resolved_amount
-    else:
-        amount_minor = resolved_amount * 100
 
     try:
         response = await init_payment(
@@ -431,8 +693,12 @@ __all__ = [
     "SBP_NOTE",
     "apply_successful_payment",
     "check_payment_status",
+    "charge_sbp_autopayment",
     "create_payment",
     "detect_payment_type",
     "disable_auto_renew_for_sbp",
+    "form_sbp_qr",
+    "get_sbp_link_status",
+    "init_sbp_payment",
     "set_db",
 ]

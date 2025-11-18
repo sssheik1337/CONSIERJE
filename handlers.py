@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import urllib.parse
 
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 import aiosqlite
 from aiogram import Bot, F, Router
@@ -27,7 +28,13 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import config, get_docs_map
 from db import DB
 from logger import logger
-from payments import SBP_NOTE, check_payment_status, create_payment
+from payments import (
+    SBP_NOTE,
+    check_payment_status,
+    create_payment,
+    form_sbp_qr,
+    init_sbp_payment,
+)
 from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
 from t_pay import (
     TBankApiError,
@@ -1440,6 +1447,54 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
     if price is None:
         await callback.answer("Тариф не найден.", show_alert=True)
         return
+    if method == "sbp":
+        try:
+            init_result = await init_sbp_payment(user_id, months, price)
+        except Exception as err:  # noqa: BLE001
+            logger.exception("Init СБП не удался", exc_info=err)
+            await callback.answer(
+                "Не удалось создать платёж СБП. Попробуйте позже.",
+                show_alert=True,
+            )
+            return
+        payment_id = init_result.get("payment_id")
+        if not payment_id:
+            await callback.answer("T-Bank не вернул PaymentId.", show_alert=True)
+            return
+        try:
+            qr_result = await form_sbp_qr(user_id, payment_id)
+        except Exception as err:  # noqa: BLE001
+            logger.exception("Не удалось получить QR для СБП", exc_info=err)
+            await callback.answer(
+                "Не удалось сформировать QR. Попробуйте позже.",
+                show_alert=True,
+            )
+            return
+
+        builder = InlineKeyboardBuilder()
+        builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
+        builder.button(text="🏠 Главное меню", callback_data="menu:home")
+        builder.adjust(1)
+        payload_text = qr_result.get("payload") or "(данные QR недоступны)"
+        message_lines = [
+            "📲 Оплата подписки через СБП.",
+            f"Срок: {months} мес., сумма: {price}₽.",
+            "Отсканируйте QR-код в приложении банка.",
+            SBP_NOTE,
+            "",
+            "QR payload:",
+            str(payload_text),
+        ]
+        if callback.message:
+            await callback.message.answer(
+                "\n".join(message_lines),
+                reply_markup=builder.as_markup(),
+                disable_web_page_preview=True,
+            )
+            await _prompt_sbp_banks(callback.message)
+        await callback.answer("QR для оплаты готов.")
+        return
+
     try:
         payment_url = await create_payment(
             user_id,
@@ -2928,3 +2983,58 @@ async def admin_save_custom_code(message: Message, state: FSMContext, db: DB, bo
     )
     await refresh_admin_panel_by_state(bot, state, db)
     await state.clear()
+
+
+async def handle_sbp_notification_payload(
+    payload: Mapping[str, Any], db: DB
+) -> bool:
+    """Обработать уведомление T-Bank с AccountToken для СБП."""
+
+    if not isinstance(payload, Mapping):
+        return False
+    request_key = str(
+        payload.get("RequestKey")
+        or payload.get("requestKey")
+        or payload.get("REQUESTKEY")
+        or ""
+    ).strip()
+    if not request_key:
+        return False
+
+    user_id = await db.get_user_by_request_key(request_key)
+    if not user_id:
+        logger.warning("СБП-уведомление: RequestKey %s не найден", request_key)
+        return False
+
+    params = payload.get("Params") if isinstance(payload.get("Params"), Mapping) else {}
+    status = (payload.get("Status") or payload.get("status") or "").upper()
+    account_token = (
+        payload.get("AccountToken")
+        or payload.get("accountToken")
+        or (params.get("AccountToken") if isinstance(params, Mapping) else None)
+    )
+    bank_member_id = (
+        payload.get("BankMemberId")
+        or (params.get("BankMemberId") if isinstance(params, Mapping) else None)
+    )
+    bank_member_name = (
+        payload.get("BankMemberName")
+        or (params.get("BankMemberName") if isinstance(params, Mapping) else None)
+    )
+
+    if status:
+        await db.update_sbp_status(user_id, status)
+    if account_token:
+        await db.save_account_token(
+            user_id,
+            str(account_token),
+            bank_member_id=str(bank_member_id) if bank_member_id else None,
+            bank_member_name=str(bank_member_name) if bank_member_name else None,
+        )
+        await db.set_auto_renew(user_id, True)
+        payment_row = await db.get_payment_by_request_key(request_key)
+        if payment_row and payment_row["payment_id"]:
+            await db.set_payment_account_token(
+                payment_row["payment_id"], str(account_token)
+            )
+    return True
