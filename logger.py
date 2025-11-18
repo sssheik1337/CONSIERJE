@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_FORMAT = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 
 _LEVELS: dict[str, int] = {
     "DEBUG": logging.DEBUG,
@@ -18,15 +19,22 @@ _LEVELS: dict[str, int] = {
     "CRITICAL": logging.CRITICAL,
 }
 
-logger = logging.getLogger("concierge")
-logger.setLevel(_LEVELS.get(_LOG_LEVEL, logging.INFO))
-logger.propagate = False
+_TARGET_LEVEL = _LEVELS.get(_LOG_LEVEL, logging.INFO)
 
-if not logger.handlers:
+root_logger = logging.getLogger()
+root_logger.setLevel(_TARGET_LEVEL)
+
+if not root_logger.handlers:
     handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s")
-    )
-    logger.addHandler(handler)
+    handler.setFormatter(logging.Formatter(_FORMAT))
+    root_logger.addHandler(handler)
+else:
+    formatter = logging.Formatter(_FORMAT)
+    for handler in root_logger.handlers:
+        handler.setLevel(_TARGET_LEVEL)
+        handler.setFormatter(formatter)
+
+logger = logging.getLogger("concierge")
+logger.setLevel(_TARGET_LEVEL)
 
 __all__ = ["logger"]

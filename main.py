@@ -309,6 +309,13 @@ async def main() -> None:
     if not config.BOT_TOKEN:
         raise SystemExit("Заполни BOT_TOKEN в .env")
 
+    logger.info(
+        "Запуск бота: база=%s, таймзона=%s, лог-уровень=%s",
+        config.DB_PATH,
+        config.TIMEZONE,
+        config.LOG_LEVEL,
+    )
+
     db = DB(config.DB_PATH)
     await db.init()
     payments.set_db(db)
@@ -324,6 +331,8 @@ async def main() -> None:
     setup_scheduler(bot, db, tz_name=config.TIMEZONE)
 
     webhook_task: Optional[asyncio.Task] = asyncio.create_task(start_webhook_server(bot, db))
+
+    logger.info("Запускаем polling aiogram и фоновый сервер вебхуков")
 
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
