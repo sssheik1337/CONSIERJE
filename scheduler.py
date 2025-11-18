@@ -20,6 +20,7 @@ RETRY_PAYMENT_CALLBACK = "payment:retry"
 
 
 FAILURE_MESSAGE = "Не удалось продлить подписку. 🔄 Повторить платёж"
+EXPIRED_MESSAGE = "Срок подписки истёк. Продлите, чтобы восстановить доступ."
 
 
 class AutoRenewResult(NamedTuple):
@@ -275,7 +276,11 @@ async def daily_check(bot: Bot, db: DB):
             if renew_result.user_notified:
                 notify_text = None
         else:
-            notify_text = "🔴 Подписка неактивна. Для доступа оформите её заново."
+            if bool(row_dict.get("auto_renew")):
+                notify_text = FAILURE_MESSAGE
+                notify_markup = _retry_markup()
+            else:
+                notify_text = EXPIRED_MESSAGE
         if notify_text:
             try:
                 await bot.send_message(
