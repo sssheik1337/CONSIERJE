@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import urllib.parse
 
 import logging
+from collections.abc import Mapping, Sequence
 
 import aiosqlite
 from aiogram import Bot, F, Router
@@ -16,6 +17,7 @@ from aiogram.types import (
     CallbackQuery,
     ChatMember,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -31,6 +33,7 @@ from t_pay import (
     TBankApiError,
     TBankHttpError,
     get_add_card_state,
+    get_qr_bank_list,
     init_add_card,
 )
 
@@ -43,6 +46,8 @@ COUPON_KIND_TRIAL = "trial"
 MD_V2_SPECIAL = set("_*[]()~`>#+-=|{}.!\\")
 
 DEFAULT_CARD_BIND_IP = "127.0.0.1"
+SBP_DEVICE_OS = {"ios": "iOS", "android": "Android"}
+SBP_BANK_LOGO_LIMIT = 10
 
 CANCEL_REPLY = ReplyKeyboardMarkup(
     keyboard=[
@@ -90,6 +95,142 @@ def _format_method_hint(method: str) -> str:
     """Вернуть описание способа оплаты для текстов пользователю."""
 
     return "картой" if method == "card" else "через СБП"
+
+
+def _resolve_device_os(raw: str | None) -> str:
+    """Определить платформу устройства пользователя для запроса банков СБП."""
+
+    if not raw:
+        return SBP_DEVICE_OS["android"]
+    lowered = raw.strip().lower()
+    return SBP_DEVICE_OS.get(lowered, SBP_DEVICE_OS["android"])
+
+
+def _build_sbp_device_keyboard() -> InlineKeyboardMarkup:
+    """Создать клавиатуру для выбора платформы перед показом банков СБП."""
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🤖 Android", callback_data="sbp:banks:android")
+    builder.button(text="📱 iOS", callback_data="sbp:banks:ios")
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def _extract_bank_list(payload: Mapping[str, object] | None) -> list[dict[str, object]]:
+    """Выделить список банков из ответа GetQrBankList."""
+
+    if not isinstance(payload, Mapping):
+        return []
+    candidates: object = (
+        payload.get("Banks")
+        or payload.get("banks")
+        or payload.get("BankList")
+        or payload.get("bankList")
+    )
+    if not candidates:
+        nested = (
+            payload.get("Result")
+            or payload.get("Payload")
+            or payload.get("Data")
+            or payload.get("result")
+            or payload.get("data")
+        )
+        if isinstance(nested, Mapping):
+            return _extract_bank_list(nested)
+    if isinstance(candidates, Mapping):
+        for key in ("Banks", "banks", "Items", "items", "List", "list"):
+            nested_candidate = candidates.get(key)
+            if nested_candidate:
+                candidates = nested_candidate
+                break
+    if not isinstance(candidates, Sequence):
+        return []
+    result: list[dict[str, object]] = []
+    for item in candidates:
+        if isinstance(item, Mapping):
+            result.append(dict(item))
+    result.sort(key=_bank_order_key)
+    return result
+
+
+def _bank_order_key(bank: Mapping[str, object]) -> tuple[int, str]:
+    """Ключ сортировки банков по порядку и названию."""
+
+    order_raw = bank.get("BankOrder") or bank.get("order") or 9999
+    order_value = _safe_int(order_raw)
+    name_value = str(bank.get("BankName") or bank.get("Name") or "").lower()
+    return (order_value, name_value)
+
+
+def _resolve_bank_link(bank: Mapping[str, object]) -> str | None:
+    """Извлечь ссылку для открытия приложения банка по deep-link."""
+
+    candidate_keys = [
+        "DeepLink",
+        "deeplink",
+        "AppLink",
+        "appLink",
+        "AppUrl",
+        "appUrl",
+        "BankUrl",
+        "bankUrl",
+        "Link",
+        "Url",
+        "link",
+        "url",
+    ]
+    for key in candidate_keys:
+        value = bank.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    nested = bank.get("Links") or bank.get("links")
+    if isinstance(nested, Mapping):
+        for key in candidate_keys:
+            value = nested.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+async def _send_sbp_bank_gallery(message: Message, banks: Sequence[Mapping[str, object]]) -> None:
+    """Показать пользователю логотипы банков в виде набора изображений."""
+
+    gallery: list[InputMediaPhoto] = []
+    for bank in banks:
+        logo = bank.get("BankLogo") or bank.get("logo")
+        if not logo:
+            continue
+        logo_url = str(logo).strip()
+        if not logo_url:
+            continue
+        caption = None
+        if not gallery:
+            caption = str(bank.get("BankName") or bank.get("Name") or "")
+        gallery.append(InputMediaPhoto(media=logo_url, caption=caption))
+        if len(gallery) >= SBP_BANK_LOGO_LIMIT:
+            break
+    if not gallery:
+        return
+    try:
+        if len(gallery) == 1:
+            await message.answer_photo(gallery[0].media, caption=gallery[0].caption)
+        else:
+            await message.answer_media_group(gallery)
+    except TelegramBadRequest as err:
+        logging.debug("Не удалось отправить логотипы банков: %s", err)
+
+
+async def _prompt_sbp_banks(message: Message | None) -> None:
+    """Отправить пользователю предложение выбрать платформу для банков СБП."""
+
+    if not message:
+        return
+    text = (
+        "📲 Хотите оплатить через приложение банка по СБП?\n"
+        "Выберите платформу, чтобы увидеть доступные банки."
+    )
+    await message.answer(f"{text}\n\n{SBP_NOTE}", reply_markup=_build_sbp_device_keyboard())
 
 
 async def _ensure_subscription_state(
@@ -1317,6 +1458,8 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
             reply_markup=builder.as_markup(),
             disable_web_page_preview=True,
         )
+        if method == "sbp":
+            await _prompt_sbp_banks(callback.message)
     await callback.answer("Ссылка на оплату готова.")
 
 
@@ -1332,6 +1475,58 @@ async def handle_buy_with_method(callback: CallbackQuery, db: DB) -> None:
     """Создание оплаты с указанием конкретного способа."""
 
     await _handle_buy_callback(callback, db)
+
+
+@router.callback_query(F.data.startswith("sbp:banks:"))
+async def handle_sbp_bank_request(callback: CallbackQuery) -> None:
+    """Получить список банков для оплаты через СБП и показать пользователю."""
+
+    parts = (callback.data or "").split(":")
+    os_code = parts[2] if len(parts) > 2 else "android"
+    os_value = _resolve_device_os(os_code)
+    try:
+        response = await get_qr_bank_list(os_value)
+    except (TBankHttpError, TBankApiError) as err:
+        logging.warning("Не удалось получить список банков СБП: %s", err)
+        await callback.answer("Список банков недоступен.", show_alert=True)
+        return
+    banks = _extract_bank_list(response)
+    if not banks:
+        if callback.message:
+            await callback.message.answer(
+                "Не удалось получить список банков СБП. Попробуйте позже.",
+                reply_markup=main_menu_markup(),
+            )
+        await callback.answer("Нет данных о банках.", show_alert=True)
+        return
+    text_lines = [
+        f"🏦 Банки для оплаты через СБП ({os_value}).",
+        "Нажмите на кнопку банка, чтобы открыть приложение и завершить оплату.",
+        SBP_NOTE,
+    ]
+    if callback.message:
+        await _send_sbp_bank_gallery(callback.message, banks)
+        builder = InlineKeyboardBuilder()
+        buttons_added = 0
+        for bank in banks:
+            link = _resolve_bank_link(bank)
+            if not link:
+                continue
+            title = str(bank.get("BankName") or bank.get("Name") or "Банк")
+            builder.button(text=f"🏦 {title[:48]}", url=link)
+            buttons_added += 1
+            if buttons_added >= 12:
+                break
+        if not buttons_added:
+            builder.button(text="🔄 Обновить список", callback_data=f"sbp:banks:{os_code}")
+        builder.button(text="🏠 Главное меню", callback_data="menu:home")
+        builder.adjust(2)
+        await callback.message.answer(
+            "\n".join(text_lines),
+            reply_markup=builder.as_markup(),
+            disable_web_page_preview=True,
+        )
+    await callback.answer("Список банков отправлен.")
 
 
 @router.callback_query(F.data.startswith("payment:check:"))

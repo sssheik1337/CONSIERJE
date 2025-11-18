@@ -717,6 +717,43 @@ async def get_add_card_state(request_key: str) -> Dict[str, Any]:
     )
 
 
+async def get_qr_bank_list(device_os: str = "android") -> Dict[str, Any]:
+    """Получить список банков, поддерживающих оплату через СБП (метод GetQrBankList)."""
+
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
+    normalized = (device_os or "android").strip().lower()
+    os_value = "iOS" if normalized.startswith("ios") else "Android"
+    payload: Dict[str, Any] = {
+        "ScenarioType": "qr",
+        "Device": {
+            "Type": "mobile",
+            "Os": os_value,
+        },
+    }
+    logging.info(
+        "GetQrBankList: base=%s os=%s",
+        base_url,
+        os_value,
+    )
+    return await _post(
+        "GetQrBankList",
+        payload,
+        base_url=base_url,
+        terminal_key=terminal_key,
+        password=password,
+        api_token=api_token,
+    )
+
+
 async def finish_authorize(
     payment_id: str,
     card_data: Dict[str, Any],
@@ -790,6 +827,7 @@ __all__ = [
     "init_add_card",
     "attach_card",
     "get_add_card_state",
+    "get_qr_bank_list",
     "finish_authorize",
     "net_diagnostics",
 ]
