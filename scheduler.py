@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 import json
 import logging
@@ -14,7 +15,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from config import config
 from db import DB
 from payments import SBP_NOTE
-from t_pay import TBankApiError, TBankHttpError, charge_payment
+from t_pay import TBankHttpError, charge_saved_card
 
 DEFAULT_RECURRENT_IP = "127.0.0.1"
 RETRY_PAYMENT_CALLBACK = "payment:retry"
@@ -157,14 +158,18 @@ async def try_auto_renew(
             )
             return False
 
+    user_email = (row_dict.get("email") or "").strip() or None
+
     try:
-        response = await charge_payment(
-            payment_id=parent_payment,
-            rebill_id=rebill_id,
-            customer_key=customer_key,
-            ip=ip or DEFAULT_RECURRENT_IP,
+        response = await asyncio.to_thread(
+            charge_saved_card,
+            parent_payment,
+            rebill_id,
+            ip or DEFAULT_RECURRENT_IP,
+            user_email,
+            False,
         )
-    except (TBankHttpError, TBankApiError) as err:
+    except TBankHttpError as err:
         logging.warning("Автосписание отклонено: user=%s | %s", user_id, err)
         await db.set_auto_renew(user_id, False)
         await db.log_payment_attempt(user_id, "FAILED", str(err), payment_type="card")

@@ -451,6 +451,99 @@ async def charge_payment(
     )
 
 
+def charge_saved_card(
+    payment_id: str,
+    rebill_id: str,
+    ip: str,
+    email: Optional[str] = None,
+    send_email: bool = False,
+) -> Dict[str, Any]:
+    """Выполнить безакцептное списание по сохранённой карте."""
+
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
+    payload: Dict[str, Any] = {
+        "PaymentId": payment_id,
+        "RebillId": rebill_id,
+        "IP": ip,
+    }
+
+    info_email = (email or "").strip() or None
+    if send_email:
+        payload["SendEmail"] = True
+        if info_email:
+            payload["InfoEmail"] = info_email
+        else:
+            logging.warning(
+                "Запрошена отправка чека по email для автосписания, но адрес отсутствует."
+            )
+    elif info_email:
+        payload["InfoEmail"] = info_email
+
+    url = f"{base_url}/Charge"
+    body = payload.copy()
+    body["TerminalKey"] = terminal_key
+    body["Token"] = _generate_token(body, password)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "ConciergeBot/Charge/1.0",
+    }
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+
+    logging.info(
+        "Charge saved card: payment=%s rebill=%s", payment_id, rebill_id
+    )
+
+    try:
+        response = requests.post(url, json=body, headers=headers, timeout=15)
+    except requests.RequestException as err:  # noqa: PERF203
+        logging.error("Charge saved card: ошибка сети %s", err)
+        raise TBankHttpError(f"NETWORK: {err}") from err
+
+    content_type = response.headers.get("Content-Type", "")
+    if response.status_code != 200:
+        preview = response.text[:500]
+        raise TBankHttpError(
+            f"HTTP {response.status_code} {content_type or 'unknown'}: {preview}"
+        )
+    if "application/json" not in content_type.lower():
+        preview = response.text[:500]
+        raise TBankHttpError(
+            f"Unexpected content-type {content_type or 'unknown'}: {preview}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as err:  # noqa: PERF203
+        raise TBankHttpError("Не удалось разобрать JSON-ответ Charge") from err
+
+    if isinstance(data, dict):
+        if not data.get("Success"):
+            logging.warning(
+                "Charge saved card: отклонено %s",
+                json.dumps(data, ensure_ascii=False)[:500],
+            )
+        else:
+            logging.info(
+                "Charge saved card: подтверждено PaymentId=%s статус=%s",
+                data.get("PaymentId"),
+                data.get("Status"),
+            )
+
+    return data
+
+
 async def get_customer(customer_key: str) -> Dict[str, Any]:
     """Получить информацию о клиенте T-Bank по CustomerKey."""
 
@@ -691,6 +784,7 @@ __all__ = [
     "confirm_payment",
     "get_payment_state",
     "charge_payment",
+    "charge_saved_card",
     "get_customer",
     "add_customer",
     "init_add_card",
