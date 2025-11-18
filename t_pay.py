@@ -843,77 +843,108 @@ async def add_account_qr(
     return data_field, request_key, success, error_code, message
 
 
-async def charge_qr_sbp(
-    terminal_key: str,
+async def charge_qr(
     payment_id: str,
     account_token: str,
-    token: str,
     ip: str,
     *,
     send_email: bool = False,
     info_email: Optional[str] = None,
-) -> Tuple[
-    bool,
-    Optional[str],
-    Optional[str],
-    Optional[str],
-    Optional[int],
-    Optional[int],
-    Optional[str],
-    Optional[str],
-    Optional[str],
-]:
-    """Выполнить автосписание по привязанному счёту через СБП."""
+) -> Dict[str, Any]:
+    """Выполнить списание через ChargeQr по ранее привязанному счёту."""
 
-    url = "https://securepay.tinkoff.ru/v2/ChargeQr"
+    if not payment_id or not account_token:
+        raise ValueError("Для ChargeQr необходимы PaymentId и AccountToken")
+
+    base_url, terminal_key, password, *_ = _read_env()
+    url = f"{base_url}/ChargeQr"
+    normalized_email = (info_email or "").strip() or None
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    normalized_email = (info_email or "").strip() or None
-    if send_email and not normalized_email:
-        logger.warning(
-            "Отправка email-чека запрошена, но info_email не указан для ChargeQr"
-        )
     payload: Dict[str, Any] = {
         "TerminalKey": terminal_key,
-        "PaymentId": payment_id,
-        "AccountToken": account_token,
-        "IP": ip,
+        "PaymentId": str(payment_id),
+        "AccountToken": str(account_token),
+        "IP": ip or "",
     }
     if send_email:
         payload["SendEmail"] = True
+        if not normalized_email:
+            logger.warning(
+                "ChargeQr: запрошена отправка email, но InfoEmail не указан"
+            )
     if normalized_email:
         payload["InfoEmail"] = normalized_email
 
-    payload["Token"] = _generate_token(payload, token)
+    payload["Token"] = _generate_token(payload, password)
+    logger.info("ChargeQr: отправка запроса payment_id=%s", payment_id)
+    logger.debug(
+        "ChargeQr payload: %s",
+        json.dumps({k: v for k, v in payload.items() if k != "Token"}, ensure_ascii=False),
+    )
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, headers=headers, timeout=15) as response:
-            response.raise_for_status()
-            data = await response.json()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=20) as response:
+                content_type = response.headers.get("Content-Type", "")
+                text = await response.text()
+                if response.status != 200:
+                    logger.error(
+                        "ChargeQr HTTP %s: %s", response.status, text[:500]
+                    )
+                    raise TBankHttpError(
+                        f"ChargeQr HTTP {response.status}: {text[:200]}"
+                    )
+                if "application/json" not in content_type.lower():
+                    logger.error(
+                        "ChargeQr: неожиданный тип ответа %s", content_type or "unknown"
+                    )
+                    raise TBankHttpError(
+                        f"ChargeQr: неожиданный тип ответа {content_type or 'unknown'}"
+                    )
+                data = json.loads(text)
+    except TBankHttpError:
+        raise
+    except Exception as err:  # noqa: BLE001
+        logger.exception("ChargeQr: ошибка сети", exc_info=err)
+        raise TBankHttpError(str(err)) from err
 
+    logger.debug("ChargeQr response: %s", json.dumps(data, ensure_ascii=False))
     success = bool(data.get("Success"))
-    if not success:
-        logger.error(
-            "ChargeQr SBP error: code=%s message=%s details=%s",
-            data.get("ErrorCode"),
-            data.get("Message"),
-            data.get("Details"),
-        )
     params = data.get("Params") or {}
     status = params.get("Status") or data.get("Status")
-    return (
-        success,
-        str(status) if status is not None else None,
-        params.get("OrderId") or data.get("OrderId"),
-        params.get("PaymentId") or data.get("PaymentId"),
-        params.get("Amount") or data.get("Amount"),
-        params.get("Currency") or data.get("Currency"),
-        str(data.get("ErrorCode")) if data.get("ErrorCode") is not None else None,
-        data.get("Message"),
-        data.get("Details"),
+    if not success:
+        error_code = str(data.get("ErrorCode", ""))
+        message = data.get("Message") or data.get("Details") or "ChargeQr вернул ошибку"
+        message_lower = message.lower()
+        if "не поддерживает" in message_lower or "unsupported" in message_lower:
+            logger.error(
+                "ChargeQr не поддерживается терминалом %s", terminal_key
+            )
+        logger.error(
+            "ChargeQr error: code=%s status=%s message=%s",
+            error_code,
+            status,
+            message,
+        )
+        raise TBankApiError(error_code or "ChargeQr", message)
+
+    logger.info(
+        "ChargeQr: операция подтверждена payment_id=%s status=%s",
+        data.get("PaymentId") or params.get("PaymentId") or payment_id,
+        status or "неизвестно",
     )
+    return {
+        "Success": success,
+        "Status": status,
+        "OrderId": params.get("OrderId") or data.get("OrderId"),
+        "PaymentId": params.get("PaymentId") or data.get("PaymentId") or payment_id,
+        "Amount": params.get("Amount") or data.get("Amount"),
+        "Currency": params.get("Currency") or data.get("Currency"),
+        "Raw": data,
+    }
 
 
 async def get_tinkoff_pay_redirect_url(
@@ -1083,7 +1114,7 @@ __all__ = [
     "get_qr_bank_list",
     "check_tinkoff_pay_availability",
     "add_account_qr",
-    "charge_qr_sbp",
+    "charge_qr",
     "get_tinkoff_pay_redirect_url",
     "get_tinkoff_pay_qr_svg",
     "get_sberpay_qr_svg",
