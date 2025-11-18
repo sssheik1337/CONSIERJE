@@ -166,10 +166,10 @@ async def _post(
         _post_sync,
         endpoint,
         payload,
-        base_url,
-        terminal_key,
-        password,
-        api_token,
+        base_url=base_url,
+        terminal_key=terminal_key,
+        password=password,
+        api_token=api_token,
     )
 
 
