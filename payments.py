@@ -95,6 +95,9 @@ async def create_payment(
     months: int,
     amount: int,
     db: Optional[DB] = None,
+    *,
+    payment_method: str = "card",
+    force_recurrent: Optional[bool] = None,
 ) -> str:
     """Создать платёж через T-Bank и вернуть ссылку на оплату."""
 
@@ -117,6 +120,9 @@ async def create_payment(
     order_id = f"{user_id}_{resolved_months}_{int(time.time())}"
     description = f"Подписка на {resolved_months} мес. (user {user_id})"
 
+    normalized_method = (payment_method or "card").strip().lower()
+    if normalized_method not in {"card", "sbp"}:
+        normalized_method = "card"
     user_row = await db_instance.get_user(user_id)
     auto_recurrent = False
     customer_key_value: Optional[str] = None
@@ -133,7 +139,11 @@ async def create_payment(
         if stored_key:
             customer_key_value = stored_key
 
-    if auto_recurrent and not customer_key_value:
+    effective_recurrent = force_recurrent
+    if effective_recurrent is None:
+        effective_recurrent = normalized_method == "card" and auto_recurrent
+
+    if effective_recurrent and not customer_key_value:
         customer_key_value = str(user_id)
         try:
             await db_instance.set_customer_key(user_id, customer_key_value)
@@ -151,8 +161,8 @@ async def create_payment(
             amount=amount_minor,
             order_id=order_id,
             description=description,
-            customer_key=customer_key_value if auto_recurrent else None,
-            recurrent="Y" if auto_recurrent else None,
+            customer_key=customer_key_value if effective_recurrent else None,
+            recurrent="Y" if effective_recurrent else None,
             success_url=config.T_PAY_SUCCESS_URL or None,
             fail_url=config.T_PAY_FAIL_URL or None,
             notification_url=config.TINKOFF_NOTIFY_URL or None,
@@ -187,7 +197,7 @@ async def create_payment(
         order_id=order_id,
         amount=amount_minor,
         months=resolved_months,
-        method="card",
+        method=normalized_method,
     )
     return str(payment_url)
 

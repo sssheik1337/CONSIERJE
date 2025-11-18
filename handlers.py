@@ -70,6 +70,23 @@ def _row_to_dict(row: aiosqlite.Row | None) -> dict[str, object]:
     return dict(row)
 
 
+def _normalize_payment_method(raw: str | None) -> str:
+    """Нормализовать способ оплаты для внутренних колбэков."""
+
+    if not raw:
+        return "card"
+    lowered = raw.strip().lower()
+    if lowered == "sbp":
+        return "sbp"
+    return "card"
+
+
+def _format_method_hint(method: str) -> str:
+    """Вернуть описание способа оплаты для текстов пользователю."""
+
+    return "картой" if method == "card" else "через СБП"
+
+
 async def _ensure_subscription_state(
     bot: Bot | None,
     db: DB,
@@ -469,10 +486,8 @@ def build_user_menu_keyboard(
             text=f"💳 Купить {months} мес",
             callback_data=f"buy:months:{months}",
         )
-    builder.button(
-        text="💳 Оплатить подписку",
-        callback_data="buy:open",
-    )
+    builder.button(text="💳 Оплатить картой", callback_data="buy:open:card")
+    builder.button(text="📲 Оплатить через СБП", callback_data="buy:open:sbp")
     builder.button(
         text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
         callback_data="ar:toggle",
@@ -490,7 +505,8 @@ def build_subscription_purchase_menu() -> InlineKeyboardMarkup:
     """Построить меню для пользователя без активной подписки."""
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="Оформить подписку", callback_data="buy:open")
+    builder.button(text="💳 Оплатить картой", callback_data="buy:open:card")
+    builder.button(text="📲 Оплатить через СБП", callback_data="buy:open:sbp")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -1193,10 +1209,12 @@ async def docs_back(callback: CallbackQuery, db: DB) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == "buy:open")
+@router.callback_query(F.data.startswith("buy:open"))
 async def handle_buy_open(callback: CallbackQuery, db: DB) -> None:
     """Показать пользователю список тарифов для оплаты."""
 
+    parts = (callback.data or "").split(":")
+    method = _normalize_payment_method(parts[2] if len(parts) > 2 else None)
     prices = await db.get_all_prices()
     if not prices:
         await callback.answer("Тарифы пока не настроены.", show_alert=True)
@@ -1205,13 +1223,14 @@ async def handle_buy_open(callback: CallbackQuery, db: DB) -> None:
     for months, price in prices[:6]:
         builder.button(
             text=f"{months} мес — {price}₽",
-            callback_data=f"buy:months:{months}",
+            callback_data=f"buy:method:{method}:{months}",
         )
     builder.button(text="❌ Отмена", callback_data="buy:cancel")
     builder.adjust(1)
     if callback.message:
+        method_hint = _format_method_hint(method)
         await callback.message.answer(
-            "Выберите срок подписки для оплаты:",
+            f"Выберите срок подписки для оплаты {method_hint}:",
             reply_markup=builder.as_markup(),
         )
     await callback.answer()
@@ -1230,24 +1249,39 @@ async def handle_buy_cancel(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("buy:months:"))
-async def handle_buy(callback: CallbackQuery, db: DB) -> None:
-    """Обработка покупки подписки."""
+async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
+    """Общая логика создания платежей по выбранному тарифу."""
 
     user_id = callback.from_user.id
     parts = (callback.data or "").split(":")
+    method = "card"
+    months_value = None
+    if len(parts) >= 4 and parts[1] == "method":
+        method = _normalize_payment_method(parts[2])
+        months_value = parts[3]
+    elif len(parts) >= 3:
+        months_value = parts[2]
     try:
-        months = int(parts[2])
-    except (IndexError, ValueError):
+        months = int(months_value) if months_value is not None else 0
+    except (TypeError, ValueError):
+        months = 0
+    if months <= 0:
         await callback.answer("Не удалось определить срок подписки.", show_alert=True)
         return
+    method_hint = _format_method_hint(method)
     prices = await db.get_prices_dict()
     price = prices.get(months)
     if price is None:
         await callback.answer("Тариф не найден.", show_alert=True)
         return
     try:
-        payment_url = await create_payment(user_id, price, months)
+        payment_url = await create_payment(
+            user_id,
+            months,
+            price,
+            payment_method=method,
+            force_recurrent=(method == "card"),
+        )
     except Exception as err:  # noqa: BLE001
         logging.exception("Не удалось создать платёж", exc_info=err)
         await callback.answer("Не удалось создать платёж. Попробуйте позже.", show_alert=True)
@@ -1262,8 +1296,9 @@ async def handle_buy(callback: CallbackQuery, db: DB) -> None:
     builder.button(text="🏠 Главное меню", callback_data="menu:home")
     builder.adjust(1)
     if callback.message:
+        prefix = "💳" if method == "card" else "📲"
         text_lines = [
-            f"💳 Оплата подписки на {months} мес.",
+            f"{prefix} Оплата подписки на {months} мес. ({method_hint}).",
             f"Сумма к оплате: {price}₽.",
             "Нажмите кнопку ниже, чтобы перейти к платёжной странице.",
         ]
@@ -1273,6 +1308,20 @@ async def handle_buy(callback: CallbackQuery, db: DB) -> None:
             disable_web_page_preview=True,
         )
     await callback.answer("Ссылка на оплату готова.")
+
+
+@router.callback_query(F.data.startswith("buy:months:"))
+async def handle_buy(callback: CallbackQuery, db: DB) -> None:
+    """Совместимость со старыми кнопками покупки."""
+
+    await _handle_buy_callback(callback, db)
+
+
+@router.callback_query(F.data.startswith("buy:method:"))
+async def handle_buy_with_method(callback: CallbackQuery, db: DB) -> None:
+    """Создание оплаты с указанием конкретного способа."""
+
+    await _handle_buy_callback(callback, db)
 
 
 @router.callback_query(F.data.startswith("payment:check:"))
@@ -1581,7 +1630,8 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     if not has_active_subscription and not has_active_trial:
         if callback.message:
             builder = InlineKeyboardBuilder()
-            builder.button(text="💳 Купить доступ", callback_data="buy:open")
+            builder.button(text="💳 Оплатить картой", callback_data="buy:open:card")
+            builder.button(text="📲 Оплатить через СБП", callback_data="buy:open:sbp")
             builder.button(text="🎟 Ввести промокод", callback_data="promo:enter")
             builder.button(text="🏠 Главное меню", callback_data="menu:home")
             builder.adjust(1)
