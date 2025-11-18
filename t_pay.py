@@ -754,6 +754,57 @@ async def get_qr_bank_list(device_os: str = "android") -> Dict[str, Any]:
     )
 
 
+async def check_tinkoff_pay_availability(terminal_key: str) -> Tuple[bool, str]:
+    """Проверить доступность Tinkoff Pay для заданного терминала."""
+
+    url = (
+        "https://securepay.tinkoff.ru/v2/TinkoffPay/terminals/"
+        f"{terminal_key}/status"
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=10) as response:
+            response.raise_for_status()
+            data = await response.json()
+    if not data.get("Success", True):
+        print(f"Tinkoff Pay availability error: {data}")
+    params = data.get("Params") or {}
+    allowed = bool(params.get("Allowed"))
+    version = params.get("Version") or ""
+    return allowed, str(version)
+
+
+async def get_tinkoff_pay_redirect_url(
+    payment_id: int, version: str
+) -> Tuple[str, str]:
+    """Получить RedirectUrl/WebQR для оплаты через Tinkoff Pay."""
+
+    url = (
+        "https://securepay.tinkoff.ru/v2/TinkoffPay/transactions/"
+        f"{payment_id}/versions/{version}/link"
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=10) as response:
+            response.raise_for_status()
+            data = await response.json()
+    if not data.get("Success", True):
+        print(f"Tinkoff Pay link error: {data}")
+    params = data.get("Params") or {}
+    redirect_url = params.get("RedirectUrl") or ""
+    web_qr = params.get("WebQR") or ""
+    return str(redirect_url), str(web_qr)
+
+
+async def get_tinkoff_pay_qr_svg(payment_id: int) -> str:
+    """Получить SVG‑код QR для оплаты через Tinkoff Pay на десктопе."""
+
+    url = f"https://securepay.tinkoff.ru/v2/TinkoffPay/{payment_id}/QR"
+    headers = {"Accept": "image/svg"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, timeout=10) as response:
+            response.raise_for_status()
+            return await response.text()
+
+
 async def finish_authorize(
     payment_id: str,
     card_data: Dict[str, Any],
@@ -828,6 +879,9 @@ __all__ = [
     "attach_card",
     "get_add_card_state",
     "get_qr_bank_list",
+    "check_tinkoff_pay_availability",
+    "get_tinkoff_pay_redirect_url",
+    "get_tinkoff_pay_qr_svg",
     "finish_authorize",
     "net_diagnostics",
 ]
