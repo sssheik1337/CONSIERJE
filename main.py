@@ -177,9 +177,17 @@ async def tbank_notify(request: web.Request) -> web.Response:
             processed = applied
             if applied:
                 payment_row = await db.get_payment_by_payment_id(target_payment_id)
+                stored_method = ""
+                user_id = 0
+                months = 0
                 if payment_row:
                     user_id = int(payment_row["user_id"] or 0)
                     months = int(payment_row["months"] or 0)
+                    try:
+                        stored_method = str(payment_row["method"] or "").strip().lower()
+                    except (KeyError, TypeError, ValueError):
+                        stored_method = ""
+
                     if user_id > 0 and months > 0 and not was_confirmed:
                         await _notify_user_payment_confirmed(bot, db, user_id, months)
                     if user_id > 0:
@@ -193,7 +201,8 @@ async def tbank_notify(request: web.Request) -> web.Response:
                                 target_payment_id,
                                 err,
                             )
-                        if payment_type == "sbp":
+                        is_sbp = payment_type == "sbp" or stored_method == "sbp"
+                        if is_sbp:
                             await payments.disable_auto_renew_for_sbp(
                                 db,
                                 user_id,

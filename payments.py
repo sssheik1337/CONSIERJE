@@ -259,6 +259,18 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
     if status:
         await db_instance.set_payment_status(payment_id, status)
     if status == "CONFIRMED":
+        payment_row = await db_instance.get_payment_by_payment_id(payment_id)
+        stored_method = ""
+        user_id = 0
+        if payment_row is not None:
+            try:
+                stored_method = str(payment_row["method"] or "").strip().lower()
+            except (KeyError, TypeError, ValueError):
+                stored_method = ""
+            try:
+                user_id = int(payment_row["user_id"] or 0)
+            except (KeyError, TypeError, ValueError):
+                user_id = 0
         payment_type = detect_payment_type(response)
         try:
             await db_instance.set_payment_method(payment_id, payment_type)
@@ -269,20 +281,13 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
                 payment_id,
                 err,
             )
-        if payment_type == "sbp":
-            payment_row = await db_instance.get_payment_by_payment_id(payment_id)
-            user_id = 0
-            if payment_row is not None:
-                try:
-                    user_id = int(payment_row["user_id"] or 0)
-                except (KeyError, TypeError, ValueError):
-                    user_id = 0
-            if user_id > 0:
-                await disable_auto_renew_for_sbp(
-                    db_instance,
-                    user_id,
-                    note="Оплата через СБП подтверждена вручную, автопродление отключено.",
-                )
+        is_sbp = payment_type == "sbp" or stored_method == "sbp"
+        if is_sbp and user_id > 0:
+            await disable_auto_renew_for_sbp(
+                db_instance,
+                user_id,
+                note="Оплата через СБП подтверждена вручную, автопродление отключено.",
+            )
     return status == "CONFIRMED"
 
 
