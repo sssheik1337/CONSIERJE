@@ -7,7 +7,14 @@ from typing import Any, Optional
 
 from config import config
 from db import DB
-from t_pay import TBankApiError, TBankHttpError, get_payment_state, init_payment
+from t_pay import (
+    TBankApiError,
+    TBankHttpError,
+    add_customer,
+    get_customer,
+    get_payment_state,
+    init_payment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,66 @@ def _get_db() -> DB:
     if _payment_db is not None:
         return _payment_db
     return DB(config.DB_PATH)
+
+
+def _extract_row_text(row: Mapping[str, Any] | None, key: str) -> Optional[str]:
+    """Безопасно получить строковое значение из строки БД."""
+
+    if row is None:
+        return None
+    try:
+        value = row[key]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+async def _ensure_customer_registered(
+    db: DB,
+    user_id: int,
+    customer_key: str,
+    *,
+    user_row: Mapping[str, Any] | None = None,
+) -> None:
+    """Проверить наличие клиента в T-Bank и зарегистрировать при необходимости."""
+
+    if user_id <= 0 or not customer_key:
+        return
+    try:
+        already_marked = await db.is_customer_registered(user_id)
+    except AttributeError:
+        already_marked = False
+    if already_marked:
+        return
+
+    # Сначала пытаемся получить клиента — если существует, просто запоминаем флаг.
+    try:
+        await get_customer(customer_key)
+    except TBankApiError as err:
+        logger.info(
+            "Клиент %s отсутствует в T-Bank, требуется регистрация: %s",
+            customer_key,
+            err,
+        )
+    else:
+        await db.set_customer_registered(user_id, True)
+        return
+
+    email = _extract_row_text(user_row, "email")
+    phone = _extract_row_text(user_row, "phone")
+    try:
+        await add_customer(customer_key, email=email, phone=phone)
+    except (TBankHttpError, TBankApiError) as err:
+        logger.error(
+            "Не удалось зарегистрировать клиента %s в T-Bank: %s",
+            customer_key,
+            err,
+        )
+        raise
+    await db.set_customer_registered(user_id, True)
 
 
 def _value_contains_sbp(value: Any) -> bool:
@@ -159,6 +226,13 @@ async def create_payment(
             await db_instance.set_customer_key(user_id, customer_key_value)
         except Exception:  # noqa: BLE001
             logger.debug("Не удалось сохранить CustomerKey для пользователя %s", user_id)
+    if effective_recurrent and customer_key_value:
+        await _ensure_customer_registered(
+            db_instance,
+            user_id,
+            customer_key_value,
+            user_row=user_row,
+        )
 
     # Если БД не передали явно, предполагаем, что сумма указана в рублях и переводим в копейки
     if explicit_db:

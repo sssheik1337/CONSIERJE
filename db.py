@@ -109,6 +109,7 @@ COUPON_CODE_PATTERN = re.compile(r"^[A-Z0-9\-]{4,32}$")
 class DB:
     def __init__(self, path: str):
         self.path = path
+        self._customer_key_prefix = "customer_registered:"
 
     @staticmethod
     def _normalize_code(raw: str) -> str:
@@ -587,6 +588,24 @@ class DB:
         if row is None:
             return None
         return row["value"]
+
+    async def set_customer_registered(self, user_id: int, flag: bool) -> None:
+        """Зафиксировать информацию о регистрации клиента в T-Bank."""
+
+        key = f"{self._customer_key_prefix}{user_id}"
+        if flag:
+            await self.set_setting(key, "1")
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM settings WHERE key=?", (key,))
+            await db.commit()
+
+    async def is_customer_registered(self, user_id: int) -> bool:
+        """Проверить, регистрировали ли клиента через AddCustomer."""
+
+        key = f"{self._customer_key_prefix}{user_id}"
+        value = await self.get_setting(key)
+        return value == "1"
 
     async def set_target_chat_username(self, name: str) -> None:
         await self.set_setting("target_chat_username", name)

@@ -426,6 +426,72 @@ async def charge_payment(
     )
 
 
+async def get_customer(customer_key: str) -> Dict[str, Any]:
+    """Получить информацию о клиенте T-Bank по CustomerKey."""
+
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
+    payload: Dict[str, Any] = {
+        "CustomerKey": customer_key,
+    }
+
+    return await _post(
+        "GetCustomer",
+        payload,
+        base_url=base_url,
+        terminal_key=terminal_key,
+        password=password,
+        api_token=api_token,
+    )
+
+
+async def add_customer(
+    customer_key: str,
+    *,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+    ip: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Зарегистрировать клиента перед использованием рекуррентных платежей."""
+
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
+    payload: Dict[str, Any] = {
+        "CustomerKey": customer_key,
+    }
+    if email:
+        payload["Email"] = email
+    if phone:
+        payload["Phone"] = phone
+    if ip:
+        payload["IP"] = ip
+
+    return await _post(
+        "AddCustomer",
+        payload,
+        base_url=base_url,
+        terminal_key=terminal_key,
+        password=password,
+        api_token=api_token,
+    )
+
+
 async def add_card(
     customer_key: str,
     *,
@@ -555,6 +621,8 @@ __all__ = [
     "confirm_payment",
     "get_payment_state",
     "charge_payment",
+    "get_customer",
+    "add_customer",
     "add_card",
     "get_add_card_state",
     "finish_authorize",
