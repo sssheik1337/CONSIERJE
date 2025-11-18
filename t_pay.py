@@ -843,6 +843,79 @@ async def add_account_qr(
     return data_field, request_key, success, error_code, message
 
 
+async def charge_qr_sbp(
+    terminal_key: str,
+    payment_id: str,
+    account_token: str,
+    token: str,
+    ip: str,
+    *,
+    send_email: bool = False,
+    info_email: Optional[str] = None,
+) -> Tuple[
+    bool,
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[int],
+    Optional[int],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
+    """Выполнить автосписание по привязанному счёту через СБП."""
+
+    url = "https://securepay.tinkoff.ru/v2/ChargeQr"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    normalized_email = (info_email or "").strip() or None
+    if send_email and not normalized_email:
+        logging.warning(
+            "Отправка email-чека запрошена, но info_email не указан для ChargeQr"
+        )
+    payload: Dict[str, Any] = {
+        "TerminalKey": terminal_key,
+        "PaymentId": payment_id,
+        "AccountToken": account_token,
+        "IP": ip,
+    }
+    if send_email:
+        payload["SendEmail"] = True
+    if normalized_email:
+        payload["InfoEmail"] = normalized_email
+
+    payload["Token"] = _generate_token(payload, token)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, headers=headers, timeout=15) as response:
+            response.raise_for_status()
+            data = await response.json()
+
+    success = bool(data.get("Success"))
+    if not success:
+        logging.error(
+            "ChargeQr SBP error: code=%s message=%s details=%s",
+            data.get("ErrorCode"),
+            data.get("Message"),
+            data.get("Details"),
+        )
+    params = data.get("Params") or {}
+    status = params.get("Status") or data.get("Status")
+    return (
+        success,
+        str(status) if status is not None else None,
+        params.get("OrderId") or data.get("OrderId"),
+        params.get("PaymentId") or data.get("PaymentId"),
+        params.get("Amount") or data.get("Amount"),
+        params.get("Currency") or data.get("Currency"),
+        str(data.get("ErrorCode")) if data.get("ErrorCode") is not None else None,
+        data.get("Message"),
+        data.get("Details"),
+    )
+
+
 async def get_tinkoff_pay_redirect_url(
     payment_id: int, version: str
 ) -> Tuple[str, str]:
@@ -1010,6 +1083,7 @@ __all__ = [
     "get_qr_bank_list",
     "check_tinkoff_pay_availability",
     "add_account_qr",
+    "charge_qr_sbp",
     "get_tinkoff_pay_redirect_url",
     "get_tinkoff_pay_qr_svg",
     "get_sberpay_qr_svg",
