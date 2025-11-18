@@ -46,7 +46,9 @@ def compute_token(payload: dict, password: str) -> str:
     return hashlib.sha256(concatenated.encode("utf-8")).hexdigest()
 
 
-async def _notify_user_payment_confirmed(bot: Bot, db: DB, user_id: int, months: int) -> None:
+async def _notify_user_payment_confirmed(
+    bot: Bot, db: DB, user_id: int, months: int, sbp_hint: bool = False
+) -> None:
     """Отправить пользователю уведомление о продлении подписки."""
 
     try:
@@ -82,6 +84,8 @@ async def _notify_user_payment_confirmed(bot: Bot, db: DB, user_id: int, months:
     ]
     if expiry_text:
         message_parts.append(f"Новая дата окончания: {expiry_text}.")
+    if sbp_hint:
+        message_parts.append(f"⚠️ {payments.SBP_NOTE}")
 
     try:
         await bot.send_message(user_id, " ".join(message_parts))
@@ -188,10 +192,14 @@ async def tbank_notify(request: web.Request) -> web.Response:
                     except (KeyError, TypeError, ValueError):
                         stored_method = ""
 
+                    payment_type = payments.detect_payment_type(data)
+                    is_sbp = payment_type == "sbp" or stored_method == "sbp"
+
                     if user_id > 0 and months > 0 and not was_confirmed:
-                        await _notify_user_payment_confirmed(bot, db, user_id, months)
+                        await _notify_user_payment_confirmed(
+                            bot, db, user_id, months, sbp_hint=is_sbp
+                        )
                     if user_id > 0:
-                        payment_type = payments.detect_payment_type(data)
                         try:
                             await db.set_payment_method(target_payment_id, payment_type)
                         except Exception as err:  # noqa: BLE001
@@ -201,7 +209,6 @@ async def tbank_notify(request: web.Request) -> web.Response:
                                 target_payment_id,
                                 err,
                             )
-                        is_sbp = payment_type == "sbp" or stored_method == "sbp"
                         if is_sbp:
                             await payments.disable_auto_renew_for_sbp(
                                 db,

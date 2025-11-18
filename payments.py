@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 _payment_db: Optional[DB] = None
 
+SBP_NOTE = "Оплата через СБП не продлевается автоматически."
+
 
 def set_db(database: DB) -> None:
     """Задать экземпляр базы данных для работы с платежами."""
@@ -123,6 +125,14 @@ async def create_payment(
     normalized_method = (payment_method or "card").strip().lower()
     if normalized_method not in {"card", "sbp"}:
         normalized_method = "card"
+    if normalized_method == "sbp":
+        try:
+            await db_instance.set_auto_renew(user_id, False)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "Не удалось сразу отключить автопродление перед оплатой через СБП для %s",
+                user_id,
+            )
     user_row = await db_instance.get_user(user_id)
     auto_recurrent = False
     customer_key_value: Optional[str] = None
@@ -324,6 +334,7 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
 
 
 __all__ = [
+    "SBP_NOTE",
     "apply_successful_payment",
     "check_payment_status",
     "create_payment",

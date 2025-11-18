@@ -25,7 +25,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import config, get_docs_map
 from db import DB
-from payments import check_payment_status, create_payment
+from payments import SBP_NOTE, check_payment_status, create_payment
 from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
 from t_pay import TBankApiError, TBankHttpError, add_card, get_add_card_state
 
@@ -1229,8 +1229,11 @@ async def handle_buy_open(callback: CallbackQuery, db: DB) -> None:
     builder.adjust(1)
     if callback.message:
         method_hint = _format_method_hint(method)
+        message_text = f"Выберите срок подписки для оплаты {method_hint}:"
+        if method == "sbp":
+            message_text = f"{message_text}\n\n{SBP_NOTE}"
         await callback.message.answer(
-            f"Выберите срок подписки для оплаты {method_hint}:",
+            message_text,
             reply_markup=builder.as_markup(),
         )
     await callback.answer()
@@ -1302,6 +1305,8 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
             f"Сумма к оплате: {price}₽.",
             "Нажмите кнопку ниже, чтобы перейти к платёжной странице.",
         ]
+        if method == "sbp":
+            text_lines.append(SBP_NOTE)
         await callback.message.answer(
             "\n".join(text_lines),
             reply_markup=builder.as_markup(),
@@ -1341,6 +1346,12 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
         return
 
     try:
+        payment_method = str(payment["method"] or "")
+    except (KeyError, TypeError, ValueError):
+        payment_method = ""
+    is_sbp_payment = payment_method.strip().lower() == "sbp"
+
+    try:
         confirmed = await check_payment_status(payment_id)
     except RuntimeError as err:
         await callback.answer(str(err), show_alert=True)
@@ -1367,6 +1378,8 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
             )
         else:
             display_text = "✅ Оплата подтверждена и подписка продлена."
+        if is_sbp_payment:
+            display_text = f"{display_text}\n\n{SBP_NOTE}"
         await callback.message.answer(
             escape_md(display_text),
             reply_markup=main_menu_markup(),

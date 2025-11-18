@@ -13,6 +13,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import config
 from db import DB
+from payments import SBP_NOTE
 from t_pay import TBankApiError, TBankHttpError, charge_payment
 
 DEFAULT_RECURRENT_IP = "127.0.0.1"
@@ -49,6 +50,24 @@ def _next_month_date(now_ts: int) -> int:
 
     future = datetime.utcfromtimestamp(now_ts) + timedelta(days=30)
     return int(future.timestamp())
+
+
+async def _was_last_payment_sbp(db: DB, user_id: int) -> bool:
+    """Понять, пользовался ли пользователь оплатой через СБП."""
+
+    if user_id <= 0:
+        return False
+    try:
+        payment = await db.get_latest_payment(user_id)
+    except Exception:  # noqa: BLE001
+        return False
+    if not payment:
+        return False
+    try:
+        method = str(payment["method"] or "").strip().lower()
+    except (KeyError, TypeError, ValueError):
+        return False
+    return method == "sbp"
 
 
 async def try_auto_renew(
@@ -250,15 +269,20 @@ async def daily_check(bot: Bot, db: DB):
             auto_fail_count += 1
 
         row_dict = dict(row)
-        if bool(row_dict.get("auto_renew")):
+        auto_flag = bool(row_dict.get("auto_renew"))
+        if auto_flag:
             await db.set_auto_renew(user_id, False)
+
+        sbp_recent = False
+        if not renew_result.attempted and not auto_flag:
+            sbp_recent = await _was_last_payment_sbp(db, user_id)
 
         try:
             await db.log_payment_attempt(
                 user_id,
                 "EXPIRED",
                 "Подписка неактивна, пользователь будет удалён",
-                payment_type="card",
+                payment_type="sbp" if sbp_recent else "card",
             )
         except Exception:
             logging.debug("Не удалось записать лог об удалении пользователя %s", user_id)
@@ -276,11 +300,13 @@ async def daily_check(bot: Bot, db: DB):
             if renew_result.user_notified:
                 notify_text = None
         else:
-            if bool(row_dict.get("auto_renew")):
+            if auto_flag:
                 notify_text = FAILURE_MESSAGE
                 notify_markup = _retry_markup()
             else:
                 notify_text = EXPIRED_MESSAGE
+                if sbp_recent:
+                    notify_text = f"{notify_text}\n\n{SBP_NOTE}"
         if notify_text:
             try:
                 await bot.send_message(
