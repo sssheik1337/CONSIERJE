@@ -41,10 +41,32 @@ def _extract_row_text(row: Mapping[str, Any] | None, key: str) -> Optional[str]:
 
     if row is None:
         return None
-    try:
-        value = row[key]
-    except (KeyError, TypeError, ValueError):
-        return None
+    getter = getattr(row, "get", None)
+    if callable(getter):
+        try:
+            value = getter(key)
+        except Exception:  # noqa: BLE001
+            value = None
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    mapping: Mapping[str, Any]
+    if isinstance(row, Mapping):
+        mapping = row
+    elif hasattr(row, "keys"):
+        try:
+            mapping = {column: row[column] for column in row.keys()}
+        except Exception:  # noqa: BLE001
+            mapping = {}
+    else:
+        try:
+            mapping = dict(row)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001
+            mapping = {}
+
+    value = mapping.get(key)
     if value is None:
         return None
     text = str(value).strip()

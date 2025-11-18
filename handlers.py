@@ -39,6 +39,8 @@ from t_pay import (
 
 router = Router()
 
+ADMIN_IDS = set(config.SUPER_ADMIN_IDS)
+
 DEFAULT_TRIAL_DAYS = 3
 DEFAULT_AUTO_RENEW = True
 COUPON_KIND_TRIAL = "trial"
@@ -321,7 +323,7 @@ def format_short_date(ts: int) -> str:
 def is_super_admin(user_id: int) -> bool:
     """Проверить, является ли пользователь суперадмином."""
 
-    return user_id in config.SUPER_ADMIN_IDS
+    return user_id in ADMIN_IDS
 
 
 def inline_emoji(flag: bool) -> str:
@@ -772,6 +774,18 @@ async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     return text, builder.as_markup()
 
 
+async def show_admin_panel(message: Message, db: DB) -> None:
+    """Показать суперадмину актуальную админ-панель."""
+
+    text, markup = await build_admin_panel(db)
+    await message.answer(
+        text,
+        reply_markup=markup,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+
+
 async def render_admin_panel(message: Message, db: DB) -> None:
     """Отобразить или обновить админ-панель в заданном сообщении."""
 
@@ -1058,6 +1072,9 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
 
     await state.clear()
     user_id = message.from_user.id
+    if user_id in ADMIN_IDS:
+        await show_admin_panel(message, db)
+        return
     now_ts = int(datetime.utcnow().timestamp())
     auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
     trial_days = await db.get_trial_days_global(DEFAULT_TRIAL_DAYS)
