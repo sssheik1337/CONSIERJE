@@ -19,12 +19,16 @@ DEFAULT_RECURRENT_IP = "127.0.0.1"
 RETRY_PAYMENT_CALLBACK = "payment:retry"
 
 
+FAILURE_MESSAGE = "Не удалось продлить подписку. 🔄 Повторить платёж"
+
+
 class AutoRenewResult(NamedTuple):
     """Результат попытки автопродления."""
 
     success: bool
     attempted: bool
     amount: int
+    user_notified: bool = False
 
 def _retry_markup() -> InlineKeyboardMarkup:
     """Построить клавиатуру для повторного списания."""
@@ -118,6 +122,21 @@ async def try_auto_renew(
     if now_ts is None:
         now_ts = int(datetime.utcnow().timestamp())
 
+    async def _notify_failure() -> bool:
+        try:
+            await bot.send_message(
+                user_id,
+                FAILURE_MESSAGE,
+                reply_markup=_retry_markup(),
+            )
+            return True
+        except Exception:
+            logging.debug(
+                "Не удалось уведомить пользователя %s об ошибке автосписания",
+                user_id,
+            )
+            return False
+
     try:
         response = await charge_payment(
             payment_id=parent_payment,
@@ -129,28 +148,14 @@ async def try_auto_renew(
         logging.warning("Автосписание отклонено: user=%s | %s", user_id, err)
         await db.set_auto_renew(user_id, False)
         await db.log_payment_attempt(user_id, "FAILED", str(err), payment_type="card")
-        try:
-            await bot.send_message(
-                user_id,
-                "⚠️ Не удалось продлить подписку. Проверьте данные карты или оплатите вручную.",
-                reply_markup=_retry_markup(),
-            )
-        except Exception:
-            logging.debug("Не удалось уведомить пользователя %s об ошибке автосписания", user_id)
-        return AutoRenewResult(False, True, 0)
+        notified = await _notify_failure()
+        return AutoRenewResult(False, True, 0, notified)
     except Exception as err:  # noqa: BLE001
         logging.exception("Неожиданная ошибка автосписания для пользователя %s", user_id, exc_info=err)
         await db.set_auto_renew(user_id, False)
         await db.log_payment_attempt(user_id, "ERROR", str(err), payment_type="card")
-        try:
-            await bot.send_message(
-                user_id,
-                "⚠️ Не удалось продлить подписку. Проверьте данные карты или оплатите вручную.",
-                reply_markup=_retry_markup(),
-            )
-        except Exception:
-            logging.debug("Не удалось уведомить пользователя %s об исключении автосписания", user_id)
-        return AutoRenewResult(False, True, 0)
+        notified = await _notify_failure()
+        return AutoRenewResult(False, True, 0, notified)
 
     status = (response.get("Status") or "").upper()
     success_flag = bool(response.get("Success"))
@@ -159,15 +164,8 @@ async def try_auto_renew(
         logging.warning("Автосписание неуспешно: user=%s | %s", user_id, info)
         await db.set_auto_renew(user_id, False)
         await db.log_payment_attempt(user_id, "FAILED", info, payment_type="card")
-        try:
-            await bot.send_message(
-                user_id,
-                "⚠️ Не удалось продлить подписку. Проверьте данные карты или оплатите вручную.",
-                reply_markup=_retry_markup(),
-            )
-        except Exception:
-            logging.debug("Не удалось уведомить пользователя %s о провале автосписания", user_id)
-        return AutoRenewResult(False, True, 0)
+        notified = await _notify_failure()
+        return AutoRenewResult(False, True, 0, notified)
 
     new_parent_payment = response.get("PaymentId") or parent_payment
     new_payment_id_str = str(new_parent_payment).strip() if new_parent_payment else ""
@@ -180,6 +178,7 @@ async def try_auto_renew(
     if not extended_until:
         extended_until = _next_month_date(now_ts)
 
+    effective_payment_id = new_payment_id_str or parent_payment
     if new_payment_id_str and new_payment_id_str != parent_payment:
         order_id = f"auto_{user_id}_{now_ts}"
         try:
@@ -194,6 +193,10 @@ async def try_auto_renew(
             )
         except Exception as err:  # noqa: BLE001
             logging.debug("Не удалось сохранить запись об автосписании: %s", err)
+        effective_payment_id = new_payment_id_str
+
+    if effective_payment_id:
+        await db.set_payment_status(effective_payment_id, "CONFIRMED")
 
     await db.log_payment_attempt(
         user_id,
@@ -202,16 +205,18 @@ async def try_auto_renew(
         payment_type="card",
     )
 
+    success_notified = False
     try:
         await bot.send_message(
             user_id,
             f"✅ Подписка успешно продлена до {_format_date(extended_until)}",
         )
+        success_notified = True
     except Exception:
         logging.debug("Не удалось отправить сообщение об успешном продлении пользователю %s", user_id)
 
     logging.info("Автопродление успешно: user=%s до %s", user_id, extended_until)
-    return AutoRenewResult(True, True, max(0, parent_amount))
+    return AutoRenewResult(True, True, max(0, parent_amount), success_notified)
 
 
 async def daily_check(bot: Bot, db: DB):
@@ -255,13 +260,27 @@ async def daily_check(bot: Bot, db: DB):
             await bot.unban_chat_member(target_chat_id, user_id)
         except Exception:
             logging.debug("Не удалось удалить пользователя %s из канала", user_id)
-        try:
-            await bot.send_message(
-                user_id,
-                "🔴 Подписка неактивна. Для доступа оформите её заново.",
-            )
-        except Exception:
-            logging.debug("Не удалось уведомить пользователя %s об окончании подписки", user_id)
+        notify_text = None
+        notify_markup = None
+        if renew_result.attempted:
+            notify_text = FAILURE_MESSAGE
+            notify_markup = _retry_markup()
+            if renew_result.user_notified:
+                notify_text = None
+        else:
+            notify_text = "🔴 Подписка неактивна. Для доступа оформите её заново."
+        if notify_text:
+            try:
+                await bot.send_message(
+                    user_id,
+                    notify_text,
+                    reply_markup=notify_markup,
+                )
+            except Exception:
+                logging.debug(
+                    "Не удалось уведомить пользователя %s об окончании подписки",
+                    user_id,
+                )
 
     if auto_success_count or auto_fail_count:
         summary_lines = [
