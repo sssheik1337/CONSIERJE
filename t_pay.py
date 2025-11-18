@@ -805,6 +805,32 @@ async def get_tinkoff_pay_qr_svg(payment_id: int) -> str:
             return await response.text()
 
 
+async def get_sberpay_qr_svg(payment_id: int) -> str:
+    """Получить SVG‑код QR для оплаты через SberPay на десктопе."""
+
+    url = f"https://securepay.tinkoff.ru/v2/SberPay/{payment_id}/QR"
+    headers = {"Accept": "image/svg"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, timeout=10) as response:
+            response.raise_for_status()
+            return await response.text()
+
+
+async def get_sberpay_redirect_url(payment_id: int) -> str:
+    """Получить RedirectUrl для оплаты через SberPay."""
+
+    url = f"https://securepay.tinkoff.ru/v2/SberPay/transactions/{payment_id}/link"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=10) as response:
+            response.raise_for_status()
+            data = await response.json()
+    if not data.get("Success", True):
+        print(f"SberPay link error: {data}")
+    params = data.get("Params") or {}
+    redirect_url = params.get("RedirectUrl") or ""
+    return str(redirect_url)
+
+
 async def finish_authorize(
     payment_id: str,
     card_data: Dict[str, Any],
@@ -882,6 +908,8 @@ __all__ = [
     "check_tinkoff_pay_availability",
     "get_tinkoff_pay_redirect_url",
     "get_tinkoff_pay_qr_svg",
+    "get_sberpay_qr_svg",
+    "get_sberpay_redirect_url",
     "finish_authorize",
     "net_diagnostics",
 ]
