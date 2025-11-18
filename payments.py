@@ -288,6 +288,38 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
                 user_id,
                 note="Оплата через СБП подтверждена вручную, автопродление отключено.",
             )
+        elif user_id > 0:
+            rebill_id = response.get("RebillId") or response.get("rebillId")
+            if rebill_id:
+                try:
+                    await db_instance.set_rebill_id(user_id, str(rebill_id))
+                except Exception as err:  # noqa: BLE001
+                    logger.debug(
+                        "Не удалось сохранить RebillId %s для пользователя %s: %s",
+                        rebill_id,
+                        user_id,
+                        err,
+                    )
+            customer_key = response.get("CustomerKey") or response.get("customerKey")
+            if customer_key:
+                try:
+                    await db_instance.set_customer_key(user_id, str(customer_key))
+                except Exception as err:  # noqa: BLE001
+                    logger.debug(
+                        "Не удалось сохранить CustomerKey %s для пользователя %s: %s",
+                        customer_key,
+                        user_id,
+                        err,
+                    )
+            try:
+                await db_instance.set_rebill_parent_payment(user_id, str(payment_id))
+            except Exception as err:  # noqa: BLE001
+                logger.debug(
+                    "Не удалось сохранить родительский платёж %s для пользователя %s: %s",
+                    payment_id,
+                    user_id,
+                    err,
+                )
     return status == "CONFIRMED"
 
 
