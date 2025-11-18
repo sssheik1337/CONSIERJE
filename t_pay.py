@@ -831,6 +831,39 @@ async def get_sberpay_redirect_url(payment_id: int) -> str:
     return str(redirect_url)
 
 
+async def get_mirpay_deeplink(terminal_key: str, payment_id: str, token: str) -> str:
+    """Получить deeplink для оплаты через MirPay."""
+
+    url = "https://securepay.tinkoff.ru/v2/MirPay/GetDeepLink"
+    payload = {
+        "TerminalKey": terminal_key,
+        "PaymentId": payment_id,
+        "Token": token,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, headers=headers, timeout=10) as response:
+            response.raise_for_status()
+            data = await response.json()
+    if not data.get("Success", True):
+        print(
+            "MirPay deeplink error:",
+            data.get("ErrorCode"),
+            data.get("Message"),
+            data.get("Details"),
+        )
+        return ""
+    # Ответы MirPay могут содержать поле Deeplink в корне или внутри Params
+    deeplink = data.get("Deeplink")
+    if not deeplink:
+        params = data.get("Params") or {}
+        deeplink = params.get("Deeplink")
+    return str(deeplink or "")
+
+
 async def finish_authorize(
     payment_id: str,
     card_data: Dict[str, Any],
@@ -910,6 +943,7 @@ __all__ = [
     "get_tinkoff_pay_qr_svg",
     "get_sberpay_qr_svg",
     "get_sberpay_redirect_url",
+    "get_mirpay_deeplink",
     "finish_authorize",
     "net_diagnostics",
 ]
