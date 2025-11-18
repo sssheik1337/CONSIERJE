@@ -27,7 +27,12 @@ from config import config, get_docs_map
 from db import DB
 from payments import SBP_NOTE, check_payment_status, create_payment
 from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
-from t_pay import TBankApiError, TBankHttpError, add_card, get_add_card_state
+from t_pay import (
+    TBankApiError,
+    TBankHttpError,
+    get_add_card_state,
+    init_add_card,
+)
 
 router = Router()
 
@@ -1494,11 +1499,16 @@ async def handle_card_binding(callback: CallbackQuery, db: DB) -> None:
                 "Не удалось сохранить CustomerKey перед привязкой для пользователя %s", user_id
             )
 
-    async def send_form_link(active_request_key: str) -> str:
-        params = urllib.parse.urlencode(
-            {"TerminalKey": terminal_key, "RequestKey": active_request_key}
-        )
-        form_url = f"https://securepay.tinkoff.ru/html/payForm.html?{params}"
+    async def send_form_link(
+        active_request_key: str, payment_url: str | None = None
+    ) -> str:
+        if payment_url:
+            form_url = payment_url
+        else:
+            params = urllib.parse.urlencode(
+                {"TerminalKey": terminal_key, "RequestKey": active_request_key}
+            )
+            form_url = f"https://securepay.tinkoff.ru/html/payForm.html?{params}"
         text_lines = [
             "Откройте форму и введите данные карты для автопродления.",
             "После подтверждения вернитесь в чат, чтобы бот обновил статус автоматически.",
@@ -1527,6 +1537,9 @@ async def handle_card_binding(callback: CallbackQuery, db: DB) -> None:
             new_rebill = state.get("RebillId") or state.get("CardId")
             if new_rebill:
                 await db.set_rebill_id(user_id, str(new_rebill))
+            card_id = state.get("CardId")
+            if card_id:
+                await db.set_card_id(user_id, str(card_id))
             await db.set_card_request_key(user_id, None)
             success_lines = [
                 "✅ Карта успешно привязана.",
@@ -1560,9 +1573,10 @@ async def handle_card_binding(callback: CallbackQuery, db: DB) -> None:
 
     if not request_key:
         try:
-            response = await add_card(
+            response = await init_add_card(
                 customer_key=customer_key,
-                check_type="NO",
+                check_type="3DSHOLD",
+                resident_state=True,
                 ip=DEFAULT_CARD_BIND_IP,
             )
         except (TBankHttpError, TBankApiError) as err:
@@ -1584,7 +1598,10 @@ async def handle_card_binding(callback: CallbackQuery, db: DB) -> None:
         if response_customer_key:
             await db.set_customer_key(user_id, str(response_customer_key))
         await db.set_card_request_key(user_id, new_request_key)
-        form_url = await send_form_link(new_request_key)
+        payment_url = (response.get("PaymentURL") or "").strip() or None
+        if not payment_url:
+            logging.debug("InitAddCard не вернул PaymentURL, используем ссылку payForm")
+        form_url = await send_form_link(new_request_key, payment_url)
         if callback.message:
             await callback.answer("Ссылка для привязки отправлена.")
         else:

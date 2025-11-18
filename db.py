@@ -501,6 +501,28 @@ class DB:
             )
             await db.commit()
 
+    async def set_card_id(self, user_id: int, card_id: Optional[str]) -> None:
+        """Сохранить идентификатор карты (CardId) в настройках."""
+
+        key = f"card_id:{user_id}"
+        value = (card_id or "").strip()
+        if value:
+            await self.set_setting(key, value)
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM settings WHERE key=?", (key,))
+            await db.commit()
+
+    async def get_card_id(self, user_id: int) -> Optional[str]:
+        """Прочитать сохранённый CardId пользователя."""
+
+        key = f"card_id:{user_id}"
+        value = await self.get_setting(key)
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
     async def log_payment_attempt(
         self,
         user_id: int,
