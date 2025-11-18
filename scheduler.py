@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import json
 import logging
+from typing import NamedTuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -10,11 +11,20 @@ import pytz
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from config import config
 from db import DB
 from t_pay import TBankApiError, TBankHttpError, charge_payment
 
 DEFAULT_RECURRENT_IP = "127.0.0.1"
 RETRY_PAYMENT_CALLBACK = "payment:retry"
+
+
+class AutoRenewResult(NamedTuple):
+    """Результат попытки автопродления."""
+
+    success: bool
+    attempted: bool
+    amount: int
 
 def _retry_markup() -> InlineKeyboardMarkup:
     """Построить клавиатуру для повторного списания."""
@@ -44,7 +54,7 @@ async def try_auto_renew(
     *,
     ip: str | None = None,
     force: bool = False,
-) -> bool:
+) -> AutoRenewResult:
     """Попытаться продлить подписку пользователя через автосписание."""
 
     # Параметр force позволяет запускать списание вручную, даже если флаг auto_renew снят.
@@ -55,10 +65,10 @@ async def try_auto_renew(
     rebill_id = (row_dict.get("rebill_id") or "").strip()
     parent_payment = (row_dict.get("rebill_parent_payment") or "").strip()
     if user_id <= 0:
-        return False
+        return AutoRenewResult(False, False, 0)
     should_attempt = auto_renew_flag or force
     if not should_attempt:
-        return False
+        return AutoRenewResult(False, False, 0)
     customer_key = (row_dict.get("customer_key") or "").strip()
     if should_attempt and not customer_key:
         customer_key = str(user_id)
@@ -103,7 +113,7 @@ async def try_auto_renew(
             if missing:
                 reason = f"{reason}: {', '.join(missing)}"
             await db.log_payment_attempt(user_id, "SKIPPED", reason, payment_type="card")
-        return False
+        return AutoRenewResult(False, False, 0)
 
     if now_ts is None:
         now_ts = int(datetime.utcnow().timestamp())
@@ -127,7 +137,7 @@ async def try_auto_renew(
             )
         except Exception:
             logging.debug("Не удалось уведомить пользователя %s об ошибке автосписания", user_id)
-        return False
+        return AutoRenewResult(False, True, 0)
     except Exception as err:  # noqa: BLE001
         logging.exception("Неожиданная ошибка автосписания для пользователя %s", user_id, exc_info=err)
         await db.set_auto_renew(user_id, False)
@@ -140,7 +150,7 @@ async def try_auto_renew(
             )
         except Exception:
             logging.debug("Не удалось уведомить пользователя %s об исключении автосписания", user_id)
-        return False
+        return AutoRenewResult(False, True, 0)
 
     status = (response.get("Status") or "").upper()
     success_flag = bool(response.get("Success"))
@@ -157,7 +167,7 @@ async def try_auto_renew(
             )
         except Exception:
             logging.debug("Не удалось уведомить пользователя %s о провале автосписания", user_id)
-        return False
+        return AutoRenewResult(False, True, 0)
 
     new_parent_payment = response.get("PaymentId") or parent_payment
     new_payment_id_str = str(new_parent_payment).strip() if new_parent_payment else ""
@@ -201,7 +211,7 @@ async def try_auto_renew(
         logging.debug("Не удалось отправить сообщение об успешном продлении пользователю %s", user_id)
 
     logging.info("Автопродление успешно: user=%s до %s", user_id, extended_until)
-    return True
+    return AutoRenewResult(True, True, max(0, parent_amount))
 
 
 async def daily_check(bot: Bot, db: DB):
@@ -212,12 +222,19 @@ async def daily_check(bot: Bot, db: DB):
         return
 
     expired = await db.list_expired(now_ts)
+    auto_success_count = 0
+    auto_fail_count = 0
+    auto_success_amount = 0
     for row in expired:
         user_id = int(row["user_id"])
 
-        renewed = await try_auto_renew(bot, db, row, now_ts)
-        if renewed:
+        renew_result = await try_auto_renew(bot, db, row, now_ts)
+        if renew_result.success:
+            auto_success_count += 1
+            auto_success_amount += max(0, renew_result.amount)
             continue
+        if renew_result.attempted:
+            auto_fail_count += 1
 
         row_dict = dict(row)
         if bool(row_dict.get("auto_renew")):
@@ -245,6 +262,24 @@ async def daily_check(bot: Bot, db: DB):
             )
         except Exception:
             logging.debug("Не удалось уведомить пользователя %s об окончании подписки", user_id)
+
+    if auto_success_count or auto_fail_count:
+        summary_lines = [
+            "💳 Автосписания за последний цикл:",
+            f"✅ Успешно: {auto_success_count}",
+            f"⚠️ Ошибки: {auto_fail_count}",
+        ]
+        if auto_success_amount > 0:
+            summary_lines.append(f"💰 Сумма: {auto_success_amount / 100:.2f} ₽")
+        summary_text = "\n".join(summary_lines)
+        for admin_id in config.SUPER_ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, summary_text)
+            except Exception:
+                logging.debug(
+                    "Не удалось отправить администратору %s сводку автосписаний",
+                    admin_id,
+                )
 
 
 def setup_scheduler(bot: Bot, db: DB, tz_name: str = "Europe/Moscow") -> AsyncIOScheduler:

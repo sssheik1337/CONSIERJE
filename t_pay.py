@@ -2,12 +2,12 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import socket
 from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
-from dotenv import load_dotenv
+
+from config import config
 
 
 class TBankHttpError(RuntimeError):
@@ -25,8 +25,6 @@ class TBankApiError(RuntimeError):
             base_message = f"{base_message} | {details}"
         super().__init__(base_message)
 
-load_dotenv()
-
 """
 Этот модуль инкапсулирует работу с API интернет‑эквайринга T‑Bank (Tinkoff).
 Для всех вызовов необходим TerminalKey и пароль, которые считываются из
@@ -40,16 +38,16 @@ load_dotenv()
 def _read_env() -> Tuple[str, str, str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Прочитать и провалидировать настройки окружения для T-Bank."""
 
-    base_url = (os.getenv("T_PAY_BASE_URL") or "https://securepay.tinkoff.ru/v2").rstrip("/")
-    terminal_key = (os.getenv("T_PAY_TERMINAL_KEY", "") or "").strip()
-    password = (os.getenv("T_PAY_PASSWORD", "") or "").strip()
+    base_url = (config.T_PAY_BASE_URL or "https://securepay.tinkoff.ru/v2").rstrip("/")
+    terminal_key = (config.T_PAY_TERMINAL_KEY or "").strip()
+    password = (config.T_PAY_PASSWORD or "").strip()
     if not terminal_key or not password:
         raise RuntimeError("T_PAY_TERMINAL_KEY/T_PAY_PASSWORD не заданы")
 
-    success_url = (os.getenv("T_PAY_SUCCESS_URL") or "").strip() or None
-    fail_url = (os.getenv("T_PAY_FAIL_URL") or "").strip() or None
-    notification_url = (os.getenv("T_PAY_NOTIFICATION_URL") or "").strip() or None
-    api_token = (os.getenv("T_PAY_API_TOKEN") or "").strip() or None
+    success_url = (config.T_PAY_SUCCESS_URL or "").strip() or None
+    fail_url = (config.T_PAY_FAIL_URL or "").strip() or None
+    notification_url = (config.TINKOFF_NOTIFY_URL or "").strip() or None
+    api_token = (config.T_PAY_API_TOKEN or "").strip() or None
 
     return (
         base_url,
@@ -173,7 +171,7 @@ async def net_diagnostics() -> Dict[str, Any]:
     except Exception as err:  # noqa: BLE001
         result["external_ip_error"] = str(err)
 
-    base_url = (os.getenv("T_PAY_BASE_URL") or "https://securepay.tinkoff.ru/v2").rstrip("/")
+    base_url = (config.T_PAY_BASE_URL or "https://securepay.tinkoff.ru/v2").rstrip("/")
     host = base_url.split("//", 1)[1].split("/", 1)[0]
     result["base_url"] = base_url
     result["base_host"] = host

@@ -1366,7 +1366,7 @@ async def handle_retry_payment(callback: CallbackQuery, db: DB) -> None:
         return
 
     now_ts = int(datetime.utcnow().timestamp())
-    success = await try_auto_renew(
+    result = await try_auto_renew(
         callback.bot,
         db,
         user,
@@ -1374,7 +1374,7 @@ async def handle_retry_payment(callback: CallbackQuery, db: DB) -> None:
         force=True,
     )
 
-    if success:
+    if result.success:
         if callback.message:
             try:
                 await callback.message.edit_reply_markup()

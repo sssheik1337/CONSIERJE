@@ -4,8 +4,6 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-import t_pay  # noqa: F401  # Импортируем для инициализации настроек платежей
-
 # Загружаем значения из файла окружения
 load_dotenv()
 
@@ -56,10 +54,12 @@ class Config:
     DOCS_PD_POLICY_URL: str = os.getenv("DOCS_PD_POLICY_URL", "")
     DOCS_OFFER_URL: str = os.getenv("DOCS_OFFER_URL", "")
 
+    T_PAY_BASE_URL: str = os.getenv("T_PAY_BASE_URL", "https://securepay.tinkoff.ru/v2")
     T_PAY_TERMINAL_KEY: str = os.getenv("T_PAY_TERMINAL_KEY", "")
     T_PAY_PASSWORD: str = os.getenv("T_PAY_PASSWORD", "")
     T_PAY_SUCCESS_URL: str = os.getenv("T_PAY_SUCCESS_URL", "")
     T_PAY_FAIL_URL: str = os.getenv("T_PAY_FAIL_URL", "")
+    T_PAY_API_TOKEN: str = os.getenv("T_PAY_API_TOKEN", "")
 
     TINKOFF_NOTIFY_URL: str = TINKOFF_NOTIFY_URL
     WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")
