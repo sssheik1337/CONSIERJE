@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import urllib.parse
 
-import logging
 from collections.abc import Mapping, Sequence
 
 import aiosqlite
@@ -27,6 +26,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import config, get_docs_map
 from db import DB
+from logger import logger
 from payments import SBP_NOTE, check_payment_status, create_payment
 from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
 from t_pay import (
@@ -218,7 +218,7 @@ async def _send_sbp_bank_gallery(message: Message, banks: Sequence[Mapping[str, 
         else:
             await message.answer_media_group(gallery)
     except TelegramBadRequest as err:
-        logging.debug("Не удалось отправить логотипы банков: %s", err)
+        logger.debug("Не удалось отправить логотипы банков: %s", err)
 
 
 async def _prompt_sbp_banks(message: Message | None) -> None:
@@ -251,7 +251,7 @@ async def _ensure_subscription_state(
 
     if expires_at and expires_at < now_ts and auto_flag:
         if bot is None:
-            logging.warning(
+            logger.warning(
                 "Не удалось инициировать автосписание при входе пользователя %s: бот отсутствует.",
                 user_id,
             )
@@ -259,7 +259,7 @@ async def _ensure_subscription_state(
             try:
                 await try_auto_renew(bot, db, user_row, now_ts)
             except Exception as err:  # noqa: BLE001
-                logging.exception(
+                logger.exception(
                     "Ошибка при запуске автопродления для пользователя %s", user_id, exc_info=err
                 )
         user_row = await db.get_user(user_id)
@@ -412,14 +412,14 @@ async def make_one_time_invite(
                 "Чат недоступен боту.",
                 "Привяжите чат заново.",
             )
-        logging.exception("Ошибка при получении сведений о боте", exc_info=err)
+        logger.exception("Ошибка при получении сведений о боте", exc_info=err)
         return (
             False,
             "Не удалось проверить права.",
             err_text,
         )
     except Exception as err:
-        logging.exception("Не удалось получить сведения о боте", exc_info=err)
+        logger.exception("Не удалось получить сведения о боте", exc_info=err)
         return (
             False,
             "Не удалось проверить права.",
@@ -452,7 +452,7 @@ async def make_one_time_invite(
             expire_date=expire_ts,
             creates_join_request=False,
         )
-        logging.info(
+        logger.info(
             "Создана одноразовая ссылка: chat_id=%s limit=%s expire=%s join_request=%s link=%s",
             chat_id,
             getattr(link, "member_limit", None),
@@ -480,7 +480,7 @@ async def make_one_time_invite(
                     "Дайте право «Пригласительные ссылки».",
                 )
             except Exception as export_err:
-                logging.exception("Ошибка при получении постоянной ссылки", exc_info=export_err)
+                logger.exception("Ошибка при получении постоянной ссылки", exc_info=export_err)
                 return (
                     False,
                     "Недостаточно прав для создания одноразовой ссылки.",
@@ -503,7 +503,7 @@ async def make_one_time_invite(
             "Проверьте права и тип чата.",
         )
     except Exception as err:
-        logging.exception("Неожиданная ошибка при создании ссылки", exc_info=err)
+        logger.exception("Неожиданная ошибка при создании ссылки", exc_info=err)
         return (
             False,
             "Не удалось создать ссылку.",
@@ -1165,7 +1165,7 @@ async def cmd_test_expire_me(message: Message, db: DB, bot: Bot) -> None:
     try:
         await daily_check(bot, db)
     except Exception as err:  # noqa: BLE001
-        logging.exception("Сбой тестовой проверки истечения подписки", exc_info=err)
+        logger.exception("Сбой тестовой проверки истечения подписки", exc_info=err)
     await send_main_menu_screen(
         message,
         db,
@@ -1432,7 +1432,7 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
             force_recurrent=(method == "card"),
         )
     except Exception as err:  # noqa: BLE001
-        logging.exception("Не удалось создать платёж", exc_info=err)
+        logger.exception("Не удалось создать платёж", exc_info=err)
         await callback.answer("Не удалось создать платёж. Попробуйте позже.", show_alert=True)
         return
 
@@ -1487,7 +1487,7 @@ async def handle_sbp_bank_request(callback: CallbackQuery) -> None:
     try:
         response = await get_qr_bank_list(os_value)
     except (TBankHttpError, TBankApiError) as err:
-        logging.warning("Не удалось получить список банков СБП: %s", err)
+        logger.warning("Не удалось получить список банков СБП: %s", err)
         await callback.answer("Список банков недоступен.", show_alert=True)
         return
     banks = _extract_bank_list(response)
@@ -1690,7 +1690,7 @@ async def handle_card_binding(callback: CallbackQuery, db: DB) -> None:
         try:
             await db.set_customer_key(user_id, customer_key)
         except Exception:  # noqa: BLE001
-            logging.debug(
+            logger.debug(
                 "Не удалось сохранить CustomerKey перед привязкой для пользователя %s", user_id
             )
 
@@ -1720,7 +1720,7 @@ async def handle_card_binding(callback: CallbackQuery, db: DB) -> None:
         try:
             state = await get_add_card_state(request_key)
         except (TBankHttpError, TBankApiError) as err:
-            logging.warning("Не удалось проверить привязку карты пользователя %s: %s", user_id, err)
+            logger.warning("Не удалось проверить привязку карты пользователя %s: %s", user_id, err)
             await callback.answer("Не удалось проверить статус привязки. Попробуйте позже.", show_alert=True)
             return
         status = (state.get("Status") or "").upper()
@@ -1775,17 +1775,17 @@ async def handle_card_binding(callback: CallbackQuery, db: DB) -> None:
                 ip=DEFAULT_CARD_BIND_IP,
             )
         except (TBankHttpError, TBankApiError) as err:
-            logging.warning("Не удалось инициировать привязку карты для пользователя %s: %s", user_id, err)
+            logger.warning("Не удалось инициировать привязку карты для пользователя %s: %s", user_id, err)
             await callback.answer("Не удалось инициировать привязку. Попробуйте позже.", show_alert=True)
             return
         except Exception as err:  # noqa: BLE001
-            logging.exception("Неожиданная ошибка при создании привязки карты", exc_info=err)
+            logger.exception("Неожиданная ошибка при создании привязки карты", exc_info=err)
             await callback.answer("Привязка временно недоступна. Попробуйте позже.", show_alert=True)
             return
 
         new_request_key = str(response.get("RequestKey") or "").strip()
         if not new_request_key:
-            logging.error("T-Bank не вернул RequestKey при привязке карты: %s", response)
+            logger.error("T-Bank не вернул RequestKey при привязке карты: %s", response)
             await callback.answer("Не удалось получить ссылку для привязки.", show_alert=True)
             return
 
@@ -1795,7 +1795,7 @@ async def handle_card_binding(callback: CallbackQuery, db: DB) -> None:
         await db.set_card_request_key(user_id, new_request_key)
         payment_url = (response.get("PaymentURL") or "").strip() or None
         if not payment_url:
-            logging.debug("InitAddCard не вернул PaymentURL, используем ссылку payForm")
+            logger.debug("InitAddCard не вернул PaymentURL, используем ссылку payForm")
         form_url = await send_form_link(new_request_key, payment_url)
         if callback.message:
             await callback.answer("Ссылка для привязки отправлена.")
@@ -1879,13 +1879,13 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     try:
         member = await bot.get_chat_member(chat_id, callback.from_user.id)
     except TelegramForbiddenError as err:
-        logging.warning("Не удалось проверить участие пользователя %s: %s", callback.from_user.id, err)
+        logger.warning("Не удалось проверить участие пользователя %s: %s", callback.from_user.id, err)
         ok, info, hint = await make_one_time_invite(bot, db)
         await send_invite_failure(info, hint)
         await callback.answer("Бот не имеет доступа к чату", show_alert=True)
         return
     except TelegramBadRequest as err:
-        logging.warning(
+        logger.warning(
             "Ошибка Telegram при проверке участия пользователя %s: %s",
             callback.from_user.id,
             err,
@@ -1895,7 +1895,7 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         await callback.answer("Не удалось проверить участие", show_alert=True)
         return
     except Exception as err:  # noqa: BLE001
-        logging.exception(
+        logger.exception(
             "Сбой при проверке участия пользователя %s в канале", callback.from_user.id, exc_info=err
         )
         if callback.message:
@@ -2137,7 +2137,7 @@ async def process_bind_username(
                 last_error = err
                 continue
             except Exception as err:
-                logging.exception("Ошибка при получении чата", exc_info=err)
+                logger.exception("Ошибка при получении чата", exc_info=err)
                 await message.answer(
                     escape_md("Произошла ошибка при получении чата. Попробуйте позже."),
                     parse_mode=ParseMode.MARKDOWN_V2,
@@ -2149,7 +2149,7 @@ async def process_bind_username(
                 break
 
         if chat is None:
-            logging.warning(
+            logger.warning(
                 "Не удалось подобрать чат по числовому идентификатору: %s", compact
             )
             await message.answer(
@@ -2158,7 +2158,7 @@ async def process_bind_username(
                 disable_web_page_preview=True,
             )
             if last_error is not None:
-                logging.debug("Последняя ошибка Telegram: %s", last_error)
+                logger.debug("Последняя ошибка Telegram: %s", last_error)
             return
     else:
         if not compact.startswith("@"):
@@ -2210,7 +2210,7 @@ async def process_bind_username(
         )
         return
     except TelegramBadRequest as err:
-        logging.exception("Ошибка при проверке прав бота", exc_info=err)
+        logger.exception("Ошибка при проверке прав бота", exc_info=err)
         await message.answer(
             escape_md("Не удалось проверить права бота. Проверьте настройки чата."),
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -2218,7 +2218,7 @@ async def process_bind_username(
         )
         return
     except Exception as err:
-        logging.exception("Неожиданная ошибка при проверке прав бота", exc_info=err)
+        logger.exception("Неожиданная ошибка при проверке прав бота", exc_info=err)
         await message.answer(
             escape_md("Не удалось проверить права бота. См. логи."),
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -2288,11 +2288,11 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     try:
         chat = await bot.get_chat(chat_id)
     except (TelegramBadRequest, TelegramForbiddenError) as err:
-        logging.exception("Не удалось получить чат", exc_info=err)
+        logger.exception("Не удалось получить чат", exc_info=err)
         await callback.answer("Не удалось получить чат. Привяжите его заново.", show_alert=True)
         return
     except Exception as err:
-        logging.exception("Неожиданная ошибка при получении чата", exc_info=err)
+        logger.exception("Неожиданная ошибка при получении чата", exc_info=err)
         await callback.answer("Не удалось получить чат. Попробуйте позже.", show_alert=True)
         return
 
@@ -2323,7 +2323,7 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
             "• Рекомендация: откройте права бота → включите «Пригласительные ссылки».",
         ]
     except Exception as err:
-        logging.exception("Ошибка при проверке прав бота", exc_info=err)
+        logger.exception("Ошибка при проверке прав бота", exc_info=err)
         lines = base_lines + [
             "• Статус: не удалось проверить",
             "• Пригласительные ссылки: ❌",

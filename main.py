@@ -8,7 +8,6 @@ import asyncio
 import contextlib
 import hashlib
 import json
-import logging
 import time
 from datetime import datetime
 from typing import Optional
@@ -23,9 +22,8 @@ import t_pay
 from config import config
 from db import DB
 from handlers import router
+from logger import logger
 from scheduler import setup_scheduler
-
-logging.basicConfig(level=logging.INFO)
 
 
 def compute_token(payload: dict, password: str) -> str:
@@ -54,14 +52,14 @@ async def _notify_user_payment_confirmed(
     try:
         user_row = await db.get_user(user_id)
     except Exception as err:  # noqa: BLE001
-        logging.exception("Не удалось получить данные пользователя %s", user_id, exc_info=err)
+        logger.exception("Не удалось получить данные пользователя %s", user_id, exc_info=err)
         user_row = None
 
     expires_at = 0
     try:
         subscription_end = await db.get_subscription_end(user_id)
     except Exception as err:  # noqa: BLE001
-        logging.exception("Не удалось получить конец подписки для уведомления", exc_info=err)
+        logger.exception("Не удалось получить конец подписки для уведомления", exc_info=err)
         subscription_end = None
     if subscription_end:
         expires_at = subscription_end
@@ -90,7 +88,7 @@ async def _notify_user_payment_confirmed(
     try:
         await bot.send_message(user_id, " ".join(message_parts))
     except Exception as err:  # noqa: BLE001
-        logging.exception("Не удалось уведомить пользователя о подтверждении оплаты", exc_info=err)
+        logger.exception("Не удалось уведомить пользователя о подтверждении оплаты", exc_info=err)
 
 
 async def tbank_notify(request: web.Request) -> web.Response:
@@ -103,11 +101,11 @@ async def tbank_notify(request: web.Request) -> web.Response:
     try:
         data = await request.json()
     except Exception as err:  # noqa: BLE001
-        logging.exception("Не удалось разобрать уведомление T-Bank", exc_info=err)
+        logger.exception("Не удалось разобрать уведомление T-Bank", exc_info=err)
         return web.json_response({"ok": True})
 
     if not isinstance(data, dict):
-        logging.warning("Webhook T-Bank получен в неверном формате: %s", data)
+        logger.warning("Webhook T-Bank получен в неверном формате: %s", data)
         return web.json_response({"ok": True})
 
     headers = dict(request.headers)
@@ -115,25 +113,25 @@ async def tbank_notify(request: web.Request) -> web.Response:
     try:
         terminal_key = str(data.get("TerminalKey") or data.get("terminalKey") or "")
         if terminal_key != config.T_PAY_TERMINAL_KEY:
-            logging.warning("Отклонён webhook T-Bank: некорректный TerminalKey")
+            logger.warning("Отклонён webhook T-Bank: некорректный TerminalKey")
             return web.Response(status=403)
 
         if config.TINKOFF_WEBHOOK_SECRET:
             secret_header = headers.get("X-Tbank-Secret") or headers.get("X-TBank-Secret")
             if secret_header != config.TINKOFF_WEBHOOK_SECRET:
-                logging.warning("Отклонён webhook T-Bank: неверный X-Tbank-Secret")
+                logger.warning("Отклонён webhook T-Bank: неверный X-Tbank-Secret")
                 return web.Response(status=403)
 
         token = data.get("Token") or data.get("token")
         if token:
             expected = compute_token(data, config.T_PAY_PASSWORD)
             if expected != str(token):
-                logging.warning("Отклонён webhook T-Bank: подпись не сошлась")
+                logger.warning("Отклонён webhook T-Bank: подпись не сошлась")
                 return web.Response(status=403)
     except web.HTTPException:
         raise
     except Exception as err:  # noqa: BLE001
-        logging.exception("Ошибка при проверке подписи webhook T-Bank", exc_info=err)
+        logger.exception("Ошибка при проверке подписи webhook T-Bank", exc_info=err)
         return web.json_response({"ok": True})
 
     payment_id = str(data.get("PaymentId") or data.get("paymentId") or "")
@@ -141,7 +139,7 @@ async def tbank_notify(request: web.Request) -> web.Response:
     status_raw = str(data.get("Status") or data.get("status") or "")
     status_upper = status_raw.upper()
 
-    logging.info(
+    logger.info(
         "Webhook от T-Bank: статус=%s payment_id=%s order_id=%s",
         status_upper or status_raw,
         payment_id or "-",
@@ -160,7 +158,7 @@ async def tbank_notify(request: web.Request) -> web.Response:
             processed=0,
         )
     except Exception as err:  # noqa: BLE001
-        logging.exception("Не удалось записать webhook-событие", exc_info=err)
+        logger.exception("Не удалось записать webhook-событие", exc_info=err)
         event_id = 0
 
     processed = False
@@ -203,7 +201,7 @@ async def tbank_notify(request: web.Request) -> web.Response:
                         try:
                             await db.set_payment_method(target_payment_id, payment_type)
                         except Exception as err:  # noqa: BLE001
-                            logging.debug(
+                            logger.debug(
                                 "Не удалось сохранить способ оплаты %s для платежа %s: %s",
                                 payment_type,
                                 target_payment_id,
@@ -234,13 +232,13 @@ async def tbank_notify(request: web.Request) -> web.Response:
                     await db.set_payment_status(payment_row["payment_id"], status_upper)
                     processed = True
     except Exception as err:  # noqa: BLE001
-        logging.exception("Ошибка обработки webhook T-Bank", exc_info=err)
+        logger.exception("Ошибка обработки webhook T-Bank", exc_info=err)
     finally:
         if processed and event_id:
             try:
                 await db.mark_webhook_processed(event_id)
             except Exception as err:  # noqa: BLE001
-                logging.exception("Не удалось пометить webhook как обработанный", exc_info=err)
+                logger.exception("Не удалось пометить webhook как обработанный", exc_info=err)
 
     return web.json_response({"ok": True})
 
@@ -276,7 +274,7 @@ async def start_webhook_server(bot: Bot, db: DB) -> None:
     await runner.setup()
     site = web.TCPSite(runner, host=config.WEBHOOK_HOST, port=config.WEBHOOK_PORT)
     await site.start()
-    logging.info(
+    logger.info(
         "Сервер уведомлений T-Bank запущен на %s:%s",
         config.WEBHOOK_HOST,
         config.WEBHOOK_PORT,
@@ -284,7 +282,7 @@ async def start_webhook_server(bot: Bot, db: DB) -> None:
     try:
         diagnostics = await t_pay.net_diagnostics()
     except Exception as err:  # noqa: BLE001
-        logging.exception("Не удалось выполнить сетевую диагностику T-Bank", exc_info=err)
+        logger.exception("Не удалось выполнить сетевую диагностику T-Bank", exc_info=err)
     else:
         local_ip = diagnostics.get("local_ip") or "-"
         external_repr = (
@@ -293,7 +291,7 @@ async def start_webhook_server(bot: Bot, db: DB) -> None:
             or diagnostics.get("probe_error")
             or "-"
         )
-        logging.info(
+        logger.info(
             "Диагностика сети при старте: local_ip=%s external=%s",
             local_ip,
             external_repr,

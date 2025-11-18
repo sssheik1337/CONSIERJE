@@ -1,5 +1,4 @@
 import json
-import logging
 import re
 import secrets
 import time
@@ -7,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 import aiosqlite
+from logger import logger
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -176,9 +176,9 @@ class DB:
                     message = str(err).lower()
                     if "duplicate column name" in message:
                         continue
-                    logging.exception("Ошибка при миграции таблиц", exc_info=err)
+                    logger.exception("Ошибка при миграции таблиц", exc_info=err)
                 except Exception as err:  # noqa: BLE001
-                    logging.exception("Не удалось обновить схему базы данных", exc_info=err)
+                    logger.exception("Не удалось обновить схему базы данных", exc_info=err)
             try:
                 cur = await db.execute(
                     """
@@ -234,7 +234,7 @@ class DB:
                     """
                 )
             except Exception as err:  # noqa: BLE001
-                logging.exception(
+                logger.exception(
                     "Не удалось перенести идентификаторы автоплатежей в таблицу subscriptions",
                     exc_info=err,
                 )
@@ -246,7 +246,7 @@ class DB:
                     "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)"
                 )
             except Exception as err:  # noqa: BLE001
-                logging.exception("Не удалось создать индексы платежей", exc_info=err)
+                logger.exception("Не удалось создать индексы платежей", exc_info=err)
 
             try:
                 await db.execute(
@@ -257,7 +257,7 @@ class DB:
                     """
                 )
             except Exception as err:  # noqa: BLE001
-                logging.debug("Не удалось нормализовать method в payments", exc_info=err)
+                logger.debug("Не удалось нормализовать method в payments", exc_info=err)
 
             try:
                 cur = await db.execute(
@@ -318,7 +318,7 @@ class DB:
                             (user_id, expires_at, now_stamp),
                         )
             except Exception as err:  # noqa: BLE001
-                logging.exception("Не удалось синхронизировать текущие сроки подписок", exc_info=err)
+                logger.exception("Не удалось синхронизировать текущие сроки подписок", exc_info=err)
 
             try:
                 cur = await db.execute(
@@ -339,7 +339,7 @@ class DB:
                         (row["code"], row["used_by"], row["used_at"], row["kind"]),
                     )
             except Exception as err:  # noqa: BLE001
-                logging.exception(
+                logger.exception(
                     "Не удалось перенести историю использования промокодов", exc_info=err
                 )
             await db.commit()
@@ -1074,7 +1074,7 @@ class DB:
                 try:
                     expires_at = int(expires_raw)
                 except (TypeError, ValueError):
-                    logging.warning("Некорректное значение срока действия промокода %s: %s", normalized, expires_raw)
+                    logger.warning("Некорректное значение срока действия промокода %s: %s", normalized, expires_raw)
             if expires_at is not None and expires_at < now_ts:
                 return False, "Промокод недействителен или истёк.", row["kind"]
 
@@ -1090,7 +1090,7 @@ class DB:
             # Здесь можно расширить логику для разных типов купонов (скидки, бонусы и т.д.)
             await db.commit()
 
-        logging.info("Промокод %s применён пользователем %s как тип %s", normalized, user_id, kind)
+        logger.info("Промокод %s применён пользователем %s как тип %s", normalized, user_id, kind)
         return True, "Промокод успешно активирован.", kind
 
     async def gen_coupons(self, kind: str, count: int) -> List[str]:

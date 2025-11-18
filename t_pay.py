@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import json
-import logging
 import socket
 from typing import Any, Dict, Optional, Tuple
 
@@ -9,6 +8,7 @@ import aiohttp
 import requests
 
 from config import config
+from logger import logger
 
 
 class TBankHttpError(RuntimeError):
@@ -218,7 +218,7 @@ async def net_diagnostics() -> Dict[str, Any]:
     except Exception as err:  # noqa: BLE001
         result["probe_error"] = str(err)
 
-    logging.info("[NET] diag: %s", json.dumps(result, ensure_ascii=False))
+    logger.info("[NET] diag: %s", json.dumps(result, ensure_ascii=False))
     return result
 
 
@@ -271,7 +271,7 @@ async def init_payment(
         api_token,
     ) = _read_env()
 
-    logging.info(
+    logger.info(
         "Init to %s | term_key_len=%s",
         f"{base_url}/Init",
         len(terminal_key),
@@ -317,10 +317,10 @@ async def init_payment(
             api_token=api_token,
         )
     except TBankHttpError as err:
-        logging.error("NETWORK/HTTP: %s (проверьте whitelist/host)", err)
+        logger.error("NETWORK/HTTP: %s (проверьте whitelist/host)", err)
         raise
     except TBankApiError as err:
-        logging.error("API: %s", err)
+        logger.error("API: %s", err)
         raise
 
     return response
@@ -403,10 +403,10 @@ async def get_payment_state(payment_id: str, ip: Optional[str] = None) -> Dict[s
             api_token=api_token,
         )
     except TBankHttpError as err:
-        logging.error("NETWORK/HTTP: %s (проверьте whitelist/host)", err)
+        logger.error("NETWORK/HTTP: %s (проверьте whitelist/host)", err)
         raise
     except TBankApiError as err:
-        logging.error("API: %s", err)
+        logger.error("API: %s", err)
         raise
 
 
@@ -482,7 +482,7 @@ def charge_saved_card(
         if info_email:
             payload["InfoEmail"] = info_email
         else:
-            logging.warning(
+            logger.warning(
                 "Запрошена отправка чека по email для автосписания, но адрес отсутствует."
             )
     elif info_email:
@@ -501,14 +501,14 @@ def charge_saved_card(
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
 
-    logging.info(
+    logger.info(
         "Charge saved card: payment=%s rebill=%s", payment_id, rebill_id
     )
 
     try:
         response = requests.post(url, json=body, headers=headers, timeout=15)
     except requests.RequestException as err:  # noqa: PERF203
-        logging.error("Charge saved card: ошибка сети %s", err)
+        logger.error("Charge saved card: ошибка сети %s", err)
         raise TBankHttpError(f"NETWORK: {err}") from err
 
     content_type = response.headers.get("Content-Type", "")
@@ -530,12 +530,12 @@ def charge_saved_card(
 
     if isinstance(data, dict):
         if not data.get("Success"):
-            logging.warning(
+            logger.warning(
                 "Charge saved card: отклонено %s",
                 json.dumps(data, ensure_ascii=False)[:500],
             )
         else:
-            logging.info(
+            logger.info(
                 "Charge saved card: подтверждено PaymentId=%s статус=%s",
                 data.get("PaymentId"),
                 data.get("Status"),
@@ -739,7 +739,7 @@ async def get_qr_bank_list(device_os: str = "android") -> Dict[str, Any]:
             "Os": os_value,
         },
     }
-    logging.info(
+    logger.info(
         "GetQrBankList: base=%s os=%s",
         base_url,
         os_value,
@@ -816,7 +816,7 @@ async def add_account_qr(
                 svg_data = await response.text()
                 success = response.status == 200
                 if not success:
-                    logging.error("AddAccountQr IMAGE: HTTP %s", response.status)
+                    logger.error("AddAccountQr IMAGE: HTTP %s", response.status)
                 return svg_data, None, success, "0" if success else str(response.status), (
                     "" if success else "Ошибка HTTP при получении SVG"
                 )
@@ -824,7 +824,7 @@ async def add_account_qr(
 
     success = bool(data_json.get("Success"))
     if not success:
-        logging.error(
+        logger.error(
             "AddAccountQr: %s %s %s",
             data_json.get("ErrorCode"),
             data_json.get("Message"),
@@ -872,7 +872,7 @@ async def charge_qr_sbp(
     }
     normalized_email = (info_email or "").strip() or None
     if send_email and not normalized_email:
-        logging.warning(
+        logger.warning(
             "Отправка email-чека запрошена, но info_email не указан для ChargeQr"
         )
     payload: Dict[str, Any] = {
@@ -895,7 +895,7 @@ async def charge_qr_sbp(
 
     success = bool(data.get("Success"))
     if not success:
-        logging.error(
+        logger.error(
             "ChargeQr SBP error: code=%s message=%s details=%s",
             data.get("ErrorCode"),
             data.get("Message"),

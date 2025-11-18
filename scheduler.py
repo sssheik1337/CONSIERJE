@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 import json
-import logging
 from typing import NamedTuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -14,6 +13,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import config
 from db import DB
+from logger import logger
 from payments import SBP_NOTE
 from t_pay import TBankHttpError, charge_saved_card
 
@@ -100,7 +100,7 @@ async def try_auto_renew(
         try:
             await db.set_customer_key(user_id, customer_key)
         except Exception:  # noqa: BLE001
-            logging.debug(
+            logger.debug(
                 "Не удалось автоматически сохранить CustomerKey для пользователя %s", user_id
             )
 
@@ -152,7 +152,7 @@ async def try_auto_renew(
             )
             return True
         except Exception:
-            logging.debug(
+            logger.debug(
                 "Не удалось уведомить пользователя %s об ошибке автосписания",
                 user_id,
             )
@@ -170,13 +170,13 @@ async def try_auto_renew(
             False,
         )
     except TBankHttpError as err:
-        logging.warning("Автосписание отклонено: user=%s | %s", user_id, err)
+        logger.warning("Автосписание отклонено: user=%s | %s", user_id, err)
         await db.set_auto_renew(user_id, False)
         await db.log_payment_attempt(user_id, "FAILED", str(err), payment_type="card")
         notified = await _notify_failure()
         return AutoRenewResult(False, True, 0, notified)
     except Exception as err:  # noqa: BLE001
-        logging.exception("Неожиданная ошибка автосписания для пользователя %s", user_id, exc_info=err)
+        logger.exception("Неожиданная ошибка автосписания для пользователя %s", user_id, exc_info=err)
         await db.set_auto_renew(user_id, False)
         await db.log_payment_attempt(user_id, "ERROR", str(err), payment_type="card")
         notified = await _notify_failure()
@@ -186,7 +186,7 @@ async def try_auto_renew(
     success_flag = bool(response.get("Success"))
     if status not in {"CONFIRMED", "COMPLETED"} and not success_flag:
         info = json.dumps(response, ensure_ascii=False)[:500]
-        logging.warning("Автосписание неуспешно: user=%s | %s", user_id, info)
+        logger.warning("Автосписание неуспешно: user=%s | %s", user_id, info)
         await db.set_auto_renew(user_id, False)
         await db.log_payment_attempt(user_id, "FAILED", info, payment_type="card")
         notified = await _notify_failure()
@@ -202,7 +202,7 @@ async def try_auto_renew(
     try:
         await db.set_paid_only(user_id, False)
     except Exception:  # noqa: BLE001
-        logging.debug(
+        logger.debug(
             "Не удалось сбросить флаг paid_only после автопродления для пользователя %s",
             user_id,
         )
@@ -224,7 +224,7 @@ async def try_auto_renew(
                 method="card",
             )
         except Exception as err:  # noqa: BLE001
-            logging.debug("Не удалось сохранить запись об автосписании: %s", err)
+            logger.debug("Не удалось сохранить запись об автосписании: %s", err)
         effective_payment_id = new_payment_id_str
 
     if effective_payment_id:
@@ -245,9 +245,9 @@ async def try_auto_renew(
         )
         success_notified = True
     except Exception:
-        logging.debug("Не удалось отправить сообщение об успешном продлении пользователю %s", user_id)
+        logger.debug("Не удалось отправить сообщение об успешном продлении пользователю %s", user_id)
 
-    logging.info("Автопродление успешно: user=%s до %s", user_id, extended_until)
+    logger.info("Автопродление успешно: user=%s до %s", user_id, extended_until)
     return AutoRenewResult(True, True, max(0, parent_amount), success_notified)
 
 
@@ -255,7 +255,7 @@ async def daily_check(bot: Bot, db: DB):
     now_ts = int(datetime.utcnow().timestamp())
     target_chat_id = await db.get_target_chat_id()
     if target_chat_id is None:
-        logging.info("Пропуск проверки подписок: чат ещё не привязан.")
+        logger.info("Пропуск проверки подписок: чат ещё не привязан.")
         return
 
     expired = await db.list_expired(now_ts)
@@ -290,13 +290,13 @@ async def daily_check(bot: Bot, db: DB):
                 payment_type="sbp" if sbp_recent else "card",
             )
         except Exception:
-            logging.debug("Не удалось записать лог об удалении пользователя %s", user_id)
+            logger.debug("Не удалось записать лог об удалении пользователя %s", user_id)
 
         try:
             await bot.ban_chat_member(target_chat_id, user_id)
             await bot.unban_chat_member(target_chat_id, user_id)
         except Exception:
-            logging.debug("Не удалось удалить пользователя %s из канала", user_id)
+            logger.debug("Не удалось удалить пользователя %s из канала", user_id)
         notify_text = None
         notify_markup = None
         if renew_result.attempted:
@@ -320,7 +320,7 @@ async def daily_check(bot: Bot, db: DB):
                     reply_markup=notify_markup,
                 )
             except Exception:
-                logging.debug(
+                logger.debug(
                     "Не удалось уведомить пользователя %s об окончании подписки",
                     user_id,
                 )
@@ -338,7 +338,7 @@ async def daily_check(bot: Bot, db: DB):
             try:
                 await bot.send_message(admin_id, summary_text)
             except Exception:
-                logging.debug(
+                logger.debug(
                     "Не удалось отправить администратору %s сводку автосписаний",
                     admin_id,
                 )

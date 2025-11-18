@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import logging
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
 from config import config
 from db import DB
+from logger import logger
 from t_pay import (
     TBankApiError,
     TBankHttpError,
@@ -15,8 +15,6 @@ from t_pay import (
     get_payment_state,
     init_payment,
 )
-
-logger = logging.getLogger(__name__)
 
 _payment_db: Optional[DB] = None
 
@@ -252,10 +250,10 @@ async def create_payment(
             notification_url=config.TINKOFF_NOTIFY_URL or None,
         )
     except (TBankHttpError, TBankApiError) as err:
-        logging.error("Некорректный ответ Init: %s", err)
+        logger.error("Некорректный ответ Init: %s", err)
         raise RuntimeError(str(err)) from err
     except Exception as err:  # noqa: BLE001
-        logging.error("Неожиданная ошибка при создании платежа: %s", err)
+        logger.error("Неожиданная ошибка при создании платежа: %s", err)
         raise RuntimeError(str(err)) from err
 
     if not response:
@@ -273,7 +271,7 @@ async def create_payment(
         logger.error("Создание платежа завершилось с ошибкой: %s", response)
         raise RuntimeError(error_text)
 
-    logging.info("Payment created: order=%s, payment_id=%s", order_id, response.get("PaymentId"))
+    logger.info("Payment created: order=%s, payment_id=%s", order_id, response.get("PaymentId"))
 
     await db_instance.add_payment(
         user_id=user_id,

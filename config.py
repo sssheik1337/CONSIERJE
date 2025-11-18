@@ -61,6 +61,8 @@ class Config:
     T_PAY_FAIL_URL: str = os.getenv("T_PAY_FAIL_URL", "")
     T_PAY_API_TOKEN: str = os.getenv("T_PAY_API_TOKEN", "")
 
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+
     TINKOFF_NOTIFY_URL: str = TINKOFF_NOTIFY_URL
     WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")
     WEBHOOK_PORT: int = _env_int("WEBHOOK_PORT", 8080)
