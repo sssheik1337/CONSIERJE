@@ -773,6 +773,76 @@ async def check_tinkoff_pay_availability(terminal_key: str) -> Tuple[bool, str]:
     return allowed, str(version)
 
 
+async def add_account_qr(
+    terminal_key: str,
+    description: str,
+    token: str,
+    *,
+    data_type: str = "PAYLOAD",
+    bank_id: Optional[str] = None,
+    data: Optional[Dict[str, Any]] = None,
+    redirect_due_date: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], bool, str, str]:
+    """Создать QR для СБП (AddAccountQr) и вернуть полезные данные ответа."""
+
+    normalized_type = (data_type or "PAYLOAD").upper()
+    url = "https://securepay.tinkoff.ru/v2/AddAccountQr"
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if normalized_type == "IMAGE":
+        headers["Accept"] = "image/svg"
+
+    payload: Dict[str, Any] = {
+        "TerminalKey": terminal_key,
+        "Description": description,
+        "DataType": normalized_type,
+    }
+    if bank_id:
+        payload["BankId"] = bank_id
+    if data:
+        payload["Data"] = data
+    if redirect_due_date:
+        payload["RedirectDueDate"] = redirect_due_date
+
+    # Подпись формируется из отсортированных параметров и секрета
+    payload["Token"] = _generate_token(payload, token)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, headers=headers, timeout=15) as response:
+            response.raise_for_status()
+            if normalized_type == "IMAGE":
+                svg_data = await response.text()
+                success = response.status == 200
+                if not success:
+                    logging.error("AddAccountQr IMAGE: HTTP %s", response.status)
+                return svg_data, None, success, "0" if success else str(response.status), (
+                    "" if success else "Ошибка HTTP при получении SVG"
+                )
+            data_json = await response.json()
+
+    success = bool(data_json.get("Success"))
+    if not success:
+        logging.error(
+            "AddAccountQr: %s %s %s",
+            data_json.get("ErrorCode"),
+            data_json.get("Message"),
+            data_json.get("Details"),
+        )
+    params = data_json.get("Params") or {}
+    data_field = (
+        params.get("Data")
+        or params.get("Payload")
+        or data_json.get("Data")
+        or data_json.get("Payload")
+    )
+    request_key = data_json.get("RequestKey") or params.get("RequestKey")
+    error_code = str(data_json.get("ErrorCode", ""))
+    message = str(data_json.get("Message", ""))
+    return data_field, request_key, success, error_code, message
+
+
 async def get_tinkoff_pay_redirect_url(
     payment_id: int, version: str
 ) -> Tuple[str, str]:
@@ -939,6 +1009,7 @@ __all__ = [
     "get_add_card_state",
     "get_qr_bank_list",
     "check_tinkoff_pay_availability",
+    "add_account_qr",
     "get_tinkoff_pay_redirect_url",
     "get_tinkoff_pay_qr_svg",
     "get_sberpay_qr_svg",
