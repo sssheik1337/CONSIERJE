@@ -102,16 +102,25 @@ def _format_method_hint(method: str) -> str:
     return "картой" if method == "card" else "через СБП"
 
 
-def _build_consent_text(months: int, price: int) -> str:
+def _build_consent_text(months: int, price: int, auto_renew: bool) -> str:
     """Сформировать текст согласия на автосписания."""
 
     lines = [
         f"Условия подписки: сумма {price}₽, периодичность {months} мес.",
-        "Списания будут происходить автоматически,",
-        "пользователь может отменить через /support.",
-        "Нажимая кнопку, пользователь подтверждает согласие",
-        "на автоматические списания и условия подписки.",
     ]
+    if auto_renew:
+        lines.append("Автопродление активно. Списания будут происходить автоматически.")
+    else:
+        lines.append("Автопродление сейчас выключено.")
+        lines.append("Вы можете включить его позже в личном меню (кнопка «Автопродление»).")
+    lines.extend(
+        [
+            "Нажимая кнопку «Я согласен», пользователь подтверждает:",
+            "• согласие на автоматические списания (если автопродление включено);",
+            "• согласие с условиями подписки;",
+            "• что автопродление можно выключить в любой момент в личном меню бота.",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -1296,11 +1305,16 @@ async def handle_buy_cancel(callback: CallbackQuery) -> None:
 
 
 async def _send_payment_consent(
-    callback: CallbackQuery, method: str, months: int, price: int
+    callback: CallbackQuery,
+    method: str,
+    months: int,
+    price: int,
+    user_row: aiosqlite.Row | None,
 ) -> None:
     """Показать пользователю текст согласия перед созданием платежа."""
 
-    consent_text = _build_consent_text(months, price)
+    auto_flag = bool(_row_to_dict(user_row).get("auto_renew", DEFAULT_AUTO_RENEW))
+    consent_text = _build_consent_text(months, price, auto_flag)
     builder = InlineKeyboardBuilder()
     builder.button(text="✔ Я согласен", callback_data=f"buy:confirm:{method}:{months}")
     builder.button(text="❌ Отмена", callback_data="buy:cancel")
@@ -1344,8 +1358,9 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
     if price is None:
         await callback.answer("Тариф не найден.", show_alert=True)
         return
+    user_row = await db.get_user(user_id)
     if not confirmed:
-        await _send_payment_consent(callback, method, months, price)
+        await _send_payment_consent(callback, method, months, price, user_row)
         return
     method_hint = _format_method_hint(method)
     if method == "sbp":
