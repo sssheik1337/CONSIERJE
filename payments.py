@@ -242,22 +242,12 @@ async def init_sbp_payment(
     )
     order_id = _build_order_id("sbp", user_id, resolved_months)
     description = f"Подписка через СБП на {resolved_months} мес. (user {user_id})"
-    customer_key, user_row = await _ensure_customer_key(resolved_db, user_id)
-    if customer_key:
-        await _ensure_customer_registered(
-            resolved_db,
-            user_id,
-            customer_key,
-            user_row=user_row,
-        )
 
     try:
         response = await init_payment(
             amount=amount_minor,
             order_id=order_id,
             description=description,
-            customer_key=customer_key or str(user_id),
-            recurrent="Y",
             pay_type="O",
             extra={"QR": "true"},
             notification_url=config.TINKOFF_NOTIFY_URL or None,
@@ -398,14 +388,6 @@ async def charge_sbp_autopayment(
     resolved_months, _, amount_minor = _normalize_amount_inputs(
         months, amount, explicit_db=explicit_db
     )
-    customer_key, user_row = await _ensure_customer_key(resolved_db, user_id)
-    if customer_key:
-        await _ensure_customer_registered(
-            resolved_db,
-            user_id,
-            customer_key,
-            user_row=user_row,
-        )
     order_id = _build_order_id("sbp_auto", user_id, resolved_months)
     description = f"Автопродление подписки (СБП) на {resolved_months} мес."
 
@@ -413,8 +395,6 @@ async def charge_sbp_autopayment(
         amount=amount_minor,
         order_id=order_id,
         description=description,
-        customer_key=customer_key or str(user_id),
-        recurrent="Y",
         pay_type="O",
         extra={"QR": "true"},
         notification_url=config.TINKOFF_NOTIFY_URL or None,
@@ -490,7 +470,7 @@ async def create_payment(
             )
     user_row = await db_instance.get_user(user_id)
     auto_recurrent = False
-    customer_key_value: Optional[str] = None
+    customer_key_value: Optional[str] = str(user_id) if normalized_method == "card" else None
     if user_row is not None:
         try:
             auto_recurrent = bool(user_row["auto_renew"])
@@ -508,8 +488,7 @@ async def create_payment(
     if effective_recurrent is None:
         effective_recurrent = normalized_method == "card" and auto_recurrent
 
-    if effective_recurrent and not customer_key_value:
-        customer_key_value = str(user_id)
+    if normalized_method == "card" and customer_key_value:
         try:
             await db_instance.set_customer_key(user_id, customer_key_value)
         except Exception:  # noqa: BLE001
@@ -527,7 +506,7 @@ async def create_payment(
             amount=amount_minor,
             order_id=order_id,
             description=description,
-            customer_key=customer_key_value if effective_recurrent else None,
+            customer_key=customer_key_value if normalized_method == "card" else None,
             recurrent="Y" if effective_recurrent else None,
             success_url=config.T_PAY_SUCCESS_URL or None,
             fail_url=config.T_PAY_FAIL_URL or None,

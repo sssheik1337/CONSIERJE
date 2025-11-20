@@ -252,96 +252,99 @@ async def try_auto_renew(
 
 
 async def daily_check(bot: Bot, db: DB):
-    now_ts = int(datetime.utcnow().timestamp())
-    target_chat_id = await db.get_target_chat_id()
-    if target_chat_id is None:
-        logger.info("Пропуск проверки подписок: чат ещё не привязан.")
-        return
+    try:
+        now_ts = int(datetime.utcnow().timestamp())
+        target_chat_id = await db.get_target_chat_id()
+        if target_chat_id is None:
+            logger.info("Пропуск проверки подписок: чат ещё не привязан.")
+            return
 
-    expired = await db.list_expired(now_ts)
-    auto_success_count = 0
-    auto_fail_count = 0
-    auto_success_amount = 0
-    for row in expired:
-        user_id = int(row["user_id"])
+        expired = await db.list_expired(now_ts)
+        auto_success_count = 0
+        auto_fail_count = 0
+        auto_success_amount = 0
+        for row in expired:
+            user_id = int(row["user_id"])
 
-        renew_result = await try_auto_renew(bot, db, row, now_ts)
-        if renew_result.success:
-            auto_success_count += 1
-            auto_success_amount += max(0, renew_result.amount)
-            continue
-        if renew_result.attempted:
-            auto_fail_count += 1
+            renew_result = await try_auto_renew(bot, db, row, now_ts)
+            if renew_result.success:
+                auto_success_count += 1
+                auto_success_amount += max(0, renew_result.amount)
+                continue
+            if renew_result.attempted:
+                auto_fail_count += 1
 
-        row_dict = dict(row)
-        auto_flag = bool(row_dict.get("auto_renew"))
-        if auto_flag:
-            await db.set_auto_renew(user_id, False)
-
-        sbp_recent = False
-        if not renew_result.attempted and not auto_flag:
-            sbp_recent = await _was_last_payment_sbp(db, user_id)
-
-        try:
-            await db.log_payment_attempt(
-                user_id,
-                "EXPIRED",
-                "Подписка неактивна, пользователь будет удалён",
-                payment_type="sbp" if sbp_recent else "card",
-            )
-        except Exception:
-            logger.debug("Не удалось записать лог об удалении пользователя %s", user_id)
-
-        try:
-            await bot.ban_chat_member(target_chat_id, user_id)
-            await bot.unban_chat_member(target_chat_id, user_id)
-        except Exception:
-            logger.debug("Не удалось удалить пользователя %s из канала", user_id)
-        notify_text = None
-        notify_markup = None
-        if renew_result.attempted:
-            notify_text = FAILURE_MESSAGE
-            notify_markup = _retry_markup()
-            if renew_result.user_notified:
-                notify_text = None
-        else:
+            row_dict = dict(row)
+            auto_flag = bool(row_dict.get("auto_renew"))
             if auto_flag:
+                await db.set_auto_renew(user_id, False)
+
+            sbp_recent = False
+            if not renew_result.attempted and not auto_flag:
+                sbp_recent = await _was_last_payment_sbp(db, user_id)
+
+            try:
+                await db.log_payment_attempt(
+                    user_id,
+                    "EXPIRED",
+                    "Подписка неактивна, пользователь будет удалён",
+                    payment_type="sbp" if sbp_recent else "card",
+                )
+            except Exception:
+                logger.debug("Не удалось записать лог об удалении пользователя %s", user_id)
+
+            try:
+                await bot.ban_chat_member(target_chat_id, user_id)
+                await bot.unban_chat_member(target_chat_id, user_id)
+            except Exception:
+                logger.debug("Не удалось удалить пользователя %s из канала", user_id)
+            notify_text = None
+            notify_markup = None
+            if renew_result.attempted:
                 notify_text = FAILURE_MESSAGE
                 notify_markup = _retry_markup()
+                if renew_result.user_notified:
+                    notify_text = None
             else:
-                notify_text = EXPIRED_MESSAGE
-                if sbp_recent:
-                    notify_text = f"{notify_text}\n\n{SBP_NOTE}"
-        if notify_text:
-            try:
-                await bot.send_message(
-                    user_id,
-                    notify_text,
-                    reply_markup=notify_markup,
-                )
-            except Exception:
-                logger.debug(
-                    "Не удалось уведомить пользователя %s об окончании подписки",
-                    user_id,
-                )
+                if auto_flag:
+                    notify_text = FAILURE_MESSAGE
+                    notify_markup = _retry_markup()
+                else:
+                    notify_text = EXPIRED_MESSAGE
+                    if sbp_recent:
+                        notify_text = f"{notify_text}\n\n{SBP_NOTE}"
+            if notify_text:
+                try:
+                    await bot.send_message(
+                        user_id,
+                        notify_text,
+                        reply_markup=notify_markup,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Не удалось уведомить пользователя %s об окончании подписки",
+                        user_id,
+                    )
 
-    if auto_success_count or auto_fail_count:
-        summary_lines = [
-            "💳 Автосписания за последний цикл:",
-            f"✅ Успешно: {auto_success_count}",
-            f"⚠️ Ошибки: {auto_fail_count}",
-        ]
-        if auto_success_amount > 0:
-            summary_lines.append(f"💰 Сумма: {auto_success_amount / 100:.2f} ₽")
-        summary_text = "\n".join(summary_lines)
-        for admin_id in config.SUPER_ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, summary_text)
-            except Exception:
-                logger.debug(
-                    "Не удалось отправить администратору %s сводку автосписаний",
-                    admin_id,
-                )
+        if auto_success_count or auto_fail_count:
+            summary_lines = [
+                "💳 Автосписания за последний цикл:",
+                f"✅ Успешно: {auto_success_count}",
+                f"⚠️ Ошибки: {auto_fail_count}",
+            ]
+            if auto_success_amount > 0:
+                summary_lines.append(f"💰 Сумма: {auto_success_amount / 100:.2f} ₽")
+            summary_text = "\n".join(summary_lines)
+            for admin_id in config.SUPER_ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, summary_text)
+                except Exception:
+                    logger.debug(
+                        "Не удалось отправить администратору %s сводку автосписаний",
+                        admin_id,
+                    )
+    except asyncio.CancelledError:
+        return
 
 
 def setup_scheduler(bot: Bot, db: DB, tz_name: str = "Europe/Moscow") -> AsyncIOScheduler:

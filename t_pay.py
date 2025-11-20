@@ -804,62 +804,6 @@ async def get_add_card_state(request_key: str) -> Dict[str, Any]:
     )
 
 
-async def get_qr_bank_list(device_os: str = "android") -> Dict[str, Any]:
-    """Получить список банков, поддерживающих оплату через СБП (метод GetQrBankList)."""
-
-    (
-        base_url,
-        terminal_key,
-        password,
-        _,
-        _,
-        _,
-        api_token,
-    ) = _read_env()
-
-    normalized = (device_os or "android").strip().lower()
-    os_value = "iOS" if normalized.startswith("ios") else "Android"
-    payload: Dict[str, Any] = {
-        "ScenarioType": "qr",
-        "Device": {
-            "Type": "mobile",
-            "Os": os_value,
-        },
-    }
-    logger.info(
-        "GetQrBankList: base=%s os=%s",
-        base_url,
-        os_value,
-    )
-    return await _post(
-        "GetQrBankList",
-        payload,
-        base_url=base_url,
-        terminal_key=terminal_key,
-        password=password,
-        api_token=api_token,
-    )
-
-
-async def check_tinkoff_pay_availability(terminal_key: str) -> Tuple[bool, str]:
-    """Проверить доступность Tinkoff Pay для заданного терминала."""
-
-    url = (
-        "https://securepay.tinkoff.ru/v2/TinkoffPay/terminals/"
-        f"{terminal_key}/status"
-    )
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=10) as response:
-            response.raise_for_status()
-            data = await response.json()
-    if not data.get("Success", True):
-        print(f"Tinkoff Pay availability error: {data}")
-    params = data.get("Params") or {}
-    allowed = bool(params.get("Allowed"))
-    version = params.get("Version") or ""
-    return allowed, str(version)
-
-
 async def add_account_qr(
     terminal_key: str,
     description: str,
@@ -1034,97 +978,6 @@ async def charge_qr(
     }
 
 
-async def get_tinkoff_pay_redirect_url(
-    payment_id: int, version: str
-) -> Tuple[str, str]:
-    """Получить RedirectUrl/WebQR для оплаты через Tinkoff Pay."""
-
-    url = (
-        "https://securepay.tinkoff.ru/v2/TinkoffPay/transactions/"
-        f"{payment_id}/versions/{version}/link"
-    )
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=10) as response:
-            response.raise_for_status()
-            data = await response.json()
-    if not data.get("Success", True):
-        print(f"Tinkoff Pay link error: {data}")
-    params = data.get("Params") or {}
-    redirect_url = params.get("RedirectUrl") or ""
-    web_qr = params.get("WebQR") or ""
-    return str(redirect_url), str(web_qr)
-
-
-async def get_tinkoff_pay_qr_svg(payment_id: int) -> str:
-    """Получить SVG‑код QR для оплаты через Tinkoff Pay на десктопе."""
-
-    url = f"https://securepay.tinkoff.ru/v2/TinkoffPay/{payment_id}/QR"
-    headers = {"Accept": "image/svg"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, timeout=10) as response:
-            response.raise_for_status()
-            return await response.text()
-
-
-async def get_sberpay_qr_svg(payment_id: int) -> str:
-    """Получить SVG‑код QR для оплаты через SberPay на десктопе."""
-
-    url = f"https://securepay.tinkoff.ru/v2/SberPay/{payment_id}/QR"
-    headers = {"Accept": "image/svg"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, timeout=10) as response:
-            response.raise_for_status()
-            return await response.text()
-
-
-async def get_sberpay_redirect_url(payment_id: int) -> str:
-    """Получить RedirectUrl для оплаты через SberPay."""
-
-    url = f"https://securepay.tinkoff.ru/v2/SberPay/transactions/{payment_id}/link"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=10) as response:
-            response.raise_for_status()
-            data = await response.json()
-    if not data.get("Success", True):
-        print(f"SberPay link error: {data}")
-    params = data.get("Params") or {}
-    redirect_url = params.get("RedirectUrl") or ""
-    return str(redirect_url)
-
-
-async def get_mirpay_deeplink(terminal_key: str, payment_id: str, token: str) -> str:
-    """Получить deeplink для оплаты через MirPay."""
-
-    url = "https://securepay.tinkoff.ru/v2/MirPay/GetDeepLink"
-    payload = {
-        "TerminalKey": terminal_key,
-        "PaymentId": payment_id,
-        "Token": token,
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, headers=headers, timeout=10) as response:
-            response.raise_for_status()
-            data = await response.json()
-    if not data.get("Success", True):
-        print(
-            "MirPay deeplink error:",
-            data.get("ErrorCode"),
-            data.get("Message"),
-            data.get("Details"),
-        )
-        return ""
-    # Ответы MirPay могут содержать поле Deeplink в корне или внутри Params
-    deeplink = data.get("Deeplink")
-    if not deeplink:
-        params = data.get("Params") or {}
-        deeplink = params.get("Deeplink")
-    return str(deeplink or "")
-
-
 async def finish_authorize(
     payment_id: str,
     card_data: Dict[str, Any],
@@ -1200,15 +1053,8 @@ __all__ = [
     "get_add_card_state",
     "get_qr",
     "get_add_account_qr_state",
-    "get_qr_bank_list",
-    "check_tinkoff_pay_availability",
     "add_account_qr",
     "charge_qr",
-    "get_tinkoff_pay_redirect_url",
-    "get_tinkoff_pay_qr_svg",
-    "get_sberpay_qr_svg",
-    "get_sberpay_redirect_url",
-    "get_mirpay_deeplink",
     "finish_authorize",
     "net_diagnostics",
 ]
