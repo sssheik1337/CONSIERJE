@@ -179,7 +179,7 @@ async def tbank_notify(request: web.Request) -> web.Response:
             except Exception as err:  # noqa: BLE001
                 logger.exception("Ошибка обработки AccountToken", exc_info=err)
 
-        if status_upper == "CONFIRMED" and target_payment_id:
+        if status_upper in {"CONFIRMED", "AUTHORIZED"} and target_payment_id:
             payment_before = await db.get_payment_by_payment_id(target_payment_id)
             was_confirmed = False
             if payment_before is not None:
@@ -201,6 +201,19 @@ async def tbank_notify(request: web.Request) -> web.Response:
 
                     payment_type = payments.detect_payment_type(data)
                     is_sbp = payment_type == "sbp" or stored_method == "sbp"
+
+                    had_confirmed_card = False
+                    if user_id > 0:
+                        try:
+                            had_confirmed_card = await db.has_confirmed_card_payment(
+                                user_id, exclude_payment_id=target_payment_id
+                            )
+                        except Exception as err:  # noqa: BLE001
+                            logger.debug(
+                                "Не удалось проверить историю карточных платежей пользователя %s: %s",
+                                user_id,
+                                err,
+                            )
 
                     if user_id > 0 and months > 0 and not was_confirmed:
                         await _notify_user_payment_confirmed(
@@ -231,6 +244,19 @@ async def tbank_notify(request: web.Request) -> web.Response:
                                 await db.set_customer_key(user_id, str(customer_key))
                             if target_payment_id:
                                 await db.set_rebill_parent_payment(user_id, str(target_payment_id))
+                            if not had_confirmed_card:
+                                try:
+                                    await db.set_auto_renew(user_id, True)
+                                    logger.info(
+                                        "Автопродление включено после первой успешной оплаты картой для пользователя %s",
+                                        user_id,
+                                    )
+                                except Exception as err:  # noqa: BLE001
+                                    logger.debug(
+                                        "Не удалось автоматически включить автопродление пользователю %s: %s",
+                                        user_id,
+                                        err,
+                                    )
         elif status_upper:
             if target_payment_id:
                 await db.set_payment_status(target_payment_id, status_upper)

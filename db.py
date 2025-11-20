@@ -986,6 +986,25 @@ class DB:
             await db.commit()
             return cur.rowcount > 0
 
+    async def has_confirmed_card_payment(
+        self, user_id: int, exclude_payment_id: Optional[str] = None
+    ) -> bool:
+        """Проверить, есть ли у пользователя подтверждённые оплаты картой."""
+
+        query = (
+            "SELECT 1 FROM payments WHERE user_id=? AND method='card' "
+            "AND UPPER(status)='CONFIRMED'"
+        )
+        params: list[object] = [user_id]
+        if exclude_payment_id:
+            query += " AND payment_id<>?"
+            params.append(exclude_payment_id)
+        query += " LIMIT 1"
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(query, params)
+            row = await cur.fetchone()
+            return row is not None
+
     async def get_payment_by_payment_id(
         self, payment_id: str
     ) -> Optional[aiosqlite.Row]:

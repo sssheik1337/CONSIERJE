@@ -102,26 +102,29 @@ def _format_method_hint(method: str) -> str:
     return "картой" if method == "card" else "через СБП"
 
 
-def _build_consent_text(months: int, price: int, auto_renew: bool) -> str:
-    """Сформировать текст согласия на автосписания."""
+def _build_consent_text(months: int, price: int, method: str) -> str:
+    """Сформировать текст согласия перед оплатой в зависимости от метода."""
 
-    lines = [
-        f"Условия подписки: сумма {price}₽, периодичность {months} мес.",
-    ]
-    if auto_renew:
-        lines.append("Автопродление активно. Списания будут происходить автоматически.")
-    else:
-        lines.append("Автопродление сейчас выключено.")
-        lines.append("Вы можете включить его позже в личном меню (кнопка «Автопродление»).")
-    lines.extend(
-        [
-            "Нажимая кнопку «Я согласен», пользователь подтверждает:",
-            "• согласие на автоматические списания (если автопродление включено);",
-            "• согласие с условиями подписки;",
-            "• что автопродление можно выключить в любой момент в личном меню бота.",
+    base = [f"Условия подписки: сумма {price}₽, периодичность {months} мес."]
+    if method == "sbp":
+        details = [
+            "",
+            "При оплате через СБП автопродление не будет подключено автоматически.",
+            "Вы сможете включить его вручную позже в личном меню бота.",
+            "",
+            "Списания будут происходить только если автопродление включено вручную.",
+            "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
         ]
-    )
-    return "\n".join(lines)
+    else:
+        details = [
+            "",
+            "При оплате картой автопродление будет включено автоматически.",
+            "Вы сможете отключить его в любой момент в личном меню бота (кнопка «Автопродление»).",
+            "",
+            "Списания будут происходить автоматически, если автопродление активно.",
+            "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
+        ]
+    return "\n".join(base + details)
 
 
 async def _ensure_subscription_state(
@@ -1313,8 +1316,7 @@ async def _send_payment_consent(
 ) -> None:
     """Показать пользователю текст согласия перед созданием платежа."""
 
-    auto_flag = bool(_row_to_dict(user_row).get("auto_renew", DEFAULT_AUTO_RENEW))
-    consent_text = _build_consent_text(months, price, auto_flag)
+    consent_text = _build_consent_text(months, price, method)
     builder = InlineKeyboardBuilder()
     builder.button(text="✔ Я согласен", callback_data=f"buy:confirm:{method}:{months}")
     builder.button(text="❌ Отмена", callback_data="buy:cancel")
