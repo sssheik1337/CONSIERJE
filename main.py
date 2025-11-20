@@ -21,7 +21,7 @@ import payments
 import t_pay
 from config import config
 from db import DB
-from handlers import handle_sbp_notification_payload, router
+from handlers import get_user_menu, handle_sbp_notification_payload, router
 from logger import logger
 from scheduler import setup_scheduler
 
@@ -86,7 +86,12 @@ async def _notify_user_payment_confirmed(
         message_parts.append(f"⚠️ {payments.SBP_NOTE}")
 
     try:
-        await bot.send_message(user_id, " ".join(message_parts))
+        reply_markup = await get_user_menu(db, user_id)
+    except Exception:  # noqa: BLE001
+        reply_markup = None
+
+    try:
+        await bot.send_message(user_id, " ".join(message_parts), reply_markup=reply_markup)
     except Exception as err:  # noqa: BLE001
         logger.exception("Не удалось уведомить пользователя о подтверждении оплаты", exc_info=err)
 
@@ -202,19 +207,6 @@ async def tbank_notify(request: web.Request) -> web.Response:
                     payment_type = payments.detect_payment_type(data)
                     is_sbp = payment_type == "sbp" or stored_method == "sbp"
 
-                    had_confirmed_card = False
-                    if user_id > 0:
-                        try:
-                            had_confirmed_card = await db.has_confirmed_card_payment(
-                                user_id, exclude_payment_id=target_payment_id
-                            )
-                        except Exception as err:  # noqa: BLE001
-                            logger.debug(
-                                "Не удалось проверить историю карточных платежей пользователя %s: %s",
-                                user_id,
-                                err,
-                            )
-
                     if user_id > 0 and months > 0 and not was_confirmed:
                         await _notify_user_payment_confirmed(
                             bot, db, user_id, months, sbp_hint=is_sbp
@@ -236,6 +228,12 @@ async def tbank_notify(request: web.Request) -> web.Response:
                                 note="Оплата через СБП подтверждена, автопродление отключено.",
                             )
                         else:
+                            auto_enabled = False
+                            try:
+                                user_data = await db.get_user(user_id)
+                                auto_enabled = bool(user_data and user_data["auto_renew"])
+                            except Exception:  # noqa: BLE001
+                                auto_enabled = False
                             rebill_id = data.get("RebillId") or data.get("rebill_id")
                             if rebill_id:
                                 await db.set_rebill_id(user_id, str(rebill_id))
@@ -244,11 +242,11 @@ async def tbank_notify(request: web.Request) -> web.Response:
                                 await db.set_customer_key(user_id, str(customer_key))
                             if target_payment_id:
                                 await db.set_rebill_parent_payment(user_id, str(target_payment_id))
-                            if not had_confirmed_card:
+                            if not auto_enabled:
                                 try:
                                     await db.set_auto_renew(user_id, True)
                                     logger.info(
-                                        "Автопродление включено после первой успешной оплаты картой для пользователя %s",
+                                        "Автопродление включено после подтверждённой оплаты картой для пользователя %s",
                                         user_id,
                                     )
                                 except Exception as err:  # noqa: BLE001

@@ -563,6 +563,10 @@ async def apply_successful_payment(payment_id: str, db: DB) -> bool:
 
     user_id = int(payment["user_id"] or 0)
     months = int(payment["months"] or 0)
+    try:
+        method = str(payment["method"] or "")
+    except Exception:  # noqa: BLE001
+        method = ""
     if user_id <= 0 or months <= 0:
         logger.warning(
             "Пропущено применение платежа %s: неверные данные user_id=%s, months=%s",
@@ -575,6 +579,22 @@ async def apply_successful_payment(payment_id: str, db: DB) -> bool:
     await db.set_payment_status(payment_id, "CONFIRMED")
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
+    is_sbp_payment = method.strip().lower() == "sbp"
+    if not is_sbp_payment:
+        try:
+            is_sbp_payment = bool(payment["is_sbp"])  # type: ignore[index]
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not is_sbp_payment:
+        try:
+            await db.set_auto_renew(user_id, True)
+        except Exception as err:  # noqa: BLE001
+            logger.debug(
+                "Не удалось автоматически включить автопродление для пользователя %s: %s",
+                user_id,
+                err,
+            )
     return True
 
 
@@ -663,6 +683,14 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
                     "Не удалось сохранить родительский платёж %s для пользователя %s: %s",
                     payment_id,
                     user_id,
+                    err,
+                )
+            try:
+                await db_instance.set_auto_renew(user_id, True)
+            except Exception as err:  # noqa: BLE001
+                logger.debug(
+                    "Не удалось включить автопродление после подтверждения платежа %s: %s",
+                    payment_id,
                     err,
                 )
     return status == "CONFIRMED"

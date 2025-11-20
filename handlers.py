@@ -1497,6 +1497,15 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
     await db.set_payment_status(payment_id, "CONFIRMED")
+    if not is_sbp_payment:
+        try:
+            await db.set_auto_renew(user_id, True)
+        except Exception as err:  # noqa: BLE001
+            logger.debug(
+                "Не удалось включить автопродление после подтверждения платежа %s: %s",
+                payment_id,
+                err,
+            )
 
     subscription_end = await db.get_subscription_end(user_id) or 0
     formatted_expiry = format_expiry(subscription_end) if subscription_end else None
