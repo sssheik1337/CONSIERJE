@@ -162,7 +162,7 @@ async def _ensure_subscription_state(
         expires_at = _safe_int(row_data.get("expires_at"))
         now_ts = int(datetime.utcnow().timestamp())
 
-    blocked = expires_at <= now_ts and not auto_flag
+    blocked = expires_at <= now_ts
     return user_row, blocked
 
 
@@ -561,13 +561,7 @@ async def get_user_menu(
     """Получить клавиатуру пользователя с актуальными данными."""
 
     user = cached_user or await db.get_user(user_id)
-    now_ts = int(datetime.utcnow().timestamp())
     auto_flag = bool(user and user["auto_renew"])
-    if blocked is None:
-        expires_at = _safe_int(user["expires_at"]) if user else 0
-        blocked = expires_at <= now_ts and not auto_flag
-    if blocked:
-        return build_subscription_purchase_menu()
     price_months = [months for months, _ in await db.get_all_prices()]
     return build_user_menu_keyboard(auto_flag, is_super_admin(user_id), price_months)
 
@@ -583,10 +577,9 @@ async def compose_main_menu_text(
 
     now_ts = int(datetime.utcnow().timestamp())
     user = cached_user or await db.get_user(user_id)
-    auto_flag = bool(user and user["auto_renew"])
     if blocked is None:
         expires_at = _safe_int(user["expires_at"]) if user else 0
-        blocked = expires_at <= now_ts and not auto_flag
+        blocked = expires_at <= now_ts
     trial_end = 0
     if user and hasattr(user, "keys") and "trial_end" in user.keys():
         try:
@@ -594,14 +587,10 @@ async def compose_main_menu_text(
         except (TypeError, ValueError):
             trial_end = 0
     subscription_end = await db.get_subscription_end(user_id) or 0
-    if blocked:
-        status_line = "⛔ Подписка неактивна. Нажмите «Оформить подписку», чтобы восстановить доступ."
-    elif trial_end and now_ts < trial_end:
+    if trial_end and now_ts < trial_end:
         status_line = f"🧪 Пробный период до: {format_short_date(trial_end)}"
     elif subscription_end and now_ts < subscription_end:
         status_line = f"✅ Подписка активна до: {format_short_date(subscription_end)}"
-    elif auto_flag:
-        status_line = "⏳ Выполняется автопродление. Повторите попытку через пару минут."
     else:
         status_line = "⛔ Нет активной подписки. Доступ к каналу закрыт."
     return f"{status_line}\n\n{START_TEXT}"
@@ -1600,7 +1589,8 @@ async def handle_toggle_autorenew(callback: CallbackQuery, db: DB) -> None:
     await db.set_auto_renew(user_id, new_flag)
     if callback.message:
         await refresh_user_menu(callback.message, db, user_id)
-    await callback.answer("Статус обновлён.")
+    message = "Автопродление включено." if new_flag else "Автопродление отключено."
+    await callback.answer(message)
 
 
 @router.callback_query(F.data == "card:bind")
