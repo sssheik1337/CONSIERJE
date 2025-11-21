@@ -1389,14 +1389,21 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
         builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
         builder.button(text="🏠 Главное меню", callback_data="menu:home")
         builder.adjust(1)
-        payload_text = qr_result.get("payload") or "(данные QR недоступны)"
+        payload_text = (
+            qr_result.get("qr_url")
+            or qr_result.get("payload")
+            or "(данные QR недоступны)"
+        )
+        payload_label = (
+            "Ссылка для оплаты через СБП:" if qr_result.get("qr_url") else "QR payload:"
+        )
         message_lines = [
             "📲 Оплата подписки через СБП.",
             f"Срок: {months} мес., сумма: {price}₽.",
             "Отсканируйте QR-код в приложении банка.",
             SBP_NOTE,
             "",
-            "QR payload:",
+            payload_label,
             str(payload_text),
         ]
         if callback.message:

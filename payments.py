@@ -304,18 +304,29 @@ async def form_sbp_qr(
         or response.get("Payload")
     )
     request_key = params.get("RequestKey") or response.get("RequestKey")
-    if not request_key:
-        logger.error("GetQr вернул неожиданный ответ без RequestKey: %s", response)
-        return None
+    if request_key:
+        await resolved_db.save_request_key(user_id, request_key, status="NEW")
+        await resolved_db.set_payment_request_key(payment_id, request_key)
 
-    await resolved_db.save_request_key(user_id, request_key, status="NEW")
-    await resolved_db.set_payment_request_key(payment_id, request_key)
+        return {
+            "success": True,
+            "payload": payload,
+            "request_key": request_key,
+            "payment_id": payment_id,
+        }
 
-    return {
-        "payload": payload,
-        "request_key": request_key,
-        "payment_id": payment_id,
-    }
+    if payload:
+        logger.info(
+            "GetQr вернул готовую ссылку для СБП без RequestKey: %s", response
+        )
+        return {
+            "success": True,
+            "payment_id": payment_id,
+            "qr_url": payload,
+        }
+
+    logger.error("GetQr не вернул ни RequestKey, ни Data: %s", response)
+    raise RuntimeError("GetQr не вернул ни RequestKey, ни Data")
 
 
 async def get_sbp_link_status(
