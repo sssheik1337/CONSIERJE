@@ -284,7 +284,7 @@ async def form_sbp_qr(
     *,
     db: Optional[DB] = None,
     data_type: str = "PAYLOAD",
-) -> dict[str, Any]:
+) -> Optional[dict[str, Any]]:
     """Запросить QR для оплаты через СБП и сохранить RequestKey."""
 
     if user_id <= 0 or not payment_id:
@@ -305,7 +305,8 @@ async def form_sbp_qr(
     )
     request_key = params.get("RequestKey") or response.get("RequestKey")
     if not request_key:
-        raise RuntimeError("GetQr не вернул RequestKey")
+        logger.error("GetQr вернул неожиданный ответ без RequestKey: %s", response)
+        return None
 
     await resolved_db.save_request_key(user_id, request_key, status="NEW")
     await resolved_db.set_payment_request_key(payment_id, request_key)

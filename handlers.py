@@ -1378,6 +1378,13 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
             )
             return
 
+        if qr_result is None:
+            warning_text = "❗ Ошибка получения QR для СБП. Попробуйте позже или оплатите картой."
+            if callback.message:
+                await callback.message.answer(warning_text)
+            await callback.answer(warning_text, show_alert=True)
+            return
+
         builder = InlineKeyboardBuilder()
         builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
         builder.button(text="🏠 Главное меню", callback_data="menu:home")
