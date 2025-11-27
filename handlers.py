@@ -526,7 +526,6 @@ def build_user_menu_keyboard(
             text=f"💳 Купить {months} мес",
             callback_data=f"buy:months:{months}",
         )
-    builder.button(text="💳 Оплатить картой", callback_data="buy:open:card")
     builder.button(text="📲 Оплатить через СБП", callback_data="buy:open:sbp")
     builder.button(
         text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
@@ -545,7 +544,6 @@ def build_subscription_purchase_menu() -> InlineKeyboardMarkup:
     """Построить меню для пользователя без активной подписки."""
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Оплатить картой", callback_data="buy:open:card")
     builder.button(text="📲 Оплатить через СБП", callback_data="buy:open:sbp")
     builder.adjust(1)
     return builder.as_markup()
@@ -1810,7 +1808,6 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     if not has_active_subscription and not has_active_trial:
         if callback.message:
             builder = InlineKeyboardBuilder()
-            builder.button(text="💳 Оплатить картой", callback_data="buy:open:card")
             builder.button(text="📲 Оплатить через СБП", callback_data="buy:open:sbp")
             builder.button(text="🎟 Ввести промокод", callback_data="promo:enter")
             builder.button(text="🏠 Главное меню", callback_data="menu:home")
