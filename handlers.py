@@ -2199,7 +2199,7 @@ async def price_add_months(message: Message, state: FSMContext, db: DB, bot: Bot
     await state.update_data(new_price_months=months)
     await state.set_state(AdminPrice.AddPrice)
     await message.answer(
-        escape_md("Введите цену в ₽ (целое, ≥0)."),
+        escape_md("Введите цену в ₽ (целое, ≥10)."),
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
         reply_markup=CANCEL_REPLY,
@@ -2235,9 +2235,9 @@ async def price_add_price(message: Message, state: FSMContext, db: DB, bot: Bot)
         )
         return
     price = int(text)
-    if price < 0:
+    if price < 10:
         await message.answer(
-            escape_md("Цена должна быть ≥0."),
+            escape_md("Цена должна быть не меньше 10 ₽ из-за ограничений СБП."),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
@@ -2305,7 +2305,7 @@ async def price_edit_price(callback: CallbackQuery, state: FSMContext) -> None:
     )
     if callback.message:
         await callback.message.answer(
-            escape_md("Введите новую цену в ₽ (целое, ≥0)."),
+            escape_md("Введите новую цену в ₽ (целое, ≥10)."),
             reply_markup=CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
@@ -2342,9 +2342,9 @@ async def price_edit_price_input(message: Message, state: FSMContext, db: DB, bo
         )
         return
     new_price = int(text)
-    if new_price < 0:
+    if new_price < 10:
         await message.answer(
-            escape_md("Цена должна быть ≥0."),
+            escape_md("Цена должна быть не меньше 10 ₽ из-за ограничений СБП."),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
@@ -2472,6 +2472,19 @@ async def price_edit_months_input(message: Message, state: FSMContext, db: DB, b
         await render_price_list_by_state(bot, state, db)
         await state.clear()
         return
+    if current_price < 10:
+        await message.answer(
+            escape_md(
+                "Сначала обновите цену тарифа до 10 ₽ и выше, затем меняйте длительность."
+            ),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await render_price_list_by_state(bot, state, db)
+        await state.clear()
+        return
+
     await db.upsert_price(new_months, current_price)
     await db.delete_price(int(old_months))
     await message.answer(

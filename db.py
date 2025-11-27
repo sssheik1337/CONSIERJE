@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE TABLE IF NOT EXISTS prices (
     months INTEGER PRIMARY KEY,
-    price  INTEGER NOT NULL CHECK(price>=0),
+    price  INTEGER NOT NULL CHECK(price>=10),
     CHECK(months>=1)
 );
 
@@ -689,7 +689,7 @@ class DB:
                     price = int(value)
                 except (TypeError, ValueError):
                     continue
-                if months < 1 or price < 0:
+                if months < 1 or price < 10:
                     continue
                 entries.append((months, price))
         if not entries:
@@ -704,6 +704,9 @@ class DB:
         return entries
 
     async def upsert_price(self, months: int, price: int) -> None:
+        if price < 10:
+            # Минимальная стоимость тарифа ограничена правилами СБП.
+            raise ValueError("Минимальная цена тарифа — 10 ₽.")
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 "INSERT OR REPLACE INTO prices(months, price) VALUES(?, ?)",
