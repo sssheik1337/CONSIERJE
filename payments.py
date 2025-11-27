@@ -10,10 +10,8 @@ from logger import logger
 from t_pay import (
     TBankApiError,
     TBankHttpError,
-    add_customer,
     charge_qr,
     get_add_account_qr_state,
-    get_customer,
     get_payment_state,
     get_qr,
     init_payment,
@@ -60,107 +58,6 @@ def _build_order_id(prefix: str, user_id: int, months: int) -> str:
     """Сформировать order_id с учётом пользователя и срока."""
 
     return f"{prefix}_{user_id}_{months}_{int(time.time())}"
-
-
-def _extract_row_text(row: Mapping[str, Any] | None, key: str) -> Optional[str]:
-    """Безопасно получить строковое значение из строки БД."""
-
-    if row is None:
-        return None
-    getter = getattr(row, "get", None)
-    if callable(getter):
-        try:
-            value = getter(key)
-        except Exception:  # noqa: BLE001
-            value = None
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
-
-    mapping: Mapping[str, Any]
-    if isinstance(row, Mapping):
-        mapping = row
-    elif hasattr(row, "keys"):
-        try:
-            mapping = {column: row[column] for column in row.keys()}
-        except Exception:  # noqa: BLE001
-            mapping = {}
-    else:
-        try:
-            mapping = dict(row)  # type: ignore[arg-type]
-        except Exception:  # noqa: BLE001
-            mapping = {}
-
-    value = mapping.get(key)
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-async def _ensure_customer_key(
-    db: DB, user_id: int, *, user_row: Mapping[str, Any] | None = None
-) -> tuple[Optional[str], Mapping[str, Any] | None]:
-    """Убедиться, что у пользователя сохранён CustomerKey."""
-
-    if user_id <= 0:
-        return None, user_row
-    if user_row is None:
-        user_row = await db.get_user(user_id)
-    customer_key = _extract_row_text(user_row, "customer_key")
-    if not customer_key:
-        customer_key = str(user_id)
-        try:
-            await db.set_customer_key(user_id, customer_key)
-        except Exception:  # noqa: BLE001
-            logger.debug("Не удалось сохранить CustomerKey для пользователя %s", user_id)
-    return customer_key, user_row
-
-
-async def _ensure_customer_registered(
-    db: DB,
-    user_id: int,
-    customer_key: str,
-    *,
-    user_row: Mapping[str, Any] | None = None,
-) -> None:
-    """Проверить наличие клиента в T-Bank и зарегистрировать при необходимости."""
-
-    if user_id <= 0 or not customer_key:
-        return
-    try:
-        already_marked = await db.is_customer_registered(user_id)
-    except AttributeError:
-        already_marked = False
-    if already_marked:
-        return
-
-    # Сначала пытаемся получить клиента — если существует, просто запоминаем флаг.
-    try:
-        await get_customer(customer_key)
-    except TBankApiError as err:
-        logger.info(
-            "Клиент %s отсутствует в T-Bank, требуется регистрация: %s",
-            customer_key,
-            err,
-        )
-    else:
-        await db.set_customer_registered(user_id, True)
-        return
-
-    email = _extract_row_text(user_row, "email")
-    phone = _extract_row_text(user_row, "phone")
-    try:
-        await add_customer(customer_key, email=email, phone=phone)
-    except (TBankHttpError, TBankApiError) as err:
-        logger.error(
-            "Не удалось зарегистрировать клиента %s в T-Bank: %s",
-            customer_key,
-            err,
-        )
-        raise
-    await db.set_customer_registered(user_id, True)
 
 
 def _value_contains_sbp(value: Any) -> bool:
@@ -444,121 +341,6 @@ async def charge_sbp_autopayment(
     }
 
 
-async def create_payment(
-    user_id: int,
-    months: int,
-    amount: int,
-    db: Optional[DB] = None,
-    *,
-    payment_method: str = "card",
-    force_recurrent: Optional[bool] = None,
-) -> str:
-    """Создать платёж через T-Bank и вернуть ссылку на оплату."""
-
-    if user_id <= 0:
-        raise ValueError("Некорректный идентификатор пользователя")
-
-    explicit_db = db is not None
-    db_instance = db or _get_db()
-
-    # Поддержка старого порядка аргументов: create_payment(user_id, price, months)
-    resolved_months, resolved_amount, amount_minor = _normalize_amount_inputs(
-        months, amount, explicit_db=explicit_db
-    )
-
-    order_id = f"{user_id}_{resolved_months}_{int(time.time())}"
-    description = f"Подписка на {resolved_months} мес. (user {user_id})"
-
-    normalized_method = (payment_method or "card").strip().lower()
-    if normalized_method not in {"card", "sbp"}:
-        normalized_method = "card"
-    if normalized_method == "sbp":
-        try:
-            await db_instance.set_auto_renew(user_id, False)
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "Не удалось сразу отключить автопродление перед оплатой через СБП для %s",
-                user_id,
-            )
-    user_row = await db_instance.get_user(user_id)
-    auto_recurrent = False
-    customer_key_value: Optional[str] = str(user_id) if normalized_method == "card" else None
-    if user_row is not None:
-        try:
-            auto_recurrent = bool(user_row["auto_renew"])
-        except (KeyError, TypeError, ValueError):
-            auto_recurrent = False
-        try:
-            stored_key_raw = user_row["customer_key"]
-        except (KeyError, TypeError, ValueError):
-            stored_key_raw = None
-        stored_key = str(stored_key_raw).strip() if stored_key_raw not in (None, "") else ""
-        if stored_key:
-            customer_key_value = stored_key
-
-    effective_recurrent = force_recurrent
-    if effective_recurrent is None:
-        effective_recurrent = normalized_method == "card" and auto_recurrent
-
-    if normalized_method == "card" and customer_key_value:
-        try:
-            await db_instance.set_customer_key(user_id, customer_key_value)
-        except Exception:  # noqa: BLE001
-            logger.debug("Не удалось сохранить CustomerKey для пользователя %s", user_id)
-    if effective_recurrent and customer_key_value:
-        await _ensure_customer_registered(
-            db_instance,
-            user_id,
-            customer_key_value,
-            user_row=user_row,
-        )
-
-    try:
-        response = await init_payment(
-            amount=amount_minor,
-            order_id=order_id,
-            description=description,
-            customer_key=customer_key_value if normalized_method == "card" else None,
-            recurrent="Y" if effective_recurrent else None,
-            success_url=config.T_PAY_SUCCESS_URL or None,
-            fail_url=config.T_PAY_FAIL_URL or None,
-            notification_url=config.TINKOFF_NOTIFY_URL or None,
-        )
-    except (TBankHttpError, TBankApiError) as err:
-        logger.error("Некорректный ответ Init: %s", err)
-        raise RuntimeError(str(err)) from err
-    except Exception as err:  # noqa: BLE001
-        logger.error("Неожиданная ошибка при создании платежа: %s", err)
-        raise RuntimeError(str(err)) from err
-
-    if not response:
-        raise RuntimeError("Не удалось создать платёж через T-Bank")
-
-    payment_url = response.get("PaymentURL")
-    payment_id = response.get("PaymentId")
-    success_flag = response.get("Success")
-    if not payment_url or not payment_id:
-        message = response.get("Message") or response.get("Details") or ""
-        logger.error("Некорректный ответ Init: %s", response)
-        raise RuntimeError(message or "Не удалось создать платёж через T-Bank")
-    if success_flag is False:
-        error_text = response.get("Message") or response.get("Details") or "Ошибка создания платежа"
-        logger.error("Создание платежа завершилось с ошибкой: %s", response)
-        raise RuntimeError(error_text)
-
-    logger.info("Payment created: order=%s, payment_id=%s", order_id, response.get("PaymentId"))
-
-    await db_instance.add_payment(
-        user_id=user_id,
-        payment_id=str(payment_id),
-        order_id=order_id,
-        amount=amount_minor,
-        months=resolved_months,
-        method=normalized_method,
-    )
-    return str(payment_url)
-
-
 async def apply_successful_payment(payment_id: str, db: DB) -> bool:
     """Идемпотентно применить успешный платёж и продлить подписку."""
 
@@ -665,46 +447,6 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
                 user_id,
                 note="Оплата через СБП подтверждена вручную, автопродление отключено.",
             )
-        elif user_id > 0:
-            rebill_id = response.get("RebillId") or response.get("rebillId")
-            if rebill_id:
-                try:
-                    await db_instance.set_rebill_id(user_id, str(rebill_id))
-                except Exception as err:  # noqa: BLE001
-                    logger.debug(
-                        "Не удалось сохранить RebillId %s для пользователя %s: %s",
-                        rebill_id,
-                        user_id,
-                        err,
-                    )
-            customer_key = response.get("CustomerKey") or response.get("customerKey")
-            if customer_key:
-                try:
-                    await db_instance.set_customer_key(user_id, str(customer_key))
-                except Exception as err:  # noqa: BLE001
-                    logger.debug(
-                        "Не удалось сохранить CustomerKey %s для пользователя %s: %s",
-                        customer_key,
-                        user_id,
-                        err,
-                    )
-            try:
-                await db_instance.set_rebill_parent_payment(user_id, str(payment_id))
-            except Exception as err:  # noqa: BLE001
-                logger.debug(
-                    "Не удалось сохранить родительский платёж %s для пользователя %s: %s",
-                    payment_id,
-                    user_id,
-                    err,
-                )
-            try:
-                await db_instance.set_auto_renew(user_id, True)
-            except Exception as err:  # noqa: BLE001
-                logger.debug(
-                    "Не удалось включить автопродление после подтверждения платежа %s: %s",
-                    payment_id,
-                    err,
-                )
     return status == "CONFIRMED"
 
 
@@ -713,7 +455,6 @@ __all__ = [
     "apply_successful_payment",
     "check_payment_status",
     "charge_sbp_autopayment",
-    "create_payment",
     "detect_payment_type",
     "disable_auto_renew_for_sbp",
     "form_sbp_qr",
