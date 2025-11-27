@@ -19,8 +19,6 @@ from t_pay import (
 
 _payment_db: Optional[DB] = None
 
-SBP_NOTE = "Оплата через СБП не продлевается автоматически."
-
 
 def set_db(database: DB) -> None:
     """Задать экземпляр базы данных для работы с платежами."""
@@ -453,7 +451,6 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
 
 
 __all__ = [
-    "SBP_NOTE",
     "apply_successful_payment",
     "check_payment_status",
     "charge_sbp_autopayment",

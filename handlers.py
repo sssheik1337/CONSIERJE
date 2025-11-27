@@ -26,7 +26,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import config, get_docs_map
 from db import DB
 from logger import logger
-from payments import SBP_NOTE, check_payment_status, form_sbp_qr, init_sbp_payment
+from payments import check_payment_status, form_sbp_qr, init_sbp_payment
 from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
 
 router = Router()
@@ -94,10 +94,9 @@ def _build_consent_text(months: int, price: int, method: str) -> str:
     if method == "sbp":
         details = [
             "",
-            "При оплате через СБП автопродление не будет подключено автоматически.",
-            "Вы сможете включить его вручную позже в личном меню бота.",
+            "Оплата проходит через СБП.",
+            "Автопродление работает при привязанном счёте и включённом тумблере в личном меню бота.",
             "",
-            "Списания будут происходить только если автопродление включено вручную.",
             "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
         ]
     else:
@@ -506,12 +505,7 @@ def build_user_menu_keyboard(
     """Собрать пользовательскую inline-клавиатуру."""
 
     builder = InlineKeyboardBuilder()
-    for months in price_months[:6]:
-        builder.button(
-            text=f"💳 Купить {months} мес",
-            callback_data=f"buy:months:{months}",
-        )
-    builder.button(text="📲 Оплатить через СБП", callback_data="buy:open:sbp")
+    builder.button(text="💳 Купить подписку", callback_data="buy:open:sbp")
     builder.button(
         text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
         callback_data="ar:toggle",
@@ -521,7 +515,7 @@ def build_user_menu_keyboard(
     builder.button(text="📄 Документы", callback_data="docs:open")
     if is_admin:
         builder.button(text="🛠️ Админ-панель", callback_data="admin:open")
-    builder.adjust(2, 2, 2, 1)
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -529,7 +523,7 @@ def build_subscription_purchase_menu() -> InlineKeyboardMarkup:
     """Построить меню для пользователя без активной подписки."""
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="📲 Оплатить через СБП", callback_data="buy:open:sbp")
+    builder.button(text="💳 Купить подписку", callback_data="buy:open:sbp")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -1257,8 +1251,6 @@ async def handle_buy_open(callback: CallbackQuery, db: DB) -> None:
     if callback.message:
         method_hint = _format_method_hint(method)
         message_text = f"Выберите срок подписки для оплаты {method_hint}:"
-        if method == "sbp":
-            message_text = f"{message_text}\n\n{SBP_NOTE}"
         await callback.message.answer(
             message_text,
             reply_markup=builder.as_markup(),
@@ -1380,7 +1372,6 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
             "📲 Оплата подписки через СБП.",
             f"Срок: {months} мес., сумма: {price}₽.",
             "Отсканируйте QR-код в приложении банка.",
-            SBP_NOTE,
         ]
 
         if not qr_url:
@@ -1481,8 +1472,6 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
             )
         else:
             display_text = "✅ Оплата подтверждена и подписка продлена."
-        if is_sbp_payment:
-            display_text = f"{display_text}\n\n{SBP_NOTE}"
         await callback.message.answer(
             escape_md(display_text),
             reply_markup=main_menu_markup(),

@@ -14,7 +14,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from config import config
 from db import DB
 from logger import logger
-from payments import SBP_NOTE, charge_sbp_autopayment
+from payments import charge_sbp_autopayment
 from t_pay import TBankApiError, TBankHttpError
 
 DEFAULT_RECURRENT_IP = "127.0.0.1"
@@ -289,8 +289,6 @@ async def daily_check(bot: Bot, db: DB):
                     notify_markup = _retry_markup()
                 else:
                     notify_text = EXPIRED_MESSAGE
-                    if sbp_recent:
-                        notify_text = f"{notify_text}\n\n{SBP_NOTE}"
             if notify_text:
                 try:
                     await bot.send_message(

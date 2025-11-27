@@ -82,9 +82,6 @@ async def _notify_user_payment_confirmed(
     ]
     if expiry_text:
         message_parts.append(f"Новая дата окончания: {expiry_text}.")
-    if sbp_hint:
-        message_parts.append(f"⚠️ {payments.SBP_NOTE}")
-
     try:
         reply_markup = await get_user_menu(db, user_id)
     except Exception:  # noqa: BLE001
