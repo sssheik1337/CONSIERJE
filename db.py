@@ -22,11 +22,7 @@ CREATE TABLE IF NOT EXISTS users (
     invite_issued INTEGER NOT NULL DEFAULT 0,
     trial_start INTEGER DEFAULT 0,
     trial_end INTEGER DEFAULT 0,
-    email TEXT,
-    rebill_id TEXT,
-    rebill_parent_payment TEXT,
-    customer_key TEXT,
-    card_request_key TEXT
+    email TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -50,10 +46,7 @@ CREATE TABLE IF NOT EXISTS coupons (
 CREATE TABLE IF NOT EXISTS subscriptions (
     user_id INTEGER PRIMARY KEY,
     end_at INTEGER,
-    updated_at INTEGER,
-    rebill_id TEXT,
-    customer_key TEXT,
-    rebill_parent_payment TEXT
+    updated_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS coupon_usages (
@@ -120,12 +113,12 @@ CREATE INDEX IF NOT EXISTS idx_sbp_links_request_key ON sbp_links(request_key);
 """
 
 COUPON_CODE_PATTERN = re.compile(r"^[A-Z0-9\-]{4,32}$")
+CUSTOMER_REGISTERED_PREFIX = "customer_registered:"
 
 
 class DB:
     def __init__(self, path: str):
         self.path = path
-        self._customer_key_prefix = "customer_registered:"
 
     @staticmethod
     def _normalize_code(raw: str) -> str:
@@ -175,15 +168,8 @@ class DB:
                 "ALTER TABLE users ADD COLUMN trial_start INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN trial_end INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN email TEXT",
-                "ALTER TABLE users ADD COLUMN rebill_id TEXT",
-                "ALTER TABLE users ADD COLUMN rebill_parent_payment TEXT",
                 "ALTER TABLE payments ADD COLUMN order_id TEXT",
-                "ALTER TABLE users ADD COLUMN customer_key TEXT",
-                "ALTER TABLE users ADD COLUMN card_request_key TEXT",
                 "CREATE TABLE IF NOT EXISTS payment_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT, created_at INTEGER, message TEXT, payment_type TEXT)",
-                "ALTER TABLE subscriptions ADD COLUMN rebill_id TEXT",
-                "ALTER TABLE subscriptions ADD COLUMN customer_key TEXT",
-                "ALTER TABLE subscriptions ADD COLUMN rebill_parent_payment TEXT",
                 "ALTER TABLE payment_logs ADD COLUMN payment_type TEXT",
                 "ALTER TABLE payments ADD COLUMN method TEXT",
                 "ALTER TABLE payments ADD COLUMN is_sbp INTEGER NOT NULL DEFAULT 0",
@@ -201,65 +187,6 @@ class DB:
                     logger.exception("Ошибка при миграции таблиц", exc_info=err)
                 except Exception as err:  # noqa: BLE001
                     logger.exception("Не удалось обновить схему базы данных", exc_info=err)
-            try:
-                cur = await db.execute(
-                    """
-                    SELECT user_id, rebill_id, customer_key, rebill_parent_payment
-                    FROM users
-                    WHERE (rebill_id IS NOT NULL AND TRIM(rebill_id) <> '')
-                       OR (customer_key IS NOT NULL AND TRIM(customer_key) <> '')
-                       OR (rebill_parent_payment IS NOT NULL AND TRIM(rebill_parent_payment) <> '')
-                    """
-                )
-                rows = await cur.fetchall()
-
-                def _normalize(value: object) -> Optional[str]:
-                    if value is None:
-                        return None
-                    text = str(value).strip()
-                    return text or None
-
-                for row in rows:
-                    user_id = self._safe_int(row["user_id"])
-                    if user_id <= 0:
-                        continue
-                    rebill_value = _normalize(row["rebill_id"])
-                    customer_value = _normalize(row["customer_key"])
-                    parent_value = _normalize(row["rebill_parent_payment"])
-                    if not any((rebill_value, customer_value, parent_value)):
-                        continue
-                    stamp = int(time.time())
-                    await db.execute(
-                        """
-                        INSERT INTO subscriptions(user_id, rebill_id, customer_key, rebill_parent_payment, updated_at)
-                        VALUES(?, ?, ?, ?, ?)
-                        ON CONFLICT(user_id) DO UPDATE SET
-                            rebill_id = COALESCE(excluded.rebill_id, subscriptions.rebill_id),
-                            customer_key = COALESCE(excluded.customer_key, subscriptions.customer_key),
-                            rebill_parent_payment = COALESCE(excluded.rebill_parent_payment, subscriptions.rebill_parent_payment),
-                            updated_at = CASE
-                                WHEN excluded.rebill_id IS NOT NULL OR excluded.customer_key IS NOT NULL OR excluded.rebill_parent_payment IS NOT NULL
-                                    THEN excluded.updated_at
-                                ELSE subscriptions.updated_at
-                            END
-                        """,
-                        (user_id, rebill_value, customer_value, parent_value, stamp),
-                    )
-
-                await db.execute(
-                    """
-                    UPDATE users
-                    SET rebill_id=NULL, customer_key=NULL, rebill_parent_payment=NULL
-                    WHERE rebill_id IS NOT NULL
-                       OR customer_key IS NOT NULL
-                       OR rebill_parent_payment IS NOT NULL
-                    """
-                )
-            except Exception as err:  # noqa: BLE001
-                logger.exception(
-                    "Не удалось перенести идентификаторы автоплатежей в таблицу subscriptions",
-                    exc_info=err,
-                )
             try:
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_payments_payment_id ON payments(payment_id)"
@@ -383,10 +310,6 @@ class DB:
                     u.trial_start,
                     u.trial_end,
                     u.email,
-                    COALESCE(s.rebill_id, u.rebill_id) AS rebill_id,
-                    COALESCE(s.rebill_parent_payment, u.rebill_parent_payment) AS rebill_parent_payment,
-                    COALESCE(s.customer_key, u.customer_key) AS customer_key,
-                    u.card_request_key,
                     s.end_at AS subscription_end_at,
                     s.updated_at AS subscription_updated_at
                 FROM users AS u
@@ -446,105 +369,6 @@ class DB:
                 (1 if flag else 0, user_id),
             )
             await db.commit()
-
-    async def set_rebill_id(self, user_id: int, rebill_id: str) -> None:
-        """Сохранить идентификатор RebillId для пользователя."""
-
-        value = (rebill_id or "").strip() or None
-        async with aiosqlite.connect(self.path) as db:
-            stamp = int(time.time())
-            await db.execute(
-                """
-                INSERT INTO subscriptions(user_id, rebill_id, updated_at)
-                VALUES(?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    rebill_id=excluded.rebill_id,
-                    updated_at=excluded.updated_at
-                """,
-                (user_id, value, stamp),
-            )
-            await db.execute(
-                "UPDATE users SET rebill_id=NULL WHERE user_id=?",
-                (user_id,),
-            )
-            await db.commit()
-
-    async def set_rebill_parent_payment(self, user_id: int, payment_id: str) -> None:
-        """Запомнить платеж как родительский для автосписаний."""
-
-        value = (payment_id or "").strip() or None
-        async with aiosqlite.connect(self.path) as db:
-            stamp = int(time.time())
-            await db.execute(
-                """
-                INSERT INTO subscriptions(user_id, rebill_parent_payment, updated_at)
-                VALUES(?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    rebill_parent_payment=excluded.rebill_parent_payment,
-                    updated_at=excluded.updated_at
-                """,
-                (user_id, value, stamp),
-            )
-            await db.execute(
-                "UPDATE users SET rebill_parent_payment=NULL WHERE user_id=?",
-                (user_id,),
-            )
-            await db.commit()
-
-    async def set_customer_key(self, user_id: int, customer_key: Optional[str]) -> None:
-        """Сохранить идентификатор клиента для рекуррентных платежей."""
-
-        value = (customer_key or "").strip() or None
-        async with aiosqlite.connect(self.path) as db:
-            stamp = int(time.time())
-            await db.execute(
-                """
-                INSERT INTO subscriptions(user_id, customer_key, updated_at)
-                VALUES(?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    customer_key=excluded.customer_key,
-                    updated_at=excluded.updated_at
-                """,
-                (user_id, value, stamp),
-            )
-            await db.execute(
-                "UPDATE users SET customer_key=NULL WHERE user_id=?",
-                (user_id,),
-            )
-            await db.commit()
-
-    async def set_card_request_key(self, user_id: int, request_key: Optional[str]) -> None:
-        """Сохранить или очистить RequestKey для привязки карты."""
-
-        value = (request_key or "").strip() or None
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                "UPDATE users SET card_request_key=? WHERE user_id=?",
-                (value, user_id),
-            )
-            await db.commit()
-
-    async def set_card_id(self, user_id: int, card_id: Optional[str]) -> None:
-        """Сохранить идентификатор карты (CardId) в настройках."""
-
-        key = f"card_id:{user_id}"
-        value = (card_id or "").strip()
-        if value:
-            await self.set_setting(key, value)
-            return
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute("DELETE FROM settings WHERE key=?", (key,))
-            await db.commit()
-
-    async def get_card_id(self, user_id: int) -> Optional[str]:
-        """Прочитать сохранённый CardId пользователя."""
-
-        key = f"card_id:{user_id}"
-        value = await self.get_setting(key)
-        if value is None:
-            return None
-        text = value.strip()
-        return text or None
 
     async def save_request_key(
         self, user_id: int, request_key: str, *, status: str = "NEW"
@@ -794,7 +618,7 @@ class DB:
     async def set_customer_registered(self, user_id: int, flag: bool) -> None:
         """Зафиксировать информацию о регистрации клиента в T-Bank."""
 
-        key = f"{self._customer_key_prefix}{user_id}"
+        key = f"{CUSTOMER_REGISTERED_PREFIX}{user_id}"
         if flag:
             await self.set_setting(key, "1")
             return
@@ -805,7 +629,7 @@ class DB:
     async def is_customer_registered(self, user_id: int) -> bool:
         """Проверить, регистрировали ли клиента через AddCustomer."""
 
-        key = f"{self._customer_key_prefix}{user_id}"
+        key = f"{CUSTOMER_REGISTERED_PREFIX}{user_id}"
         value = await self.get_setting(key)
         return value == "1"
 
@@ -1245,10 +1069,6 @@ class DB:
                     u.invite_issued,
                     u.trial_start,
                     u.trial_end,
-                    COALESCE(s.rebill_id, u.rebill_id) AS rebill_id,
-                    COALESCE(s.rebill_parent_payment, u.rebill_parent_payment) AS rebill_parent_payment,
-                    COALESCE(s.customer_key, u.customer_key) AS customer_key,
-                    u.card_request_key,
                     s.end_at AS subscription_end_at,
                     s.updated_at AS subscription_updated_at
                 FROM users AS u

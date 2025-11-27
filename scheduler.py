@@ -94,16 +94,6 @@ async def try_auto_renew(
     should_attempt = auto_renew_flag or force
     if not should_attempt:
         return AutoRenewResult(False, False, 0)
-    customer_key = (row_dict.get("customer_key") or "").strip()
-    if should_attempt and not customer_key:
-        customer_key = str(user_id)
-        try:
-            await db.set_customer_key(user_id, customer_key)
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "Не удалось автоматически сохранить CustomerKey для пользователя %s", user_id
-            )
-
     parent_amount = 0
     parent_months = 1
     parent_payment_row = None
@@ -125,13 +115,11 @@ async def try_auto_renew(
             if parent_months <= 0:
                 parent_months = 1
 
-    if not rebill_id or not customer_key or not parent_payment:
+    if not rebill_id or not parent_payment:
         if should_attempt:
             missing = []
             if not rebill_id:
                 missing.append("RebillId")
-            if not customer_key:
-                missing.append("CustomerKey")
             if not parent_payment:
                 missing.append("родительский платёж")
             reason = "Недостаточно данных для автосписания"
@@ -195,7 +183,11 @@ async def try_auto_renew(
     new_parent_payment = response.get("PaymentId") or parent_payment
     new_payment_id_str = str(new_parent_payment).strip() if new_parent_payment else ""
     if new_payment_id_str:
-        await db.set_rebill_parent_payment(user_id, new_payment_id_str)
+        logger.debug(
+            "Новый родительский платёж сохранён локально: user=%s payment=%s",
+            user_id,
+            new_payment_id_str,
+        )
 
     months_to_extend = max(1, parent_months)
     await db.extend_subscription(user_id, months_to_extend)

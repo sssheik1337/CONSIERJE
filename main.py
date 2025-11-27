@@ -227,34 +227,6 @@ async def tbank_notify(request: web.Request) -> web.Response:
                                 user_id,
                                 note="Оплата через СБП подтверждена, автопродление отключено.",
                             )
-                        else:
-                            auto_enabled = False
-                            try:
-                                user_data = await db.get_user(user_id)
-                                auto_enabled = bool(user_data and user_data["auto_renew"])
-                            except Exception:  # noqa: BLE001
-                                auto_enabled = False
-                            rebill_id = data.get("RebillId") or data.get("rebill_id")
-                            if rebill_id:
-                                await db.set_rebill_id(user_id, str(rebill_id))
-                            customer_key = data.get("CustomerKey") or data.get("customer_key")
-                            if customer_key:
-                                await db.set_customer_key(user_id, str(customer_key))
-                            if target_payment_id:
-                                await db.set_rebill_parent_payment(user_id, str(target_payment_id))
-                            if not auto_enabled:
-                                try:
-                                    await db.set_auto_renew(user_id, True)
-                                    logger.info(
-                                        "Автопродление включено после подтверждённой оплаты картой для пользователя %s",
-                                        user_id,
-                                    )
-                                except Exception as err:  # noqa: BLE001
-                                    logger.debug(
-                                        "Не удалось автоматически включить автопродление пользователю %s: %s",
-                                        user_id,
-                                        err,
-                                    )
         elif status_upper:
             if target_payment_id:
                 await db.set_payment_status(target_payment_id, status_upper)
