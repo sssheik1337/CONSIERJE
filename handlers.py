@@ -696,44 +696,58 @@ async def build_price_list_view(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     """Сформировать текст и клавиатуру списка тарифов."""
 
     prices = await db.get_all_prices()
-    lines = ["💰 Тарифы", "Выберите действие."]
-    if prices:
-        lines.append("")
-        for months, price in prices:
-            lines.append(f"{months} мес — {price}₽")
-    else:
-        lines.append("")
-        lines.append("Тарифов пока нет.")
-    text = "\n".join(escape_md(line) if line else "" for line in lines)
+    lines = ["💰 Тарифы", "Выберите тариф для управления."]
+    text = "\n".join(escape_md(line) for line in lines)
 
     builder = InlineKeyboardBuilder()
-    for months, _ in prices:
-        builder.button(text="✏️ Редактировать", callback_data=f"price:edit:{months}")
-        builder.button(text="🗑️ Удалить", callback_data=f"price:del:{months}")
+    for months, price in prices:
+        builder.button(
+            text=f"{months} мес — {price}₽",
+            callback_data=f"price:edit:{months}",
+        )
     builder.button(text="➕ Добавить тариф", callback_data="price:add")
     builder.button(text="⬅️ Назад", callback_data="admin:open")
-    builder.adjust(2, 1, 1)
+    builder.adjust(1)
     return text, builder.as_markup()
 
 
-async def render_price_list(message: Message, db: DB) -> None:
-    """Показать экран управления тарифами."""
+async def _send_price_list(
+    bot: Bot,
+    chat_id: int,
+    db: DB,
+    *,
+    state: FSMContext | None = None,
+    previous_message_id: int | None = None,
+) -> None:
+    """Отрисовать экран тарифов новой клавиатурой и при необходимости обновить стейт."""
 
     text, markup = await build_price_list_view(db)
-    try:
-        await message.edit_text(
-            text,
-            reply_markup=markup,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
-    except TelegramBadRequest:
-        await message.answer(
-            text,
-            reply_markup=markup,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
+    if previous_message_id:
+        try:
+            await bot.delete_message(chat_id, previous_message_id)
+        except TelegramBadRequest:
+            pass
+    sent = await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=markup,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    if state:
+        await state.update_data(price_chat_id=chat_id, price_message_id=sent.message_id)
+
+
+async def render_price_list(message: Message, db: DB, state: FSMContext | None = None) -> None:
+    """Показать экран управления тарифами."""
+
+    await _send_price_list(
+        message.bot,
+        message.chat.id,
+        db,
+        state=state,
+        previous_message_id=message.message_id,
+    )
 
 
 async def render_price_list_by_state(bot: Bot, state: FSMContext, db: DB) -> None:
@@ -742,26 +756,15 @@ async def render_price_list_by_state(bot: Bot, state: FSMContext, db: DB) -> Non
     data = await state.get_data()
     chat_id = data.get("price_chat_id")
     message_id = data.get("price_message_id")
-    if not chat_id or not message_id:
+    if not chat_id:
         return
-    text, markup = await build_price_list_view(db)
-    try:
-        await bot.edit_message_text(
-            text,
-            chat_id=chat_id,
-            message_id=message_id,
-            reply_markup=markup,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
-    except TelegramBadRequest:
-        await bot.send_message(
-            chat_id,
-            text,
-            reply_markup=markup,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
+    await _send_price_list(
+        bot,
+        chat_id,
+        db,
+        state=state,
+        previous_message_id=message_id,
+    )
 
 
 async def render_price_edit(message: Message, months: int) -> None:
@@ -772,8 +775,9 @@ async def render_price_edit(message: Message, months: int) -> None:
     builder = InlineKeyboardBuilder()
     builder.button(text="⌛ Изменить месяцы", callback_data=f"price:editm:{months}")
     builder.button(text="💵 Изменить цену", callback_data=f"price:editp:{months}")
+    builder.button(text="🗑️ Удалить", callback_data=f"price:del:{months}")
     builder.button(text="⬅️ Назад", callback_data="price:list")
-    builder.adjust(2, 1)
+    builder.adjust(2, 1, 1)
     try:
         await message.edit_text(
             text,
@@ -2119,19 +2123,19 @@ async def admin_prices(callback: CallbackQuery, state: FSMContext, db: DB) -> No
         return
     await state.clear()
     if callback.message:
-        await render_price_list(callback.message, db)
+        await render_price_list(callback.message, db, state)
     await callback.answer()
 
 
 @router.callback_query(F.data == "price:list")
-async def price_list_back(callback: CallbackQuery, db: DB) -> None:
+async def price_list_back(callback: CallbackQuery, state: FSMContext, db: DB) -> None:
     """Вернуться к списку тарифов."""
 
     if not is_super_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
     if callback.message:
-        await render_price_list(callback.message, db)
+        await render_price_list(callback.message, db, state)
     await callback.answer()
 
 
@@ -2500,7 +2504,7 @@ async def price_delete(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("price:confirm_del:"))
-async def price_confirm_delete(callback: CallbackQuery, db: DB) -> None:
+async def price_confirm_delete(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
     """Удалить тариф после подтверждения."""
 
     if not is_super_admin(callback.from_user.id):
@@ -2514,7 +2518,7 @@ async def price_confirm_delete(callback: CallbackQuery, db: DB) -> None:
         return
     deleted = await db.delete_price(months)
     if callback.message:
-        await render_price_list(callback.message, db)
+        await render_price_list(callback.message, db, state)
     if deleted:
         await callback.answer("Тариф удалён.")
     else:
