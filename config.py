@@ -62,6 +62,11 @@ class Config:
     T_PAY_API_TOKEN: str = os.getenv("T_PAY_API_TOKEN", "")
 
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    LOG_PATH: str = os.getenv("LOG_PATH", "./payments.log")
+
+    TEST_RENEW_INTERVAL_MINUTES: Optional[int] = field(
+        default_factory=lambda: _env_int("TEST_RENEW_INTERVAL_MINUTES", 0) or None
+    )
 
     TINKOFF_NOTIFY_URL: str = TINKOFF_NOTIFY_URL
     WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")

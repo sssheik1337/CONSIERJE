@@ -1064,6 +1064,51 @@ class DB:
             )
             await conn.commit()
 
+    async def extend_subscription_minutes(self, user_id: int, minutes: int) -> None:
+        """Продлить подписку на указанное число минут (тестовый режим)."""
+
+        if minutes <= 0:
+            return
+        delta = int(timedelta(minutes=minutes).total_seconds())
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT invite_issued, trial_end FROM users WHERE user_id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await conn.commit()
+                return
+            invite_flag = 0
+            trial_end = 0
+            if hasattr(row, "keys"):
+                if "invite_issued" in row.keys():
+                    invite_flag = self._safe_int(row["invite_issued"])
+                if "trial_end" in row.keys():
+                    trial_end = self._safe_int(row["trial_end"])
+            now_ts = int(datetime.utcnow().timestamp())
+            current_sub_end = await self._get_subscription_end_internal(conn, user_id)
+            base = max(current_sub_end, now_ts)
+            new_end = base + delta
+            expired_before = current_sub_end <= now_ts
+            new_invite_flag = 0 if expired_before else invite_flag
+            stamp = int(time.time())
+            await conn.execute(
+                """
+                INSERT INTO subscriptions(user_id, end_at, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET end_at=excluded.end_at, updated_at=excluded.updated_at
+                """,
+                (user_id, new_end, stamp),
+            )
+            new_expires = max(trial_end, new_end)
+            await conn.execute(
+                "UPDATE users SET invite_issued=?, expires_at=? WHERE user_id=?",
+                (new_invite_flag, new_expires, user_id),
+            )
+            await conn.commit()
+
     async def list_expired(self, now_ts: int) -> List[aiosqlite.Row]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row

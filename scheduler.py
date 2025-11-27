@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 import pytz
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -87,6 +88,7 @@ async def try_auto_renew(
     row_dict = dict(user_row)
     user_id = int(row_dict.get("user_id", 0))
     auto_renew_flag = bool(row_dict.get("auto_renew"))
+    test_interval = config.TEST_RENEW_INTERVAL_MINUTES
     account_token = (row_dict.get("account_token") or "").strip()
     if not account_token:
         account_token = (await db.get_account_token(user_id)) or ""
@@ -189,7 +191,10 @@ async def try_auto_renew(
     payment_id_value = response.get("payment_id") or charge_response.get("PaymentId")
     payment_id_str = str(payment_id_value).strip() if payment_id_value else ""
 
-    await db.extend_subscription(user_id, months_to_extend)
+    if test_interval:
+        await db.extend_subscription_minutes(user_id, test_interval)
+    else:
+        await db.extend_subscription(user_id, months_to_extend)
     try:
         await db.set_paid_only(user_id, False)
     except Exception:  # noqa: BLE001
@@ -199,7 +204,9 @@ async def try_auto_renew(
         )
     extended_until = await db.get_subscription_end(user_id)
     if not extended_until:
-        extended_until = _next_month_date(now_ts)
+        base_dt = datetime.utcfromtimestamp(now_ts or int(datetime.utcnow().timestamp()))
+        delta_dt = timedelta(minutes=test_interval) if test_interval else timedelta(days=30)
+        extended_until = int((base_dt + delta_dt).timestamp())
 
     if payment_id_str:
         await db.set_payment_status(payment_id_str, "CONFIRMED")
@@ -325,7 +332,18 @@ async def daily_check(bot: Bot, db: DB):
 
 def setup_scheduler(bot: Bot, db: DB, tz_name: str = "Europe/Moscow") -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=pytz.timezone(tz_name))
-    scheduler.add_job(daily_check, CronTrigger(hour=3, minute=10), kwargs={"bot": bot, "db": db})
+    if config.TEST_RENEW_INTERVAL_MINUTES:
+        scheduler.add_job(
+            daily_check,
+            IntervalTrigger(minutes=config.TEST_RENEW_INTERVAL_MINUTES),
+            kwargs={"bot": bot, "db": db},
+        )
+    else:
+        scheduler.add_job(
+            daily_check,
+            CronTrigger(hour=3, minute=10),
+            kwargs={"bot": bot, "db": db},
+        )
     scheduler.start()
     return scheduler
 
