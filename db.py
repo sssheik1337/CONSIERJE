@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS users (
     invite_issued INTEGER NOT NULL DEFAULT 0,
     trial_start INTEGER DEFAULT 0,
     trial_end INTEGER DEFAULT 0,
-    email TEXT
+    email TEXT,
+    account_token TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -168,6 +169,7 @@ class DB:
                 "ALTER TABLE users ADD COLUMN trial_start INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN trial_end INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN email TEXT",
+                "ALTER TABLE users ADD COLUMN account_token TEXT",
                 "ALTER TABLE payments ADD COLUMN order_id TEXT",
                 "CREATE TABLE IF NOT EXISTS payment_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT, created_at INTEGER, message TEXT, payment_type TEXT)",
                 "ALTER TABLE payment_logs ADD COLUMN payment_type TEXT",
@@ -442,6 +444,10 @@ class DB:
                 """,
                 (user_id, token_value, member_id, member_name, stamp),
             )
+            await db.execute(
+                "UPDATE users SET account_token=? WHERE user_id=?",
+                (token_value, user_id),
+            )
             await db.commit()
 
     async def get_account_token(self, user_id: int) -> Optional[str]:
@@ -452,8 +458,13 @@ class DB:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT account_token FROM sbp_links WHERE user_id=?",
-                (user_id,),
+                """
+                SELECT account_token FROM sbp_links WHERE user_id=?
+                UNION ALL
+                SELECT account_token FROM users WHERE user_id=?
+                LIMIT 1
+                """,
+                (user_id, user_id),
             )
             row = await cur.fetchone()
         if row is None:
