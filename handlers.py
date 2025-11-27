@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-import urllib.parse
 
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -27,20 +26,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import config, get_docs_map
 from db import DB
 from logger import logger
-from payments import (
-    SBP_NOTE,
-    check_payment_status,
-    create_payment,
-    form_sbp_qr,
-    init_sbp_payment,
-)
+from payments import SBP_NOTE, check_payment_status, form_sbp_qr, init_sbp_payment
 from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
-from t_pay import (
-    TBankApiError,
-    TBankHttpError,
-    get_add_card_state,
-    init_add_card,
-)
 
 router = Router()
 
@@ -51,8 +38,6 @@ DEFAULT_AUTO_RENEW = True
 COUPON_KIND_TRIAL = "trial"
 
 MD_V2_SPECIAL = set("_*[]()~`>#+-=|{}.!\\")
-
-DEFAULT_CARD_BIND_IP = "127.0.0.1"
 
 CANCEL_REPLY = ReplyKeyboardMarkup(
     keyboard=[
@@ -89,17 +74,17 @@ def _normalize_payment_method(raw: str | None) -> str:
     """Нормализовать способ оплаты для внутренних колбэков."""
 
     if not raw:
-        return "card"
+        return "sbp"
     lowered = raw.strip().lower()
     if lowered == "sbp":
         return "sbp"
-    return "card"
+    return "sbp"
 
 
 def _format_method_hint(method: str) -> str:
     """Вернуть описание способа оплаты для текстов пользователю."""
 
-    return "картой" if method == "card" else "через СБП"
+    return "через СБП"
 
 
 def _build_consent_text(months: int, price: int, method: str) -> str:
@@ -1323,7 +1308,7 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
 
     user_id = callback.from_user.id
     parts = (callback.data or "").split(":")
-    method = "card"
+    method = "sbp"
     months_value = None
     confirmed = False
     if len(parts) >= 4 and parts[1] == "confirm":
@@ -1377,7 +1362,7 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
             return
 
         if qr_result is None:
-            warning_text = "❗ Ошибка получения QR для СБП. Попробуйте позже или оплатите картой."
+            warning_text = "❗ Ошибка получения QR для СБП. Попробуйте позже."
             if callback.message:
                 await callback.message.answer(warning_text)
             await callback.answer(warning_text, show_alert=True)
@@ -1412,44 +1397,6 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
             )
         await callback.answer("QR для оплаты готов.")
         return
-
-    try:
-        payment_url = await create_payment(
-            user_id,
-            months,
-            price,
-            payment_method=method,
-            force_recurrent=(method == "card"),
-        )
-    except Exception as err:  # noqa: BLE001
-        logger.exception("Не удалось создать платёж", exc_info=err)
-        await callback.answer("Не удалось создать платёж. Попробуйте позже.", show_alert=True)
-        return
-
-    payment = await db.get_latest_payment(user_id, status="PENDING")
-    payment_id = payment["payment_id"] if payment else None
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Перейти к оплате 💳", url=payment_url)
-    if payment_id:
-        builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
-    builder.button(text="🏠 Главное меню", callback_data="menu:home")
-    builder.adjust(1)
-    if callback.message:
-        prefix = "💳" if method == "card" else "📲"
-        text_lines = [
-            f"{prefix} Оплата подписки на {months} мес. ({method_hint}).",
-            f"Сумма к оплате: {price}₽.",
-            "Нажмите кнопку ниже, чтобы перейти к платёжной странице.",
-        ]
-        if method == "sbp":
-            text_lines.append(SBP_NOTE)
-        await callback.message.answer(
-            "\n".join(text_lines),
-            reply_markup=builder.as_markup(),
-            disable_web_page_preview=True,
-        )
-    await callback.answer("Ссылка на оплату готова.")
-
 
 @router.callback_query(F.data.startswith("buy:months:"))
 async def handle_buy(callback: CallbackQuery, db: DB) -> None:
@@ -1612,148 +1559,6 @@ async def handle_toggle_autorenew(callback: CallbackQuery, db: DB) -> None:
         await refresh_user_menu(callback.message, db, user_id)
     message = "Автопродление включено." if new_flag else "Автопродление отключено."
     await callback.answer(message)
-
-
-@router.callback_query(F.data == "card:bind")
-async def handle_card_binding(callback: CallbackQuery, db: DB) -> None:
-    """Инициировать или проверить привязку карты пользователя."""
-
-    user_id = callback.from_user.id
-    if not await db.has_accepted_legal(user_id):
-        await callback.answer("Сначала подтвердите согласие.", show_alert=True)
-        return
-
-    user = await db.get_user(user_id)
-    if user is None:
-        await callback.answer("Сначала выполните /start.", show_alert=True)
-        return
-
-    terminal_key = (config.T_PAY_TERMINAL_KEY or "").strip()
-    if not terminal_key:
-        await callback.answer("Привязка временно недоступна. Обратитесь в поддержку.", show_alert=True)
-        return
-
-    row = dict(user)
-    rebill_id = (row.get("rebill_id") or "").strip()
-    request_key = (row.get("card_request_key") or "").strip()
-    customer_key = (row.get("customer_key") or "").strip()
-
-    if not customer_key:
-        customer_key = str(user_id)
-        try:
-            await db.set_customer_key(user_id, customer_key)
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "Не удалось сохранить CustomerKey перед привязкой для пользователя %s", user_id
-            )
-
-    async def send_form_link(
-        active_request_key: str, payment_url: str | None = None
-    ) -> str:
-        if payment_url:
-            form_url = payment_url
-        else:
-            params = urllib.parse.urlencode(
-                {"TerminalKey": terminal_key, "RequestKey": active_request_key}
-            )
-            form_url = f"https://securepay.tinkoff.ru/html/payForm.html?{params}"
-        text_lines = [
-            "Откройте форму и введите данные карты для автопродления.",
-            "После подтверждения вернитесь в чат, чтобы бот обновил статус автоматически.",
-            form_url,
-        ]
-        if callback.message:
-            await callback.message.answer(
-                "\n\n".join(text_lines),
-                disable_web_page_preview=True,
-            )
-        return form_url
-
-    if request_key:
-        try:
-            state = await get_add_card_state(request_key)
-        except (TBankHttpError, TBankApiError) as err:
-            logger.warning("Не удалось проверить привязку карты пользователя %s: %s", user_id, err)
-            await callback.answer("Не удалось проверить статус привязки. Попробуйте позже.", show_alert=True)
-            return
-        status = (state.get("Status") or "").upper()
-        state_message = state.get("Message") or state.get("Details") or ""
-        state_customer_key = state.get("CustomerKey")
-        if state_customer_key:
-            await db.set_customer_key(user_id, str(state_customer_key))
-        if status == "CONFIRMED":
-            new_rebill = state.get("RebillId") or state.get("CardId")
-            if new_rebill:
-                await db.set_rebill_id(user_id, str(new_rebill))
-            card_id = state.get("CardId")
-            if card_id:
-                await db.set_card_id(user_id, str(card_id))
-            await db.set_card_request_key(user_id, None)
-            success_lines = [
-                "✅ Карта успешно привязана.",
-                "Автопродление будет использовать сохранённую карту при следующем списании.",
-            ]
-            if rebill_id and callback.message:
-                success_lines.append(
-                    "Предыдущая привязанная карта останется активной до первой успешной оплаты новой картой."
-                )
-            if callback.message:
-                await callback.message.answer("\n".join(success_lines))
-                await refresh_user_menu(callback.message, db, user_id)
-            await callback.answer("Карта привязана.")
-            return
-        failure_statuses = {"REJECTED", "DECLINED", "ERROR", "FAILED"}
-        if status in failure_statuses:
-            await db.set_card_request_key(user_id, None)
-            request_key = ""
-            details = state_message or f"Статус: {status}"
-            if callback.message:
-                await callback.message.answer(
-                    "⚠️ Не удалось привязать карту. Попробуйте ещё раз.\n" + details
-                )
-        else:
-            form_url = await send_form_link(request_key)
-            if callback.message:
-                await callback.answer("Перейдите по ссылке и завершите привязку карты.")
-            else:
-                await callback.answer(f"Перейдите по ссылке: {form_url}", show_alert=True)
-            return
-
-    if not request_key:
-        try:
-            response = await init_add_card(
-                customer_key=customer_key,
-                check_type="3DSHOLD",
-                resident_state=True,
-                ip=DEFAULT_CARD_BIND_IP,
-            )
-        except (TBankHttpError, TBankApiError) as err:
-            logger.warning("Не удалось инициировать привязку карты для пользователя %s: %s", user_id, err)
-            await callback.answer("Не удалось инициировать привязку. Попробуйте позже.", show_alert=True)
-            return
-        except Exception as err:  # noqa: BLE001
-            logger.exception("Неожиданная ошибка при создании привязки карты", exc_info=err)
-            await callback.answer("Привязка временно недоступна. Попробуйте позже.", show_alert=True)
-            return
-
-        new_request_key = str(response.get("RequestKey") or "").strip()
-        if not new_request_key:
-            logger.error("T-Bank не вернул RequestKey при привязке карты: %s", response)
-            await callback.answer("Не удалось получить ссылку для привязки.", show_alert=True)
-            return
-
-        response_customer_key = response.get("CustomerKey")
-        if response_customer_key:
-            await db.set_customer_key(user_id, str(response_customer_key))
-        await db.set_card_request_key(user_id, new_request_key)
-        payment_url = (response.get("PaymentURL") or "").strip() or None
-        if not payment_url:
-            logger.debug("InitAddCard не вернул PaymentURL, используем ссылку payForm")
-        form_url = await send_form_link(new_request_key, payment_url)
-        if callback.message:
-            await callback.answer("Ссылка для привязки отправлена.")
-        else:
-            await callback.answer(f"Ссылка: {form_url}", show_alert=True)
 
 
 @router.callback_query(F.data == "invite:once")
