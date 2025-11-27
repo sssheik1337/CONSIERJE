@@ -4,8 +4,8 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-# Загружаем значения из файла окружения
-load_dotenv()
+# Загружаем значения из файла окружения, явно переопределяя системные
+load_dotenv(override=True)
 
 # URL для уведомлений от T-Bank
 TINKOFF_NOTIFY_URL: str = os.getenv("TINKOFF_NOTIFY_URL", "")
@@ -61,8 +61,8 @@ class Config:
     T_PAY_FAIL_URL: str = os.getenv("T_PAY_FAIL_URL", "")
     T_PAY_API_TOKEN: str = os.getenv("T_PAY_API_TOKEN", "")
 
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    LOG_PATH: str = os.getenv("LOG_PATH", "./payments.log")
+    LOG_LEVEL: str = (os.getenv("LOG_LEVEL") or "INFO").strip() or "INFO"
+    LOG_PATH: str = (os.getenv("LOG_PATH") or "./payments.log").strip() or "./payments.log"
 
     TEST_RENEW_INTERVAL_MINUTES: Optional[int] = field(
         default_factory=lambda: _env_int("TEST_RENEW_INTERVAL_MINUTES", 0) or None

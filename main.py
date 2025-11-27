@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import time
 from datetime import datetime
 from typing import Optional
@@ -313,11 +314,12 @@ async def main() -> None:
     if not config.BOT_TOKEN:
         raise SystemExit("Заполни BOT_TOKEN в .env")
 
+    effective_level = logging.getLevelName(logger.getEffectiveLevel())
     logger.info(
         "Запуск бота: база=%s, таймзона=%s, лог-уровень=%s",
         config.DB_PATH,
         config.TIMEZONE,
-        config.LOG_LEVEL,
+        effective_level,
     )
 
     db = DB(config.DB_PATH)

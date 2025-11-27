@@ -6,10 +6,11 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Явно переопределяем переменные окружения значениями из .env
+load_dotenv(override=True)
 
-_LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()
-_LOG_PATH = os.getenv("LOG_PATH", "./payments.log") or "./payments.log"
+_LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").strip().upper()
+_LOG_PATH = (os.getenv("LOG_PATH") or "./payments.log").strip() or "./payments.log"
 _FORMAT = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 
 _LEVELS: dict[str, int] = {
