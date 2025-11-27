@@ -1366,8 +1366,10 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
 
         builder = InlineKeyboardBuilder()
         qr_url = qr_result.get("qr_url")
-        if qr_url:
-            builder.button(text="Оплатить", url=qr_url)
+        payload_url = qr_result.get("payload")
+        payment_link = qr_url or payload_url
+        if payment_link:
+            builder.button(text="Оплатить", url=str(payment_link))
         builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
         builder.button(text="🏠 Главное меню", callback_data="menu:home")
         builder.adjust(1)
@@ -1378,11 +1380,8 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
             "Отсканируйте QR-код в приложении банка.",
         ]
 
-        if not qr_url:
-            payload_text = (
-                qr_result.get("payload")
-                or "(данные QR недоступны)"
-            )
+        if not payment_link:
+            payload_text = qr_result.get("payload") or "(данные QR недоступны)"
             message_lines.extend([
                 "",
                 "QR payload:",
