@@ -180,7 +180,9 @@ async def tbank_notify(request: web.Request) -> web.Response:
             data.get("AccountToken") or data.get("RequestKey")
         ):
             try:
-                sbp_link_processed = await handle_sbp_notification_payload(data, db)
+                sbp_link_processed = await handle_sbp_notification_payload(
+                    data, db, bot
+                )
             except Exception as err:  # noqa: BLE001
                 logger.exception("Ошибка обработки AccountToken", exc_info=err)
 

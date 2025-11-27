@@ -21,7 +21,7 @@ DEFAULT_RECURRENT_IP = "127.0.0.1"
 RETRY_PAYMENT_CALLBACK = "payment:retry"
 
 
-FAILURE_MESSAGE = "Не удалось продлить подписку. 🔄 Повторить платёж"
+FAILURE_MESSAGE = "Не удалось списать, автопродление отключено."
 EXPIRED_MESSAGE = "Срок подписки истёк. Продлите, чтобы восстановить доступ."
 
 
@@ -213,10 +213,13 @@ async def try_auto_renew(
     )
 
     success_notified = False
+    amount_text = (
+        f"{parent_amount / 100:.2f}" if parent_amount and parent_amount % 100 == 0 else str(parent_amount)
+    )
     try:
         await bot.send_message(
             user_id,
-            f"✅ Подписка успешно продлена до {_format_date(extended_until)}",
+            f"✅ Списано {amount_text}₽, подписка продлена до {_format_date(extended_until)}",
         )
         success_notified = True
     except Exception:

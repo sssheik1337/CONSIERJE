@@ -2671,7 +2671,7 @@ async def admin_save_custom_code(message: Message, state: FSMContext, db: DB, bo
 
 
 async def handle_sbp_notification_payload(
-    payload: Mapping[str, Any], db: DB
+    payload: Mapping[str, Any], db: DB, bot: Bot | None = None
 ) -> bool:
     """Обработать уведомление T-Bank с AccountToken для СБП."""
 
@@ -2722,4 +2722,15 @@ async def handle_sbp_notification_payload(
             await db.set_payment_account_token(
                 payment_row["payment_id"], str(account_token)
             )
+        if bot:
+            try:
+                await bot.send_message(
+                    user_id,
+                    "Ваш счёт привязан, автопродление работает.",
+                )
+            except Exception:
+                logger.debug(
+                    "Не удалось отправить уведомление о привязке счёта пользователю %s",
+                    user_id,
+                )
     return True
