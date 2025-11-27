@@ -121,33 +121,46 @@ def _post_sync(
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
 
+    logger.info("T-Bank запрос: %s payload=%s", endpoint, body)
     try:
         response = requests.post(url, json=body, headers=headers, timeout=15)
     except requests.RequestException as err:  # noqa: PERF203
+        logger.exception("T-Bank сеть: %s", err)
         raise TBankHttpError(f"NETWORK: {err}") from err
 
     content_type = response.headers.get("Content-Type", "")
     if response.status_code != 200:
         preview = response.text[:500]
+        logger.error(
+            "T-Bank HTTP ошибка: %s status=%s body=%s", endpoint, response.status_code, preview
+        )
         raise TBankHttpError(
             f"HTTP {response.status_code} {content_type or 'unknown'}: {preview}"
         )
     if "application/json" not in content_type.lower():
         preview = response.text[:500]
+        logger.error(
+            "T-Bank content-type ошибка: %s type=%s body=%s", endpoint, content_type, preview
+        )
         raise TBankHttpError(
             f"Unexpected content-type {content_type or 'unknown'}: {preview}"
         )
     try:
         data = response.json()
     except ValueError as err:  # noqa: PERF203
+        logger.exception("T-Bank JSON ошибка: %s", err)
         raise TBankHttpError("Не удалось разобрать JSON-ответ") from err
 
     if isinstance(data, dict) and data.get("Success") is False:
+        logger.error(
+            "T-Bank бизнес-ошибка: %s response=%s", endpoint, json.dumps(data, ensure_ascii=False)
+        )
         raise TBankApiError(
             str(data.get("ErrorCode", "")),
             data.get("Message", ""),
             data.get("Details"),
         )
+    logger.info("T-Bank ответ: %s response=%s", endpoint, json.dumps(data, ensure_ascii=False))
     return data
 
 
@@ -344,6 +357,7 @@ async def get_qr(payment_id: str, *, data_type: str = "PAYLOAD") -> Dict[str, An
     }
     payload["Token"] = _generate_token(payload, password)
     url = f"{base_url}/GetQr"
+    logger.info("GetQr запрос: %s payload=%s", url, json.dumps(payload, ensure_ascii=False))
     async with aiohttp.ClientSession() as session:
         async with session.post(
             url,
@@ -360,11 +374,13 @@ async def get_qr(payment_id: str, *, data_type: str = "PAYLOAD") -> Dict[str, An
                 raise TBankHttpError(f"GetQr HTTP {response.status}: {text[:100]}")
             data = json.loads(text)
     if not data.get("Success"):
+        logger.error("GetQr ошибка: %s", json.dumps(data, ensure_ascii=False))
         raise TBankApiError(
             str(data.get("ErrorCode", "GetQr")),
             data.get("Message") or "GetQr вернул ошибку",
             data.get("Details"),
         )
+    logger.info("GetQr ответ: %s", json.dumps(data, ensure_ascii=False))
     return data
 
 
@@ -385,6 +401,11 @@ async def get_add_account_qr_state(request_key: str) -> Dict[str, Any]:
     }
     payload["Token"] = _generate_token(payload, password)
     url = f"{base_url}/GetAddAccountQrState"
+    logger.info(
+        "GetAddAccountQrState запрос: %s payload=%s",
+        url,
+        json.dumps(payload, ensure_ascii=False),
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(
             url,
@@ -405,11 +426,15 @@ async def get_add_account_qr_state(request_key: str) -> Dict[str, Any]:
                 )
             data = json.loads(text)
     if not data.get("Success"):
+        logger.error(
+            "GetAddAccountQrState ошибка: %s", json.dumps(data, ensure_ascii=False)
+        )
         raise TBankApiError(
             str(data.get("ErrorCode", "GetAddAccountQrState")),
             data.get("Message") or "Привязка счёта не подтверждена",
             data.get("Details"),
         )
+    logger.info("GetAddAccountQrState ответ: %s", json.dumps(data, ensure_ascii=False))
     return data
 
 
@@ -840,6 +865,11 @@ async def add_account_qr(
     # Подпись формируется из отсортированных параметров и секрета
     payload["Token"] = _generate_token(payload, token)
 
+    logger.info(
+        "AddAccountQr запрос: %s payload=%s",
+        url,
+        json.dumps(payload, ensure_ascii=False),
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload, headers=headers, timeout=15) as response:
             response.raise_for_status()
@@ -852,6 +882,8 @@ async def add_account_qr(
                     "" if success else "Ошибка HTTP при получении SVG"
                 )
             data_json = await response.json()
+
+    logger.info("AddAccountQr ответ: %s", json.dumps(data_json, ensure_ascii=False))
 
     success = bool(data_json.get("Success"))
     if not success:

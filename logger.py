@@ -28,11 +28,19 @@ if not root_logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(_FORMAT))
     root_logger.addHandler(handler)
+    file_handler = logging.FileHandler("payments.log")
+    file_handler.setFormatter(logging.Formatter(_FORMAT))
+    root_logger.addHandler(file_handler)
 else:
     formatter = logging.Formatter(_FORMAT)
     for handler in root_logger.handlers:
         handler.setLevel(_TARGET_LEVEL)
         handler.setFormatter(formatter)
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None)
+               and os.path.basename(h.baseFilename) == "payments.log" for h in root_logger.handlers):
+        file_handler = logging.FileHandler("payments.log")
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
 
 logger = logging.getLogger("concierge")
 logger.setLevel(_TARGET_LEVEL)
