@@ -88,7 +88,7 @@ async def try_auto_renew(
     row_dict = dict(user_row)
     user_id = int(row_dict.get("user_id", 0))
     auto_renew_flag = bool(row_dict.get("auto_renew"))
-    test_interval = config.TEST_RENEW_INTERVAL_MINUTES
+    test_interval = config.SBP_TEST_INTERVAL_MINUTES or config.TEST_RENEW_INTERVAL_MINUTES
     account_token = (row_dict.get("account_token") or "").strip()
     if not account_token:
         account_token = (await db.get_account_token(user_id)) or ""
@@ -332,10 +332,11 @@ async def daily_check(bot: Bot, db: DB):
 
 def setup_scheduler(bot: Bot, db: DB, tz_name: str = "Europe/Moscow") -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=pytz.timezone(tz_name))
-    if config.TEST_RENEW_INTERVAL_MINUTES:
+    interval_minutes = config.SBP_TEST_INTERVAL_MINUTES or config.TEST_RENEW_INTERVAL_MINUTES
+    if interval_minutes:
         scheduler.add_job(
             daily_check,
-            IntervalTrigger(minutes=config.TEST_RENEW_INTERVAL_MINUTES),
+            IntervalTrigger(minutes=interval_minutes),
             kwargs={"bot": bot, "db": db},
         )
     else:

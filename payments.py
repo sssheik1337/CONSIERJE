@@ -373,14 +373,11 @@ async def apply_successful_payment(payment_id: str, db: DB) -> bool:
     await db.set_payment_status(payment_id, "CONFIRMED")
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
-    is_sbp_payment = method.strip().lower() == "sbp"
-    if not is_sbp_payment:
-        try:
-            is_sbp_payment = bool(payment["is_sbp"])  # type: ignore[index]
-        except Exception:  # noqa: BLE001
-            pass
-
-    if not is_sbp_payment:
+    try:
+        account_token = await db.get_account_token(user_id)
+    except Exception:  # noqa: BLE001
+        account_token = None
+    if account_token:
         try:
             await db.set_auto_renew(user_id, True)
         except Exception as err:  # noqa: BLE001
@@ -440,13 +437,13 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
                 payment_id,
                 err,
             )
-        is_sbp = payment_type == "sbp" or stored_method == "sbp"
-        if is_sbp and user_id > 0:
-            await disable_auto_renew_for_sbp(
-                db_instance,
-                user_id,
-                note="Оплата через СБП подтверждена вручную, автопродление отключено.",
-            )
+        if user_id > 0:
+            try:
+                account_token = await db_instance.get_account_token(user_id)
+            except Exception:  # noqa: BLE001
+                account_token = None
+            if account_token:
+                await db_instance.set_auto_renew(user_id, True)
     return status == "CONFIRMED"
 
 

@@ -67,10 +67,13 @@ class Config:
     TEST_RENEW_INTERVAL_MINUTES: Optional[int] = field(
         default_factory=lambda: _env_int("TEST_RENEW_INTERVAL_MINUTES", 0) or None
     )
+    SBP_TEST_INTERVAL_MINUTES: Optional[int] = field(
+        default_factory=lambda: _env_int("SBP_TEST_INTERVAL_MINUTES", 0) or None
+    )
 
     TINKOFF_NOTIFY_URL: str = TINKOFF_NOTIFY_URL
     WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-    WEBHOOK_PORT: int = _env_int("WEBHOOK_PORT", 8080)
+    WEBHOOK_PORT: int = _env_int("WEBHOOK_PORT", 8000)
     TINKOFF_WEBHOOK_SECRET: Optional[str] = _optional_env("TINKOFF_WEBHOOK_SECRET")
 
 

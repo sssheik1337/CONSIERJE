@@ -113,6 +113,8 @@ async def tbank_notify(request: web.Request) -> web.Response:
 
     headers = dict(request.headers)
 
+    logger.info("[TBank Webhook] Получено уведомление: %s", data)
+
     try:
         terminal_key = str(data.get("TerminalKey") or data.get("terminalKey") or "")
         if terminal_key != config.T_PAY_TERMINAL_KEY:
@@ -166,6 +168,7 @@ async def tbank_notify(request: web.Request) -> web.Response:
 
     processed = False
     sbp_link_processed = False
+    account_token_saved = False
 
     try:
         target_payment_id = payment_id
@@ -174,6 +177,10 @@ async def tbank_notify(request: web.Request) -> web.Response:
             if payment_row:
                 target_payment_id = payment_row["payment_id"]
 
+        account_token_value = data.get("AccountToken") or data.get("accountToken")
+        if account_token_value:
+            logger.info("[TBank Webhook] AccountToken найден в уведомлении")
+
         if not sbp_link_processed and (
             data.get("AccountToken") or data.get("RequestKey")
         ):
@@ -181,8 +188,35 @@ async def tbank_notify(request: web.Request) -> web.Response:
                 sbp_link_processed = await handle_sbp_notification_payload(
                     data, db, bot
                 )
+                if sbp_link_processed and account_token_value:
+                    logger.info("[TBank Webhook] AccountToken обновлён")
+                    account_token_saved = True
             except Exception as err:  # noqa: BLE001
                 logger.exception("Ошибка обработки AccountToken", exc_info=err)
+
+        if account_token_value and not account_token_saved:
+            related_user_id = 0
+            if target_payment_id:
+                payment_row_for_token = await db.get_payment_by_payment_id(
+                    target_payment_id
+                )
+                if payment_row_for_token:
+                    related_user_id = int(payment_row_for_token.get("user_id") or 0)
+            if not related_user_id and order_id:
+                payment_row_for_token = await db.get_payment_by_order_id(order_id)
+                if payment_row_for_token:
+                    related_user_id = int(payment_row_for_token.get("user_id") or 0)
+            if related_user_id:
+                await db.save_account_token(
+                    related_user_id, str(account_token_value)
+                )
+                await db.set_auto_renew(related_user_id, True)
+                await db.update_sbp_status(related_user_id, status_upper or "ACTIVE")
+                if target_payment_id:
+                    await db.set_payment_account_token(
+                        target_payment_id, str(account_token_value)
+                    )
+                logger.info("[TBank Webhook] AccountToken обновлён")
 
         if status_upper in {"CONFIRMED", "AUTHORIZED"} and target_payment_id:
             payment_before = await db.get_payment_by_payment_id(target_payment_id)
@@ -192,6 +226,7 @@ async def tbank_notify(request: web.Request) -> web.Response:
             applied = await payments.apply_successful_payment(target_payment_id, db)
             processed = applied
             if applied:
+                logger.info("[TBank Webhook] Оплата подтверждена")
                 payment_row = await db.get_payment_by_payment_id(target_payment_id)
                 stored_method = ""
                 user_id = 0
@@ -221,12 +256,9 @@ async def tbank_notify(request: web.Request) -> web.Response:
                                 target_payment_id,
                                 err,
                             )
-                        if is_sbp:
-                            await payments.disable_auto_renew_for_sbp(
-                                db,
-                                user_id,
-                                note="Оплата через СБП подтверждена, автопродление отключено.",
-                            )
+                        if account_token_value:
+                            await db.save_account_token(user_id, str(account_token_value))
+                            await db.set_auto_renew(user_id, True)
         elif status_upper:
             if target_payment_id:
                 await db.set_payment_status(target_payment_id, status_upper)
@@ -273,6 +305,7 @@ async def start_webhook_server(bot: Bot, db: DB) -> None:
     app["db"] = db
     app["bot"] = bot
     app.router.add_get("/debug/net", debug_net)
+    app.router.add_get("/health", lambda _: web.json_response({"status": "ok"}))
     app.router.add_post("/tbank_notify", tbank_notify)
 
     runner = web.AppRunner(app)
