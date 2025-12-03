@@ -295,6 +295,32 @@ async def init_payment(
         "OrderId": order_id,
         "Description": description,
     }
+    # Формируем чек: либо используем переданный, либо собираем минимальный по ФФД 1.05
+    if receipt is None:
+        taxation = getattr(config, "T_PAY_TAXATION", None) or "usn_income"
+        auto_receipt: Dict[str, Any] = {
+            "FfdVersion": "1.05",
+            "Taxation": taxation,
+            "Items": [
+                {
+                    "Name": description,
+                    "Price": amount,
+                    "Quantity": 1,
+                    "Amount": amount,
+                    "PaymentMethod": "full_prepayment",
+                    "PaymentObject": "service",
+                    "Tax": "none",
+                }
+            ],
+            "Payments": {"Electronic": amount},
+        }
+        if email:
+            auto_receipt["Email"] = email
+        if phone:
+            auto_receipt["Phone"] = phone
+        receipt_to_send = auto_receipt
+    else:
+        receipt_to_send = receipt
     if customer_key:
         payload["CustomerKey"] = customer_key
     if pay_type:
@@ -313,8 +339,7 @@ async def init_payment(
     if extra:
         payload["DATA"] = extra
     # Реквизиты для чека (если подключена онлайн‑касса)
-    if receipt:
-        payload["Receipt"] = receipt
+    payload["Receipt"] = receipt_to_send
     # E‑mail и телефон можно также передавать в Receipt, но можно и на верхнем уровне
     if email:
         payload.setdefault("DATA", {})["Email"] = email
@@ -435,6 +460,62 @@ async def get_add_account_qr_state(request_key: str) -> Dict[str, Any]:
             data.get("Details"),
         )
     logger.info("GetAddAccountQrState ответ: %s", json.dumps(data, ensure_ascii=False))
+    return data
+
+
+async def send_closing_receipt(payment_id: str, receipt: Dict[str, Any]) -> Dict[str, Any]:
+    """Отправить закрывающий чек по оплаченному платежу."""
+
+    if not payment_id:
+        raise ValueError("PaymentId обязателен для SendClosingReceipt")
+    (
+        _base_url,
+        terminal_key,
+        password,
+        *_
+    ) = _read_env()
+    payload: Dict[str, Any] = {
+        "TerminalKey": terminal_key,
+        "PaymentId": str(payment_id),
+        "Receipt": receipt,
+    }
+    payload["Token"] = _generate_token(payload, password)
+    url = "https://securepay.tinkoff.ru/cashbox/SendClosingReceipt"
+    logger.info(
+        "SendClosingReceipt запрос: %s payload=%s",
+        url,
+        json.dumps(payload, ensure_ascii=False),
+    )
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=15,
+            ) as response:
+                text = await response.text()
+                if response.status != 200:
+                    logger.error("SendClosingReceipt HTTP %s: %s", response.status, text[:200])
+                    raise TBankHttpError(
+                        f"SendClosingReceipt HTTP {response.status}: {text[:100]}"
+                    )
+                data = json.loads(text)
+        except aiohttp.ClientError as err:  # noqa: PERF203
+            logger.exception("SendClosingReceipt: ошибка сети", exc_info=err)
+            raise TBankHttpError(str(err)) from err
+
+    if not data.get("Success"):
+        logger.error("SendClosingReceipt ошибка: %s", json.dumps(data, ensure_ascii=False))
+        raise TBankApiError(
+            str(data.get("ErrorCode", "SendClosingReceipt")),
+            data.get("Message") or "SendClosingReceipt вернул ошибку",
+            data.get("Details"),
+        )
+    logger.info("SendClosingReceipt ответ: %s", json.dumps(data, ensure_ascii=False))
     return data
 
 
@@ -1085,6 +1166,7 @@ __all__ = [
     "get_add_card_state",
     "get_qr",
     "get_add_account_qr_state",
+    "send_closing_receipt",
     "add_account_qr",
     "charge_qr",
     "finish_authorize",
