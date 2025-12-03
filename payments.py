@@ -122,10 +122,10 @@ async def disable_auto_renew_for_sbp(
 async def init_sbp_payment(
     user_id: int,
     months: int,
-    amount: int,
-    *,
+    price: int,
     contact_type: str,
     contact_value: str,
+    *,
     db: Optional[DB] = None,
 ) -> dict[str, Any]:
     """Создать платёж для СБП с рекуррентной привязкой счёта."""
@@ -135,7 +135,7 @@ async def init_sbp_payment(
     explicit_db = db is not None
     resolved_db = db or _get_db()
     resolved_months, _, amount_minor = _normalize_amount_inputs(
-        months, amount, explicit_db=explicit_db
+        months, price, explicit_db=explicit_db
     )
     order_id = _build_order_id("sbp", user_id, resolved_months)
     description = f"Подписка через СБП на {resolved_months} мес. (user {user_id})"
