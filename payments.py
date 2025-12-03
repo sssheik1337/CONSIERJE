@@ -48,7 +48,10 @@ def _normalize_amount_inputs(
         raise ValueError("Срок подписки должен быть положительным")
     if resolved_amount <= 0:
         raise ValueError("Сумма должна быть положительной")
-    amount_minor = resolved_amount if explicit_db else resolved_amount * 100
+
+    # Сумма из базы хранится в рублях, но API T-Bank принимает копейки,
+    # поэтому всегда переводим в минорные единицы независимо от источника.
+    amount_minor = resolved_amount * 100
     return resolved_months, resolved_amount, amount_minor
 
 
