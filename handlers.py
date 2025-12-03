@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from collections.abc import Mapping, Sequence
 from typing import Any
+import re
 
 import aiosqlite
 from aiogram import Bot, F, Router
@@ -85,6 +86,21 @@ def _format_method_hint(method: str) -> str:
     """Вернуть описание способа оплаты для текстов пользователю."""
 
     return "через СБП"
+
+
+def _validate_contact_value(value: str) -> tuple[str | None, str | None]:
+    """Проверить контакт пользователя и определить тип (телефон или email)."""
+
+    if not value:
+        return None, None
+    cleaned = value.strip()
+    phone_pattern = re.compile(r"^\+7\d{10}$")
+    email_pattern = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
+    if phone_pattern.match(cleaned):
+        return "phone", cleaned
+    if email_pattern.match(cleaned):
+        return "email", cleaned
+    return None, None
 
 
 def _build_consent_text(months: int, price: int, method: str) -> str:
@@ -176,6 +192,12 @@ class User(StatesGroup):
     """Состояния пользователя."""
 
     WaitPromoCode = State()
+
+
+class BuyContactState(StatesGroup):
+    """Состояние запроса контактных данных для чека."""
+
+    waiting_for_contact = State()
 
 
 def escape_md(text: str) -> str:
@@ -1299,7 +1321,30 @@ async def _send_payment_consent(
     await callback.answer()
 
 
-async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
+async def _request_contact_details(
+    callback: CallbackQuery,
+    state: FSMContext,
+    method: str,
+    months: int,
+    price: int,
+) -> None:
+    """Запросить у пользователя контактные данные для формирования чека."""
+
+    await state.set_state(BuyContactState.waiting_for_contact)
+    await state.update_data(
+        pending_method=method,
+        pending_months=months,
+        pending_price=price,
+    )
+    if callback.message:
+        await callback.message.answer(
+            "Укажи телефон в формате +7XXXXXXXXXX или email, чтобы получить чек.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    await callback.answer("Ожидаю контакт для чека.")
+
+
+async def _handle_buy_callback(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
     """Общая логика создания платежей по выбранному тарифу."""
 
     user_id = callback.from_user.id
@@ -1332,89 +1377,164 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB) -> None:
     if not confirmed:
         await _send_payment_consent(callback, method, months, price, user_row)
         return
-    method_hint = _format_method_hint(method)
-    if method == "sbp":
-        try:
-            init_result = await init_sbp_payment(user_id, months, price)
-        except Exception as err:  # noqa: BLE001
-            logger.exception("Init СБП не удался", exc_info=err)
-            await callback.answer(
-                "Не удалось создать платёж СБП. Попробуйте позже.",
-                show_alert=True,
-            )
-            return
-        payment_id = init_result.get("payment_id")
-        if not payment_id:
-            await callback.answer("T-Bank не вернул PaymentId.", show_alert=True)
-            return
-        try:
-            qr_result = await form_sbp_qr(user_id, payment_id)
-        except Exception as err:  # noqa: BLE001
-            logger.exception("Не удалось получить QR для СБП", exc_info=err)
-            await callback.answer(
-                "Не удалось сформировать QR. Попробуйте позже.",
-                show_alert=True,
-            )
-            return
+    await _request_contact_details(callback, state, method, months, price)
+    return
 
-        if qr_result is None:
-            warning_text = "❗ Ошибка получения QR для СБП. Попробуйте позже."
-            if callback.message:
-                await callback.message.answer(warning_text)
-            await callback.answer(warning_text, show_alert=True)
-            return
 
-        builder = InlineKeyboardBuilder()
-        qr_url = qr_result.get("qr_url")
-        payload_url = qr_result.get("payload")
-        payment_link = qr_url or payload_url
-        if payment_link:
-            builder.button(text="Оплатить", url=str(payment_link))
-        builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
-        builder.button(text="🏠 Главное меню", callback_data="menu:home")
-        builder.adjust(1)
+async def _send_sbp_payment_details(
+    message: Message,
+    user_id: int,
+    months: int,
+    price: int,
+    payment_id: str,
+    db: DB,
+) -> None:
+    """Сформировать QR/ссылку для оплаты через СБП и отправить пользователю."""
 
-        message_lines = [
-            "📲 Оплата подписки через СБП.",
-            f"Срок: {months} мес., сумма: {price}₽.",
-            "Отсканируйте QR-код в приложении банка.",
-        ]
-
-        if not payment_link:
-            payload_text = qr_result.get("payload") or "(данные QR недоступны)"
-            message_lines.extend([
-                "",
-                "QR payload:",
-                str(payload_text),
-            ])
-        if callback.message:
-            await callback.message.answer(
-                "\n".join(message_lines),
-                reply_markup=builder.as_markup(),
-                disable_web_page_preview=True,
-            )
-        await callback.answer("QR для оплаты готов.")
+    try:
+        qr_result = await form_sbp_qr(user_id, payment_id, db=db)
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Не удалось получить QR для СБП", exc_info=err)
+        await message.answer(
+            "Не удалось сформировать QR. Попробуйте позже.",
+            reply_markup=main_menu_markup(),
+        )
         return
 
+    if qr_result is None:
+        warning_text = "❗ Ошибка получения QR для СБП. Попробуйте позже или оплатите позже."
+        await message.answer(warning_text, reply_markup=main_menu_markup())
+        return
+
+    builder = InlineKeyboardBuilder()
+    qr_url = qr_result.get("qr_url")
+    payload_url = qr_result.get("payload")
+    payment_link = qr_url or payload_url
+    if payment_link:
+        builder.button(text="Оплатить", url=str(payment_link))
+    builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
+    builder.adjust(1)
+
+    message_lines = [
+        "📲 Оплата подписки через СБП.",
+        f"Срок: {months} мес., сумма: {price}₽.",
+        "Отсканируйте QR-код в приложении банка.",
+    ]
+
+    if not payment_link:
+        payload_text = qr_result.get("payload") or "(данные QR недоступны)"
+        message_lines.extend([
+            "",
+            "QR payload:",
+            str(payload_text),
+        ])
+    await message.answer(
+        "\n".join(message_lines),
+        reply_markup=builder.as_markup(),
+        disable_web_page_preview=True,
+    )
+
+
+async def _create_sbp_payment_with_contact(
+    message: Message,
+    db: DB,
+    user_id: int,
+    months: int,
+    price: int,
+    contact_type: str,
+    contact_value: str,
+) -> None:
+    """Создать платёж СБП с учётом контактных данных и отправить ссылку оплаты."""
+
+    try:
+        init_result = await init_sbp_payment(
+            user_id,
+            months,
+            price,
+            contact_type,
+            contact_value,
+            db=db,
+        )
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Init СБП не удался", exc_info=err)
+        await message.answer(
+            "Не удалось создать платёж СБП. Попробуйте позже.",
+            reply_markup=main_menu_markup(),
+        )
+        return
+
+    payment_id = init_result.get("payment_id")
+    if not payment_id:
+        await message.answer(
+            "T-Bank не вернул PaymentId. Попробуйте позже.",
+            reply_markup=main_menu_markup(),
+        )
+        return
+
+    await _send_sbp_payment_details(message, user_id, months, price, payment_id, db)
+
 @router.callback_query(F.data.startswith("buy:months:"))
-async def handle_buy(callback: CallbackQuery, db: DB) -> None:
+async def handle_buy(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
     """Совместимость со старыми кнопками покупки."""
 
-    await _handle_buy_callback(callback, db)
+    await _handle_buy_callback(callback, db, state)
 
 
 @router.callback_query(F.data.startswith("buy:method:"))
-async def handle_buy_with_method(callback: CallbackQuery, db: DB) -> None:
+async def handle_buy_with_method(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
     """Создание оплаты с указанием конкретного способа."""
 
-    await _handle_buy_callback(callback, db)
+    await _handle_buy_callback(callback, db, state)
 
 
 @router.callback_query(F.data.startswith("buy:confirm:"))
-async def handle_buy_confirm(callback: CallbackQuery, db: DB) -> None:
+async def handle_buy_confirm(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
     """Создание оплаты после подтверждения согласия."""
 
-    await _handle_buy_callback(callback, db)
+    await _handle_buy_callback(callback, db, state)
+
+
+@router.message(BuyContactState.waiting_for_contact)
+async def handle_buy_contact_input(message: Message, state: FSMContext, db: DB) -> None:
+    """Получить телефон или email для формирования чека перед оплатой."""
+
+    contact_type, contact_value = _validate_contact_value(message.text or "")
+    if not contact_type:
+        await message.answer("Отправь телефон в формате +7XXXXXXXXXX или email.")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+    try:
+        months = int(data.get("pending_months") or 0)
+    except (TypeError, ValueError):
+        months = 0
+    try:
+        price = int(data.get("pending_price") or 0)
+    except (TypeError, ValueError):
+        price = 0
+    method = str(data.get("pending_method") or "sbp").strip().lower()
+    if months <= 0 or price <= 0:
+        await message.answer("Не удалось определить параметры оплаты. Попробуйте ещё раз.", reply_markup=main_menu_markup())
+        return
+    if method != "sbp":
+        method = "sbp"
+
+    try:
+        await db.set_user_contact(message.from_user.id, contact_value)
+    except Exception as err:  # noqa: BLE001
+        logger.debug("Не удалось сохранить контакт пользователя %s: %s", message.from_user.id, err)
+
+    await _create_sbp_payment_with_contact(
+        message,
+        db,
+        message.from_user.id,
+        months,
+        price,
+        contact_type,
+        contact_value,
+    )
 
 
 @router.callback_query(F.data.startswith("payment:check:"))

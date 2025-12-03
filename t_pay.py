@@ -295,6 +295,8 @@ async def init_payment(
         "OrderId": order_id,
         "Description": description,
     }
+    if not email and not phone:
+        raise ValueError("Для формирования чека требуется email или телефон")
     # Формируем чек: либо используем переданный, либо собираем минимальный по ФФД 1.05
     if receipt is None:
         taxation = getattr(config, "T_PAY_TAXATION", None) or "usn_income"

@@ -372,6 +372,18 @@ class DB:
             )
             await db.commit()
 
+    async def set_user_contact(self, user_id: int, contact_value: str) -> None:
+        """Сохранить контакт пользователя (email или телефон) для чеков."""
+
+        if not contact_value:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET email=? WHERE user_id=?",
+                (contact_value, user_id),
+            )
+            await db.commit()
+
     async def save_request_key(
         self, user_id: int, request_key: str, *, status: str = "NEW"
     ) -> None:

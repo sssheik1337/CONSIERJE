@@ -124,6 +124,8 @@ async def init_sbp_payment(
     months: int,
     amount: int,
     *,
+    contact_type: str,
+    contact_value: str,
     db: Optional[DB] = None,
 ) -> dict[str, Any]:
     """Создать платёж для СБП с рекуррентной привязкой счёта."""
@@ -138,6 +140,16 @@ async def init_sbp_payment(
     order_id = _build_order_id("sbp", user_id, resolved_months)
     description = f"Подписка через СБП на {resolved_months} мес. (user {user_id})"
 
+    email_value: Optional[str] = None
+    phone_value: Optional[str] = None
+    normalized_contact = (contact_type or "").strip().lower()
+    if normalized_contact == "email":
+        email_value = contact_value
+    elif normalized_contact == "phone":
+        phone_value = contact_value
+    else:
+        raise ValueError("Не указан тип контакта для чека")
+
     try:
         response = await init_payment(
             amount=amount_minor,
@@ -147,6 +159,8 @@ async def init_sbp_payment(
             pay_type="O",
             extra={"QR": "true"},
             notification_url=config.TINKOFF_NOTIFY_URL or None,
+            email=email_value,
+            phone=phone_value,
         )
     except (TBankHttpError, TBankApiError) as err:
         logger.error("Init для СБП завершился ошибкой: %s", err)
@@ -293,6 +307,22 @@ async def charge_sbp_autopayment(
         raise ValueError("Некорректный пользователь для автосписания")
     explicit_db = db is not None
     resolved_db = db or _get_db()
+    user_row = await resolved_db.get_user(user_id)
+    raw_contact = ""
+    if user_row is not None and hasattr(user_row, "keys"):
+        try:
+            raw_contact = str(user_row["email"] or "").strip()
+        except (KeyError, TypeError, ValueError):
+            raw_contact = ""
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    if raw_contact:
+        if raw_contact.startswith("+7") and len(raw_contact) == 12:
+            contact_phone = raw_contact
+        elif "@" in raw_contact:
+            contact_email = raw_contact
+    if not contact_email and not contact_phone:
+        raise RuntimeError("Для отправки чека не указан контакт пользователя")
     resolved_months, _, amount_minor = _normalize_amount_inputs(
         months, amount, explicit_db=explicit_db
     )
@@ -307,6 +337,8 @@ async def charge_sbp_autopayment(
         pay_type="O",
         extra={"QR": "true"},
         notification_url=config.TINKOFF_NOTIFY_URL or None,
+        email=contact_email,
+        phone=contact_phone,
     )
     payment_id = str(init_response.get("PaymentId") or "")
     if not payment_id:
