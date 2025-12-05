@@ -32,13 +32,21 @@ def compute_token(payload: dict, password: str) -> str:
 
     items: list[tuple[str, str]] = []
     for key, value in payload.items():
-        if key.lower() == "token":
+        key_str = str(key)
+        if key_str.lower() == "token":
+            continue
+        if key_str in {"Data", "DATA", "Receipt", "receipt"}:
             continue
         if isinstance(value, (dict, list)):
             continue
         if value is None:
             continue
-        items.append((str(key), str(value)))
+        if isinstance(value, bool):
+            value_str = "true" if value else "false"
+        else:
+            value_str = str(value)
+        items.append((key_str, value_str))
+    # Добавляем пароль до сортировки, чтобы он участвовал в подписи
     items.append(("Password", password))
     items.sort(key=lambda item: item[0])
     concatenated = "".join(value for _, value in items)
