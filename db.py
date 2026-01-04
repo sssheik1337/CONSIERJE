@@ -1,5 +1,4 @@
 import json
-import logging
 import re
 import secrets
 import time
@@ -7,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 import aiosqlite
+from logger import logger
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS users (
     accepted_at INTEGER,
     invite_issued INTEGER NOT NULL DEFAULT 0,
     trial_start INTEGER DEFAULT 0,
-    trial_end INTEGER DEFAULT 0
+    trial_end INTEGER DEFAULT 0,
+    email TEXT,
+    account_token TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -31,7 +33,7 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE TABLE IF NOT EXISTS prices (
     months INTEGER PRIMARY KEY,
-    price  INTEGER NOT NULL CHECK(price>=0),
+    price  INTEGER NOT NULL CHECK(price>=10),
     CHECK(months>=1)
 );
 
@@ -67,7 +69,11 @@ CREATE TABLE IF NOT EXISTS payments (
     amount INTEGER,
     months INTEGER,
     status TEXT DEFAULT 'PENDING',
-    created_at INTEGER
+    created_at INTEGER,
+    method TEXT DEFAULT 'card',
+    is_sbp INTEGER NOT NULL DEFAULT 0,
+    request_key TEXT,
+    account_token TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_payment_id ON payments(payment_id);
@@ -84,9 +90,31 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     received_at INTEGER,
     processed INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS payment_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    status TEXT,
+    created_at INTEGER,
+    message TEXT,
+    payment_type TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sbp_links (
+    user_id INTEGER PRIMARY KEY,
+    request_key TEXT,
+    account_token TEXT,
+    bank_member_id TEXT,
+    bank_member_name TEXT,
+    status TEXT,
+    created_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_sbp_links_request_key ON sbp_links(request_key);
 """
 
 COUPON_CODE_PATTERN = re.compile(r"^[A-Z0-9\-]{4,32}$")
+CUSTOMER_REGISTERED_PREFIX = "customer_registered:"
 
 
 class DB:
@@ -140,7 +168,17 @@ class DB:
                 "ALTER TABLE users ADD COLUMN invite_issued INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN trial_start INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN trial_end INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN email TEXT",
+                "ALTER TABLE users ADD COLUMN account_token TEXT",
                 "ALTER TABLE payments ADD COLUMN order_id TEXT",
+                "CREATE TABLE IF NOT EXISTS payment_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT, created_at INTEGER, message TEXT, payment_type TEXT)",
+                "ALTER TABLE payment_logs ADD COLUMN payment_type TEXT",
+                "ALTER TABLE payments ADD COLUMN method TEXT",
+                "ALTER TABLE payments ADD COLUMN is_sbp INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE payments ADD COLUMN request_key TEXT",
+                "ALTER TABLE payments ADD COLUMN account_token TEXT",
+                "CREATE TABLE IF NOT EXISTS sbp_links (user_id INTEGER PRIMARY KEY, request_key TEXT, account_token TEXT, bank_member_id TEXT, bank_member_name TEXT, status TEXT, created_at INTEGER)",
+                "CREATE INDEX IF NOT EXISTS idx_sbp_links_request_key ON sbp_links(request_key)",
             ):
                 try:
                     await db.execute(ddl)
@@ -148,9 +186,9 @@ class DB:
                     message = str(err).lower()
                     if "duplicate column name" in message:
                         continue
-                    logging.exception("Ошибка при миграции таблиц", exc_info=err)
+                    logger.exception("Ошибка при миграции таблиц", exc_info=err)
                 except Exception as err:  # noqa: BLE001
-                    logging.exception("Не удалось обновить схему базы данных", exc_info=err)
+                    logger.exception("Не удалось обновить схему базы данных", exc_info=err)
             try:
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_payments_payment_id ON payments(payment_id)"
@@ -159,7 +197,18 @@ class DB:
                     "CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id)"
                 )
             except Exception as err:  # noqa: BLE001
-                logging.exception("Не удалось создать индексы платежей", exc_info=err)
+                logger.exception("Не удалось создать индексы платежей", exc_info=err)
+
+            try:
+                await db.execute(
+                    """
+                    UPDATE payments
+                    SET method='card'
+                    WHERE method IS NULL OR TRIM(method)=''
+                    """
+                )
+            except Exception as err:  # noqa: BLE001
+                logger.debug("Не удалось нормализовать method в payments", exc_info=err)
 
             try:
                 cur = await db.execute(
@@ -220,7 +269,7 @@ class DB:
                             (user_id, expires_at, now_stamp),
                         )
             except Exception as err:  # noqa: BLE001
-                logging.exception("Не удалось синхронизировать текущие сроки подписок", exc_info=err)
+                logger.exception("Не удалось синхронизировать текущие сроки подписок", exc_info=err)
 
             try:
                 cur = await db.execute(
@@ -241,7 +290,7 @@ class DB:
                         (row["code"], row["used_by"], row["used_at"], row["kind"]),
                     )
             except Exception as err:  # noqa: BLE001
-                logging.exception(
+                logger.exception(
                     "Не удалось перенести историю использования промокодов", exc_info=err
                 )
             await db.commit()
@@ -249,7 +298,28 @@ class DB:
     async def get_user(self, user_id: int) -> Optional[aiosqlite.Row]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+            cur = await db.execute(
+                """
+                SELECT
+                    u.user_id,
+                    u.started_at,
+                    u.expires_at,
+                    u.auto_renew,
+                    u.paid_only,
+                    u.accepted_legal,
+                    u.accepted_at,
+                    u.invite_issued,
+                    u.trial_start,
+                    u.trial_end,
+                    u.email,
+                    s.end_at AS subscription_end_at,
+                    s.updated_at AS subscription_updated_at
+                FROM users AS u
+                LEFT JOIN subscriptions AS s ON s.user_id = u.user_id
+                WHERE u.user_id=?
+                """,
+                (user_id,),
+            )
             return await cur.fetchone()
 
     async def upsert_user(
@@ -299,6 +369,212 @@ class DB:
             await db.execute(
                 "UPDATE users SET auto_renew=? WHERE user_id=?",
                 (1 if flag else 0, user_id),
+            )
+            await db.commit()
+
+    async def set_user_contact(self, user_id: int, contact_value: str) -> None:
+        """Сохранить контакт пользователя (email или телефон) для чеков."""
+
+        if not contact_value:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET email=? WHERE user_id=?",
+                (contact_value, user_id),
+            )
+            await db.commit()
+
+    async def save_request_key(
+        self, user_id: int, request_key: str, *, status: str = "NEW"
+    ) -> None:
+        """Сохранить RequestKey привязки счёта через СБП."""
+
+        if user_id <= 0:
+            return
+        value = (request_key or "").strip()
+        if not value:
+            return
+        normalized_status = (status or "NEW").strip().upper() or "NEW"
+        stamp = int(time.time())
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO sbp_links(user_id, request_key, status, created_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    request_key=excluded.request_key,
+                    status=excluded.status,
+                    created_at=excluded.created_at
+                """,
+                (user_id, value, normalized_status, stamp),
+            )
+            await db.commit()
+
+    async def update_sbp_status(self, user_id: int, status: str) -> None:
+        """Обновить статус привязки счёта через СБП."""
+
+        if user_id <= 0:
+            return
+        normalized_status = (status or "").strip().upper()
+        if not normalized_status:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE sbp_links SET status=? WHERE user_id=?",
+                (normalized_status, user_id),
+            )
+            await db.commit()
+
+    async def save_account_token(
+        self,
+        user_id: int,
+        account_token: str,
+        bank_member_id: Optional[str] = None,
+        bank_member_name: Optional[str] = None,
+    ) -> None:
+        """Сохранить AccountToken и данные банка для пользователя."""
+
+        if user_id <= 0:
+            return
+        token_value = (account_token or "").strip()
+        if not token_value:
+            return
+        member_id = (bank_member_id or "").strip() or None
+        member_name = (bank_member_name or "").strip() or None
+        stamp = int(time.time())
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO sbp_links(user_id, account_token, bank_member_id, bank_member_name, status, created_at)
+                VALUES(?, ?, ?, ?, 'ACTIVE', ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    account_token=excluded.account_token,
+                    bank_member_id=COALESCE(excluded.bank_member_id, sbp_links.bank_member_id),
+                    bank_member_name=COALESCE(excluded.bank_member_name, sbp_links.bank_member_name),
+                    status=excluded.status,
+                    created_at=CASE WHEN sbp_links.created_at IS NULL OR sbp_links.created_at=0 THEN excluded.created_at ELSE sbp_links.created_at END
+                """,
+                (user_id, token_value, member_id, member_name, stamp),
+            )
+            await db.execute(
+                "UPDATE users SET account_token=? WHERE user_id=?",
+                (token_value, user_id),
+            )
+            await db.commit()
+
+    async def get_account_token(self, user_id: int) -> Optional[str]:
+        """Получить AccountToken, сохранённый для пользователя."""
+
+        if user_id <= 0:
+            return None
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT account_token FROM sbp_links WHERE user_id=?
+                UNION ALL
+                SELECT account_token FROM users WHERE user_id=?
+                LIMIT 1
+                """,
+                (user_id, user_id),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        value = row["account_token"]
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    async def get_user_by_request_key(self, request_key: str) -> Optional[int]:
+        """Найти пользователя по RequestKey привязки счёта."""
+
+        value = (request_key or "").strip()
+        if not value:
+            return None
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT user_id FROM sbp_links WHERE request_key=?",
+                (value,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return int(row["user_id"] or 0)
+
+    async def get_payment_by_request_key(
+        self, request_key: str
+    ) -> Optional[aiosqlite.Row]:
+        """Получить платёж по RequestKey (для СБП-привязок)."""
+
+        value = (request_key or "").strip()
+        if not value:
+            return None
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM payments WHERE request_key=? ORDER BY created_at DESC LIMIT 1",
+                (value,),
+            )
+            return await cur.fetchone()
+
+    async def set_payment_request_key(
+        self, payment_id: str, request_key: Optional[str]
+    ) -> None:
+        """Привязать RequestKey к конкретному платежу."""
+
+        value = (request_key or "").strip()
+        if not payment_id:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE payments SET request_key=? WHERE payment_id=?",
+                (value or None, payment_id),
+            )
+            await db.commit()
+
+    async def set_payment_account_token(
+        self, payment_id: str, account_token: Optional[str]
+    ) -> None:
+        """Сохранить AccountToken для конкретного платежа."""
+
+        if not payment_id:
+            return
+        value = (account_token or "").strip() or None
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE payments SET account_token=? WHERE payment_id=?",
+                (value, payment_id),
+            )
+            await db.commit()
+
+    async def log_payment_attempt(
+        self,
+        user_id: int,
+        status: str,
+        message: str = "",
+        *,
+        payment_type: Optional[str] = None,
+    ) -> None:
+        """Записать результат автоплатежа в журнал с указанием типа платежа."""
+
+        normalized_status = (status or "").strip().upper() or "UNKNOWN"
+        note = (message or "").strip()
+        stamp = int(time.time())
+        normalized_type = "card"
+        if payment_type:
+            candidate = payment_type.strip().lower()
+            if candidate == "sbp":
+                normalized_type = "sbp"
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO payment_logs(user_id, status, created_at, message, payment_type)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (user_id, normalized_status, stamp, note, normalized_type),
             )
             await db.commit()
 
@@ -362,6 +638,24 @@ class DB:
             return None
         return row["value"]
 
+    async def set_customer_registered(self, user_id: int, flag: bool) -> None:
+        """Зафиксировать информацию о регистрации клиента в T-Bank."""
+
+        key = f"{CUSTOMER_REGISTERED_PREFIX}{user_id}"
+        if flag:
+            await self.set_setting(key, "1")
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM settings WHERE key=?", (key,))
+            await db.commit()
+
+    async def is_customer_registered(self, user_id: int) -> bool:
+        """Проверить, регистрировали ли клиента через AddCustomer."""
+
+        key = f"{CUSTOMER_REGISTERED_PREFIX}{user_id}"
+        value = await self.get_setting(key)
+        return value == "1"
+
     async def set_target_chat_username(self, name: str) -> None:
         await self.set_setting("target_chat_username", name)
 
@@ -407,7 +701,7 @@ class DB:
                     price = int(value)
                 except (TypeError, ValueError):
                     continue
-                if months < 1 or price < 0:
+                if months < 1 or price < 10:
                     continue
                 entries.append((months, price))
         if not entries:
@@ -422,6 +716,9 @@ class DB:
         return entries
 
     async def upsert_price(self, months: int, price: int) -> None:
+        if price < 10:
+            # Минимальная стоимость тарифа ограничена правилами СБП.
+            raise ValueError("Минимальная цена тарифа — 10 ₽.")
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 "INSERT OR REPLACE INTO prices(months, price) VALUES(?, ?)",
@@ -447,10 +744,19 @@ class DB:
         amount: int,
         months: int,
         status: str = "PENDING",
+        *,
+        method: Optional[str] = None,
+        request_key: Optional[str] = None,
+        account_token: Optional[str] = None,
+        is_sbp: Optional[bool] = None,
     ) -> None:
         """Сохранить платёж в базе данных."""
 
         normalized_status = status.upper() if status else "PENDING"
+        normalized_method = (method or "card").strip().lower() or "card"
+        sbp_flag = 1 if (is_sbp if is_sbp is not None else normalized_method == "sbp") else 0
+        request_value = (request_key or "").strip() or None
+        account_value = (account_token or "").strip() or None
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
@@ -462,17 +768,29 @@ class DB:
                 await db.execute(
                     """
                     UPDATE payments
-                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?
+                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?, method=?, is_sbp=?, request_key=?, account_token=?
                     WHERE id=?
                     """,
-                    (user_id, order_id, payment_id, amount, months, normalized_status, row["id"]),
+                    (
+                        user_id,
+                        order_id,
+                        payment_id,
+                        amount,
+                        months,
+                        normalized_status,
+                        normalized_method,
+                        sbp_flag,
+                        request_value,
+                        account_value,
+                        row["id"],
+                    ),
                 )
             else:
                 created_at = int(time.time())
                 await db.execute(
                     """
-                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at, method, is_sbp, request_key, account_token)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id,
@@ -482,9 +800,27 @@ class DB:
                         months,
                         normalized_status,
                         created_at,
+                        normalized_method,
+                        sbp_flag,
+                        request_value,
+                        account_value,
                     ),
                 )
             await db.commit()
+
+    async def set_payment_method(self, payment_id: str, method: Optional[str]) -> bool:
+        """Обновить способ оплаты для конкретного платежа."""
+
+        normalized_method = (method or "").strip().lower()
+        if not normalized_method:
+            normalized_method = "card"
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "UPDATE payments SET method=? WHERE payment_id=?",
+                (normalized_method, payment_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
 
     async def set_payment_status(self, payment_id: str, status: str) -> bool:
         """Обновить статус платежа."""
@@ -499,6 +835,25 @@ class DB:
             )
             await db.commit()
             return cur.rowcount > 0
+
+    async def has_confirmed_card_payment(
+        self, user_id: int, exclude_payment_id: Optional[str] = None
+    ) -> bool:
+        """Проверить, есть ли у пользователя подтверждённые оплаты картой."""
+
+        query = (
+            "SELECT 1 FROM payments WHERE user_id=? AND method='card' "
+            "AND UPPER(status)='CONFIRMED'"
+        )
+        params: list[object] = [user_id]
+        if exclude_payment_id:
+            query += " AND payment_id<>?"
+            params.append(exclude_payment_id)
+        query += " LIMIT 1"
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(query, params)
+            row = await cur.fetchone()
+            return row is not None
 
     async def get_payment_by_payment_id(
         self, payment_id: str
@@ -724,10 +1079,75 @@ class DB:
             )
             await conn.commit()
 
+    async def extend_subscription_minutes(self, user_id: int, minutes: int) -> None:
+        """Продлить подписку на указанное число минут (тестовый режим)."""
+
+        if minutes <= 0:
+            return
+        delta = int(timedelta(minutes=minutes).total_seconds())
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT invite_issued, trial_end FROM users WHERE user_id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await conn.commit()
+                return
+            invite_flag = 0
+            trial_end = 0
+            if hasattr(row, "keys"):
+                if "invite_issued" in row.keys():
+                    invite_flag = self._safe_int(row["invite_issued"])
+                if "trial_end" in row.keys():
+                    trial_end = self._safe_int(row["trial_end"])
+            now_ts = int(datetime.utcnow().timestamp())
+            current_sub_end = await self._get_subscription_end_internal(conn, user_id)
+            base = max(current_sub_end, now_ts)
+            new_end = base + delta
+            expired_before = current_sub_end <= now_ts
+            new_invite_flag = 0 if expired_before else invite_flag
+            stamp = int(time.time())
+            await conn.execute(
+                """
+                INSERT INTO subscriptions(user_id, end_at, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET end_at=excluded.end_at, updated_at=excluded.updated_at
+                """,
+                (user_id, new_end, stamp),
+            )
+            new_expires = max(trial_end, new_end)
+            await conn.execute(
+                "UPDATE users SET invite_issued=?, expires_at=? WHERE user_id=?",
+                (new_invite_flag, new_expires, user_id),
+            )
+            await conn.commit()
+
     async def list_expired(self, now_ts: int) -> List[aiosqlite.Row]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT * FROM users WHERE expires_at<?", (now_ts,))
+            cur = await db.execute(
+                """
+                SELECT
+                    u.user_id,
+                    u.started_at,
+                    u.expires_at,
+                    u.auto_renew,
+                    u.paid_only,
+                    u.accepted_legal,
+                    u.accepted_at,
+                    u.invite_issued,
+                    u.trial_start,
+                    u.trial_end,
+                    s.end_at AS subscription_end_at,
+                    s.updated_at AS subscription_updated_at
+                FROM users AS u
+                LEFT JOIN subscriptions AS s ON s.user_id = u.user_id
+                WHERE u.expires_at<?
+                """,
+                (now_ts,),
+            )
             return await cur.fetchall()
 
     async def use_coupon(self, code: str, user_id: int) -> tuple[bool, str, str | None]:
@@ -756,7 +1176,7 @@ class DB:
                 try:
                     expires_at = int(expires_raw)
                 except (TypeError, ValueError):
-                    logging.warning("Некорректное значение срока действия промокода %s: %s", normalized, expires_raw)
+                    logger.warning("Некорректное значение срока действия промокода %s: %s", normalized, expires_raw)
             if expires_at is not None and expires_at < now_ts:
                 return False, "Промокод недействителен или истёк.", row["kind"]
 
@@ -772,7 +1192,7 @@ class DB:
             # Здесь можно расширить логику для разных типов купонов (скидки, бонусы и т.д.)
             await db.commit()
 
-        logging.info("Промокод %s применён пользователем %s как тип %s", normalized, user_id, kind)
+        logger.info("Промокод %s применён пользователем %s как тип %s", normalized, user_id, kind)
         return True, "Промокод успешно активирован.", kind
 
     async def gen_coupons(self, kind: str, count: int) -> List[str]:

@@ -1,41 +1,357 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta
+import json
+from typing import NamedTuple
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from datetime import datetime
-import logging
+from apscheduler.triggers.interval import IntervalTrigger
 import pytz
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from config import config
 from db import DB
+from logger import logger
+from payments import charge_sbp_autopayment
+from t_pay import TBankApiError, TBankHttpError
+
+DEFAULT_RECURRENT_IP = "127.0.0.1"
+RETRY_PAYMENT_CALLBACK = "payment:retry"
+
+
+FAILURE_MESSAGE = "Не удалось списать, автопродление отключено."
+EXPIRED_MESSAGE = "Срок подписки истёк. Продлите, чтобы восстановить доступ."
+
+
+class AutoRenewResult(NamedTuple):
+    """Результат попытки автопродления."""
+
+    success: bool
+    attempted: bool
+    amount: int
+    user_notified: bool = False
+
+def _retry_markup() -> InlineKeyboardMarkup:
+    """Построить клавиатуру для повторного списания."""
+
+    button = InlineKeyboardButton(text="🔄 Повторить платёж", callback_data=RETRY_PAYMENT_CALLBACK)
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+
+def _format_date(ts: int) -> str:
+    """Вернуть строку даты в формате ДД.ММ.ГГГГ."""
+
+    return datetime.utcfromtimestamp(ts).strftime("%d.%m.%Y")
+
+
+def _next_month_date(now_ts: int) -> int:
+    """Вернуть таймстамп через условные 30 дней от указанного момента."""
+
+    future = datetime.utcfromtimestamp(now_ts) + timedelta(days=30)
+    return int(future.timestamp())
+
+
+async def _was_last_payment_sbp(db: DB, user_id: int) -> bool:
+    """Понять, пользовался ли пользователь оплатой через СБП."""
+
+    if user_id <= 0:
+        return False
+    try:
+        payment = await db.get_latest_payment(user_id)
+    except Exception:  # noqa: BLE001
+        return False
+    if not payment:
+        return False
+    try:
+        method = str(payment["method"] or "").strip().lower()
+    except (KeyError, TypeError, ValueError):
+        return False
+    return method == "sbp"
+
+
+async def try_auto_renew(
+    bot: Bot,
+    db: DB,
+    user_row,
+    now_ts: int | None = None,
+    *,
+    ip: str | None = None,
+    force: bool = False,
+) -> AutoRenewResult:
+    """Попытаться продлить подписку пользователя через автосписание."""
+
+    # Параметр force позволяет запускать списание вручную, даже если флаг auto_renew снят.
+
+    row_dict = dict(user_row)
+    user_id = int(row_dict.get("user_id", 0))
+    auto_renew_flag = bool(row_dict.get("auto_renew"))
+    test_interval = config.SBP_TEST_INTERVAL_MINUTES or config.TEST_RENEW_INTERVAL_MINUTES
+    account_token = (row_dict.get("account_token") or "").strip()
+    if not account_token:
+        account_token = (await db.get_account_token(user_id)) or ""
+    if user_id <= 0:
+        return AutoRenewResult(False, False, 0)
+    should_attempt = auto_renew_flag or force
+    if not should_attempt:
+        return AutoRenewResult(False, False, 0)
+    if not account_token:
+        if should_attempt:
+            await db.log_payment_attempt(
+                user_id,
+                "SKIPPED",
+                "Нет account_token для автопродления через СБП",
+                payment_type="sbp",
+            )
+        return AutoRenewResult(False, False, 0)
+
+    months_to_extend = 1
+    parent_amount = 0
+    try:
+        last_payment = await db.get_latest_payment(user_id)
+    except Exception:  # noqa: BLE001
+        last_payment = None
+    if last_payment is not None:
+        try:
+            months_to_extend = int(last_payment.get("months", months_to_extend))  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001
+            months_to_extend = 1
+        try:
+            parent_amount = int(last_payment.get("amount", 0))  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001
+            parent_amount = 0
+    if months_to_extend <= 0:
+        months_to_extend = 1
+    if parent_amount <= 0:
+        await db.log_payment_attempt(
+            user_id,
+            "SKIPPED",
+            "Не удалось определить сумму для автопродления через СБП",
+            payment_type="sbp",
+        )
+        return AutoRenewResult(False, False, 0)
+
+    if now_ts is None:
+        now_ts = int(datetime.utcnow().timestamp())
+
+    async def _notify_failure() -> bool:
+        try:
+            await bot.send_message(
+                user_id,
+                FAILURE_MESSAGE,
+                reply_markup=_retry_markup(),
+            )
+            return True
+        except Exception:
+            logger.debug(
+                "Не удалось уведомить пользователя %s об ошибке автосписания",
+                user_id,
+            )
+            return False
+
+    try:
+        response = await charge_sbp_autopayment(
+            user_id,
+            months_to_extend,
+            parent_amount,
+            account_token,
+            db=db,
+            ip=ip or DEFAULT_RECURRENT_IP,
+        )
+    except (TBankHttpError, TBankApiError) as err:
+        logger.warning("Автосписание через СБП отклонено: user=%s | %s", user_id, err)
+        await db.set_auto_renew(user_id, False)
+        await db.log_payment_attempt(user_id, "FAILED", str(err), payment_type="sbp")
+        notified = await _notify_failure()
+        return AutoRenewResult(False, True, 0, notified)
+    except Exception as err:  # noqa: BLE001
+        logger.exception(
+            "Неожиданная ошибка автосписания через СБП для пользователя %s",
+            user_id,
+            exc_info=err,
+        )
+        await db.set_auto_renew(user_id, False)
+        await db.log_payment_attempt(user_id, "ERROR", str(err), payment_type="sbp")
+        notified = await _notify_failure()
+        return AutoRenewResult(False, True, 0, notified)
+
+    charge_response = response.get("charge_response") or {}
+    status = (response.get("status") or charge_response.get("Status") or "").upper()
+    success_flag = bool(charge_response.get("Success")) or status in {"CONFIRMED", "COMPLETED"}
+    if not success_flag:
+        info = json.dumps(charge_response or response, ensure_ascii=False)[:500]
+        logger.warning("Автосписание через СБП неуспешно: user=%s | %s", user_id, info)
+        await db.set_auto_renew(user_id, False)
+        await db.log_payment_attempt(user_id, "FAILED", info, payment_type="sbp")
+        notified = await _notify_failure()
+        return AutoRenewResult(False, True, 0, notified)
+
+    payment_id_value = response.get("payment_id") or charge_response.get("PaymentId")
+    payment_id_str = str(payment_id_value).strip() if payment_id_value else ""
+
+    if test_interval:
+        await db.extend_subscription_minutes(user_id, test_interval)
+    else:
+        await db.extend_subscription(user_id, months_to_extend)
+    try:
+        await db.set_paid_only(user_id, False)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "Не удалось сбросить флаг paid_only после автопродления для пользователя %s",
+            user_id,
+        )
+    extended_until = await db.get_subscription_end(user_id)
+    if not extended_until:
+        base_dt = datetime.utcfromtimestamp(now_ts or int(datetime.utcnow().timestamp()))
+        delta_dt = timedelta(minutes=test_interval) if test_interval else timedelta(days=30)
+        extended_until = int((base_dt + delta_dt).timestamp())
+
+    if payment_id_str:
+        await db.set_payment_status(payment_id_str, "CONFIRMED")
+        await db.set_payment_account_token(payment_id_str, account_token)
+
+    await db.log_payment_attempt(
+        user_id,
+        "SUCCESS",
+        json.dumps(charge_response or response, ensure_ascii=False)[:500],
+        payment_type="sbp",
+    )
+
+    success_notified = False
+    amount_text = (
+        f"{parent_amount / 100:.2f}" if parent_amount and parent_amount % 100 == 0 else str(parent_amount)
+    )
+    try:
+        await bot.send_message(
+            user_id,
+            f"✅ Списано {amount_text}₽, подписка продлена до {_format_date(extended_until)}",
+        )
+        success_notified = True
+    except Exception:
+        logger.debug("Не удалось отправить сообщение об успешном продлении пользователю %s", user_id)
+
+    logger.info("Автопродление через СБП успешно: user=%s до %s", user_id, extended_until)
+    return AutoRenewResult(True, True, max(0, parent_amount), success_notified)
+
 
 async def daily_check(bot: Bot, db: DB):
-    now_ts = int(datetime.utcnow().timestamp())
-    target_chat_id = await db.get_target_chat_id()
-    if target_chat_id is None:
-        logging.info("Пропуск проверки подписок: чат ещё не привязан.")
-        return
-    expired = await db.list_expired(now_ts)
-    for row in expired:
-        user_id = row["user_id"]
-        if row["auto_renew"]:
-            await db.extend_subscription(user_id, months=1)
-            try:
-                await bot.send_message(user_id, "Подписка автопродлена на 1 месяц (заглушка оплаты).")
-            except Exception:
-                pass
-            continue
+    try:
+        now_ts = int(datetime.utcnow().timestamp())
+        target_chat_id = await db.get_target_chat_id()
+        if target_chat_id is None:
+            logger.info("Пропуск проверки подписок: чат ещё не привязан.")
+            return
 
-        try:
-            await bot.ban_chat_member(target_chat_id, user_id)
-            await bot.unban_chat_member(target_chat_id, user_id)  # чтобы мог войти позже по новой ссылке
-        except Exception:
-            pass
-        try:
-            await bot.send_message(user_id, "Срок подписки истёк. Оплатите, чтобы вернуться в канал.")
-        except Exception:
-            pass
+        expired = await db.list_expired(now_ts)
+        auto_success_count = 0
+        auto_fail_count = 0
+        auto_success_amount = 0
+        for row in expired:
+            user_id = int(row["user_id"])
+
+            renew_result = await try_auto_renew(bot, db, row, now_ts)
+            if renew_result.success:
+                auto_success_count += 1
+                auto_success_amount += max(0, renew_result.amount)
+                continue
+            if renew_result.attempted:
+                auto_fail_count += 1
+
+            row_dict = dict(row)
+            auto_flag = bool(row_dict.get("auto_renew"))
+            if auto_flag:
+                await db.set_auto_renew(user_id, False)
+
+            sbp_recent = False
+            if not renew_result.attempted and not auto_flag:
+                sbp_recent = await _was_last_payment_sbp(db, user_id)
+
+            try:
+                await db.log_payment_attempt(
+                    user_id,
+                    "EXPIRED",
+                    "Подписка неактивна, пользователь будет удалён",
+                    payment_type="sbp" if sbp_recent else "card",
+                )
+            except Exception:
+                logger.debug("Не удалось записать лог об удалении пользователя %s", user_id)
+
+            try:
+                await bot.ban_chat_member(target_chat_id, user_id)
+                await bot.unban_chat_member(target_chat_id, user_id)
+            except Exception:
+                logger.debug("Не удалось удалить пользователя %s из канала", user_id)
+            notify_text = None
+            notify_markup = None
+            if renew_result.attempted:
+                notify_text = FAILURE_MESSAGE
+                notify_markup = _retry_markup()
+                if renew_result.user_notified:
+                    notify_text = None
+            else:
+                if auto_flag:
+                    notify_text = FAILURE_MESSAGE
+                    notify_markup = _retry_markup()
+                else:
+                    notify_text = EXPIRED_MESSAGE
+            if notify_text:
+                try:
+                    await bot.send_message(
+                        user_id,
+                        notify_text,
+                        reply_markup=notify_markup,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Не удалось уведомить пользователя %s об окончании подписки",
+                        user_id,
+                    )
+
+        if auto_success_count or auto_fail_count:
+            summary_lines = [
+                "💳 Автосписания за последний цикл:",
+                f"✅ Успешно: {auto_success_count}",
+                f"⚠️ Ошибки: {auto_fail_count}",
+            ]
+            if auto_success_amount > 0:
+                summary_lines.append(f"💰 Сумма: {auto_success_amount / 100:.2f} ₽")
+            summary_text = "\n".join(summary_lines)
+            for admin_id in config.SUPER_ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, summary_text)
+                except Exception:
+                    logger.debug(
+                        "Не удалось отправить администратору %s сводку автосписаний",
+                        admin_id,
+                    )
+    except asyncio.CancelledError:
+        return
+
 
 def setup_scheduler(bot: Bot, db: DB, tz_name: str = "Europe/Moscow") -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=pytz.timezone(tz_name))
-    # Каждый день в 03:10 по локальному часовому поясу
-    scheduler.add_job(daily_check, CronTrigger(hour=3, minute=10), kwargs={"bot": bot, "db": db})
+    interval_minutes = config.SBP_TEST_INTERVAL_MINUTES or config.TEST_RENEW_INTERVAL_MINUTES
+    if interval_minutes:
+        scheduler.add_job(
+            daily_check,
+            IntervalTrigger(minutes=interval_minutes),
+            kwargs={"bot": bot, "db": db},
+        )
+    else:
+        scheduler.add_job(
+            daily_check,
+            CronTrigger(hour=3, minute=10),
+            kwargs={"bot": bot, "db": db},
+        )
     scheduler.start()
     return scheduler
+
+
+__all__ = [
+    "daily_check",
+    "setup_scheduler",
+    "try_auto_renew",
+    "RETRY_PAYMENT_CALLBACK",
+]

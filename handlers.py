@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-import logging
+from collections.abc import Mapping, Sequence
+from typing import Any
+import re
 
 import aiosqlite
 from aiogram import Bot, F, Router
@@ -24,10 +26,13 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import config, get_docs_map
 from db import DB
-from payments import check_payment_status, create_payment
-from scheduler import daily_check
+from logger import logger
+from payments import check_payment_status, form_sbp_qr, init_sbp_payment
+from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
 
 router = Router()
+
+ADMIN_IDS = set(config.SUPER_ADMIN_IDS)
 
 DEFAULT_TRIAL_DAYS = 3
 DEFAULT_AUTO_RENEW = True
@@ -45,6 +50,120 @@ CANCEL_REPLY = ReplyKeyboardMarkup(
 )
 
 START_TEXT = "🎟️ Доступ в канал\nВыберите действие ниже.\n\nℹ️ Пробный период доступен по промокоду."
+
+
+def _safe_int(value: object) -> int:
+    """Безопасно преобразовать значение в int."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _row_to_dict(row: aiosqlite.Row | None) -> dict[str, object]:
+    """Преобразовать строку БД в словарь."""
+
+    if row is None:
+        return {}
+    if hasattr(row, "keys"):
+        return {key: row[key] for key in row.keys()}
+    return dict(row)
+
+
+def _normalize_payment_method(raw: str | None) -> str:
+    """Нормализовать способ оплаты для внутренних колбэков."""
+
+    if not raw:
+        return "sbp"
+    lowered = raw.strip().lower()
+    if lowered == "sbp":
+        return "sbp"
+    return "sbp"
+
+
+def _format_method_hint(method: str) -> str:
+    """Вернуть описание способа оплаты для текстов пользователю."""
+
+    return "через СБП"
+
+
+def _validate_contact_value(value: str) -> tuple[str | None, str | None]:
+    """Проверить контакт пользователя и определить тип (телефон или email)."""
+
+    if not value:
+        return None, None
+    cleaned = value.strip()
+    phone_pattern = re.compile(r"^\+7\d{10}$")
+    email_pattern = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
+    if phone_pattern.match(cleaned):
+        return "phone", cleaned
+    if email_pattern.match(cleaned):
+        return "email", cleaned
+    return None, None
+
+
+def _build_consent_text(months: int, price: int, method: str) -> str:
+    """Сформировать текст согласия перед оплатой в зависимости от метода."""
+
+    base = [f"Условия подписки: сумма {price}₽, периодичность {months} мес."]
+    if method == "sbp":
+        details = [
+            "",
+            "Оплата проходит через СБП.",
+            "Автопродление работает при привязанном счёте и включённом тумблере в личном меню бота.",
+            "",
+            "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
+        ]
+    else:
+        details = [
+            "",
+            "При оплате картой автопродление будет включено автоматически.",
+            "Вы сможете отключить его в любой момент в личном меню бота (кнопка «Автопродление»).",
+            "",
+            "Списания будут происходить автоматически, если автопродление активно.",
+            "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
+        ]
+    return "\n".join(base + details)
+
+
+async def _ensure_subscription_state(
+    bot: Bot | None,
+    db: DB,
+    user_row: aiosqlite.Row | None,
+) -> tuple[aiosqlite.Row | None, bool]:
+    """Проверить актуальность подписки и при необходимости инициировать автосписание."""
+
+    if user_row is None:
+        return None, True
+
+    row_data = _row_to_dict(user_row)
+    user_id = _safe_int(row_data.get("user_id"))
+    now_ts = int(datetime.utcnow().timestamp())
+    expires_at = _safe_int(row_data.get("expires_at"))
+    auto_flag = bool(row_data.get("auto_renew"))
+
+    if expires_at and expires_at < now_ts and auto_flag:
+        if bot is None:
+            logger.warning(
+                "Не удалось инициировать автосписание при входе пользователя %s: бот отсутствует.",
+                user_id,
+            )
+        else:
+            try:
+                await try_auto_renew(bot, db, user_row, now_ts)
+            except Exception as err:  # noqa: BLE001
+                logger.exception(
+                    "Ошибка при запуске автопродления для пользователя %s", user_id, exc_info=err
+                )
+        user_row = await db.get_user(user_id)
+        row_data = _row_to_dict(user_row)
+        auto_flag = bool(row_data.get("auto_renew"))
+        expires_at = _safe_int(row_data.get("expires_at"))
+        now_ts = int(datetime.utcnow().timestamp())
+
+    blocked = expires_at <= now_ts
+    return user_row, blocked
 
 
 class BindChat(StatesGroup):
@@ -75,6 +194,12 @@ class User(StatesGroup):
     WaitPromoCode = State()
 
 
+class BuyContactState(StatesGroup):
+    """Состояние запроса контактных данных для чека."""
+
+    waiting_for_contact = State()
+
+
 def escape_md(text: str) -> str:
     """Экранировать текст для MarkdownV2."""
 
@@ -96,7 +221,7 @@ def format_short_date(ts: int) -> str:
 def is_super_admin(user_id: int) -> bool:
     """Проверить, является ли пользователь суперадмином."""
 
-    return user_id in config.SUPER_ADMIN_IDS
+    return user_id in ADMIN_IDS
 
 
 def inline_emoji(flag: bool) -> str:
@@ -187,14 +312,14 @@ async def make_one_time_invite(
                 "Чат недоступен боту.",
                 "Привяжите чат заново.",
             )
-        logging.exception("Ошибка при получении сведений о боте", exc_info=err)
+        logger.exception("Ошибка при получении сведений о боте", exc_info=err)
         return (
             False,
             "Не удалось проверить права.",
             err_text,
         )
     except Exception as err:
-        logging.exception("Не удалось получить сведения о боте", exc_info=err)
+        logger.exception("Не удалось получить сведения о боте", exc_info=err)
         return (
             False,
             "Не удалось проверить права.",
@@ -227,7 +352,7 @@ async def make_one_time_invite(
             expire_date=expire_ts,
             creates_join_request=False,
         )
-        logging.info(
+        logger.info(
             "Создана одноразовая ссылка: chat_id=%s limit=%s expire=%s join_request=%s link=%s",
             chat_id,
             getattr(link, "member_limit", None),
@@ -255,7 +380,7 @@ async def make_one_time_invite(
                     "Дайте право «Пригласительные ссылки».",
                 )
             except Exception as export_err:
-                logging.exception("Ошибка при получении постоянной ссылки", exc_info=export_err)
+                logger.exception("Ошибка при получении постоянной ссылки", exc_info=export_err)
                 return (
                     False,
                     "Недостаточно прав для создания одноразовой ссылки.",
@@ -278,7 +403,7 @@ async def make_one_time_invite(
             "Проверьте права и тип чата.",
         )
     except Exception as err:
-        logging.exception("Неожиданная ошибка при создании ссылки", exc_info=err)
+        logger.exception("Неожиданная ошибка при создании ссылки", exc_info=err)
         return (
             False,
             "Не удалось создать ссылку.",
@@ -299,6 +424,8 @@ async def send_main_menu_screen(
     message: Message,
     db: DB,
     notice: str | None = None,
+    *,
+    bot: Bot | None = None,
 ) -> None:
     """Показать главное меню пользователю с удалением реплай-клавиатуры."""
 
@@ -309,8 +436,21 @@ async def send_main_menu_screen(
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
-    menu = await get_user_menu(db, message.from_user.id)
-    main_text = await compose_main_menu_text(db, message.from_user.id)
+    effective_bot = bot or getattr(message, "bot", None)
+    user = await db.get_user(message.from_user.id)
+    user, blocked = await _ensure_subscription_state(effective_bot, db, user)
+    menu = await get_user_menu(
+        db,
+        message.from_user.id,
+        cached_user=user,
+        blocked=blocked,
+    )
+    main_text = await compose_main_menu_text(
+        db,
+        message.from_user.id,
+        cached_user=user,
+        blocked=blocked,
+    )
     await message.answer(
         escape_md(main_text),
         reply_markup=menu,
@@ -324,11 +464,13 @@ async def go_home_from_state(
     state: FSMContext,
     db: DB,
     notice: str | None = None,
+    *,
+    bot: Bot | None = None,
 ) -> None:
     """Очистить состояние и вернуть пользователя в главное меню."""
 
     await state.clear()
-    await send_main_menu_screen(message, db, notice)
+    await send_main_menu_screen(message, db, notice, bot=bot)
 
 
 def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMarkup:
@@ -385,15 +527,7 @@ def build_user_menu_keyboard(
     """Собрать пользовательскую inline-клавиатуру."""
 
     builder = InlineKeyboardBuilder()
-    for months in price_months[:6]:
-        builder.button(
-            text=f"💳 Купить {months} мес",
-            callback_data=f"buy:months:{months}",
-        )
-    builder.button(
-        text="💳 Оплатить подписку",
-        callback_data="buy:open",
-    )
+    builder.button(text="💳 Купить подписку", callback_data="buy:open:sbp")
     builder.button(
         text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
         callback_data="ar:toggle",
@@ -403,24 +537,48 @@ def build_user_menu_keyboard(
     builder.button(text="📄 Документы", callback_data="docs:open")
     if is_admin:
         builder.button(text="🛠️ Админ-панель", callback_data="admin:open")
-    builder.adjust(2, 2, 2, 1)
+    builder.adjust(1)
     return builder.as_markup()
 
 
-async def get_user_menu(db: DB, user_id: int) -> InlineKeyboardMarkup:
+def build_subscription_purchase_menu() -> InlineKeyboardMarkup:
+    """Построить меню для пользователя без активной подписки."""
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 Купить подписку", callback_data="buy:open:sbp")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+async def get_user_menu(
+    db: DB,
+    user_id: int,
+    *,
+    cached_user: aiosqlite.Row | None = None,
+    blocked: bool | None = None,
+) -> InlineKeyboardMarkup:
     """Получить клавиатуру пользователя с актуальными данными."""
 
-    user = await db.get_user(user_id)
+    user = cached_user or await db.get_user(user_id)
     auto_flag = bool(user and user["auto_renew"])
     price_months = [months for months, _ in await db.get_all_prices()]
     return build_user_menu_keyboard(auto_flag, is_super_admin(user_id), price_months)
 
 
-async def compose_main_menu_text(db: DB, user_id: int) -> str:
+async def compose_main_menu_text(
+    db: DB,
+    user_id: int,
+    *,
+    cached_user: aiosqlite.Row | None = None,
+    blocked: bool | None = None,
+) -> str:
     """Сформировать текст главного меню с указанием статуса доступа."""
 
     now_ts = int(datetime.utcnow().timestamp())
-    user = await db.get_user(user_id)
+    user = cached_user or await db.get_user(user_id)
+    if blocked is None:
+        expires_at = _safe_int(user["expires_at"]) if user else 0
+        blocked = expires_at <= now_ts
     trial_end = 0
     if user and hasattr(user, "keys") and "trial_end" in user.keys():
         try:
@@ -496,6 +654,18 @@ async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     return text, builder.as_markup()
 
 
+async def show_admin_panel(message: Message, db: DB) -> None:
+    """Показать суперадмину актуальную админ-панель."""
+
+    text, markup = await build_admin_panel(db)
+    await message.answer(
+        text,
+        reply_markup=markup,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+
+
 async def render_admin_panel(message: Message, db: DB) -> None:
     """Отобразить или обновить админ-панель в заданном сообщении."""
 
@@ -548,44 +718,58 @@ async def build_price_list_view(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     """Сформировать текст и клавиатуру списка тарифов."""
 
     prices = await db.get_all_prices()
-    lines = ["💰 Тарифы", "Выберите действие."]
-    if prices:
-        lines.append("")
-        for months, price in prices:
-            lines.append(f"{months} мес — {price}₽")
-    else:
-        lines.append("")
-        lines.append("Тарифов пока нет.")
-    text = "\n".join(escape_md(line) if line else "" for line in lines)
+    lines = ["💰 Тарифы", "Выберите тариф для управления."]
+    text = "\n".join(escape_md(line) for line in lines)
 
     builder = InlineKeyboardBuilder()
-    for months, _ in prices:
-        builder.button(text="✏️ Редактировать", callback_data=f"price:edit:{months}")
-        builder.button(text="🗑️ Удалить", callback_data=f"price:del:{months}")
+    for months, price in prices:
+        builder.button(
+            text=f"{months} мес — {price}₽",
+            callback_data=f"price:edit:{months}",
+        )
     builder.button(text="➕ Добавить тариф", callback_data="price:add")
     builder.button(text="⬅️ Назад", callback_data="admin:open")
-    builder.adjust(2, 1, 1)
+    builder.adjust(1)
     return text, builder.as_markup()
 
 
-async def render_price_list(message: Message, db: DB) -> None:
-    """Показать экран управления тарифами."""
+async def _send_price_list(
+    bot: Bot,
+    chat_id: int,
+    db: DB,
+    *,
+    state: FSMContext | None = None,
+    previous_message_id: int | None = None,
+) -> None:
+    """Отрисовать экран тарифов новой клавиатурой и при необходимости обновить стейт."""
 
     text, markup = await build_price_list_view(db)
-    try:
-        await message.edit_text(
-            text,
-            reply_markup=markup,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
-    except TelegramBadRequest:
-        await message.answer(
-            text,
-            reply_markup=markup,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
+    if previous_message_id:
+        try:
+            await bot.delete_message(chat_id, previous_message_id)
+        except TelegramBadRequest:
+            pass
+    sent = await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=markup,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    if state:
+        await state.update_data(price_chat_id=chat_id, price_message_id=sent.message_id)
+
+
+async def render_price_list(message: Message, db: DB, state: FSMContext | None = None) -> None:
+    """Показать экран управления тарифами."""
+
+    await _send_price_list(
+        message.bot,
+        message.chat.id,
+        db,
+        state=state,
+        previous_message_id=message.message_id,
+    )
 
 
 async def render_price_list_by_state(bot: Bot, state: FSMContext, db: DB) -> None:
@@ -594,26 +778,15 @@ async def render_price_list_by_state(bot: Bot, state: FSMContext, db: DB) -> Non
     data = await state.get_data()
     chat_id = data.get("price_chat_id")
     message_id = data.get("price_message_id")
-    if not chat_id or not message_id:
+    if not chat_id:
         return
-    text, markup = await build_price_list_view(db)
-    try:
-        await bot.edit_message_text(
-            text,
-            chat_id=chat_id,
-            message_id=message_id,
-            reply_markup=markup,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
-    except TelegramBadRequest:
-        await bot.send_message(
-            chat_id,
-            text,
-            reply_markup=markup,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
+    await _send_price_list(
+        bot,
+        chat_id,
+        db,
+        state=state,
+        previous_message_id=message_id,
+    )
 
 
 async def render_price_edit(message: Message, months: int) -> None:
@@ -624,8 +797,9 @@ async def render_price_edit(message: Message, months: int) -> None:
     builder = InlineKeyboardBuilder()
     builder.button(text="⌛ Изменить месяцы", callback_data=f"price:editm:{months}")
     builder.button(text="💵 Изменить цену", callback_data=f"price:editp:{months}")
+    builder.button(text="🗑️ Удалить", callback_data=f"price:del:{months}")
     builder.button(text="⬅️ Назад", callback_data="price:list")
-    builder.adjust(2, 1)
+    builder.adjust(2, 1, 1)
     try:
         await message.edit_text(
             text,
@@ -782,6 +956,9 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
 
     await state.clear()
     user_id = message.from_user.id
+    if user_id in ADMIN_IDS:
+        await show_admin_panel(message, db)
+        return
     now_ts = int(datetime.utcnow().timestamp())
     auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
     trial_days = await db.get_trial_days_global(DEFAULT_TRIAL_DAYS)
@@ -808,8 +985,14 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
             disable_web_page_preview=True,
         )
         return
-    menu = await get_user_menu(db, user_id)
-    main_text = await compose_main_menu_text(db, user_id)
+    user, blocked = await _ensure_subscription_state(message.bot, db, user)
+    menu = await get_user_menu(db, user_id, cached_user=user, blocked=blocked)
+    main_text = await compose_main_menu_text(
+        db,
+        user_id,
+        cached_user=user,
+        blocked=blocked,
+    )
     await message.answer(
         escape_md(main_text),
         reply_markup=menu,
@@ -846,9 +1029,15 @@ async def handle_menu_home(callback: CallbackQuery, state: FSMContext, db: DB) -
         await callback.answer()
         return
 
-    menu = await get_user_menu(db, user_id)
+    user, blocked = await _ensure_subscription_state(callback.bot, db, user)
+    menu = await get_user_menu(db, user_id, cached_user=user, blocked=blocked)
     if callback.message:
-        main_text = await compose_main_menu_text(db, user_id)
+        main_text = await compose_main_menu_text(
+            db,
+            user_id,
+            cached_user=user,
+            blocked=blocked,
+        )
         await callback.message.answer(
             escape_md(main_text),
             reply_markup=menu,
@@ -877,11 +1066,12 @@ async def cmd_test_expire_me(message: Message, db: DB, bot: Bot) -> None:
     try:
         await daily_check(bot, db)
     except Exception as err:  # noqa: BLE001
-        logging.exception("Сбой тестовой проверки истечения подписки", exc_info=err)
+        logger.exception("Сбой тестовой проверки истечения подписки", exc_info=err)
     await send_main_menu_screen(
         message,
         db,
         notice="Тест: подписка и триал завершены, проверка истечения выполнена.",
+        bot=bot,
     )
 
 
@@ -1066,10 +1256,12 @@ async def docs_back(callback: CallbackQuery, db: DB) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == "buy:open")
+@router.callback_query(F.data.startswith("buy:open"))
 async def handle_buy_open(callback: CallbackQuery, db: DB) -> None:
     """Показать пользователю список тарифов для оплаты."""
 
+    parts = (callback.data or "").split(":")
+    method = _normalize_payment_method(parts[2] if len(parts) > 2 else None)
     prices = await db.get_all_prices()
     if not prices:
         await callback.answer("Тарифы пока не настроены.", show_alert=True)
@@ -1078,13 +1270,15 @@ async def handle_buy_open(callback: CallbackQuery, db: DB) -> None:
     for months, price in prices[:6]:
         builder.button(
             text=f"{months} мес — {price}₽",
-            callback_data=f"buy:months:{months}",
+            callback_data=f"buy:method:{method}:{months}",
         )
     builder.button(text="❌ Отмена", callback_data="buy:cancel")
     builder.adjust(1)
     if callback.message:
+        method_hint = _format_method_hint(method)
+        message_text = f"Выберите срок подписки для оплаты {method_hint}:"
         await callback.message.answer(
-            "Выберите срок подписки для оплаты:",
+            message_text,
             reply_markup=builder.as_markup(),
         )
     await callback.answer()
@@ -1103,15 +1297,75 @@ async def handle_buy_cancel(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("buy:months:"))
-async def handle_buy(callback: CallbackQuery, db: DB) -> None:
-    """Обработка покупки подписки."""
+async def _send_payment_consent(
+    callback: CallbackQuery,
+    method: str,
+    months: int,
+    price: int,
+    user_row: aiosqlite.Row | None,
+) -> None:
+    """Показать пользователю текст согласия перед созданием платежа."""
+
+    consent_text = _build_consent_text(months, price, method)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✔ Я согласен", callback_data=f"buy:confirm:{method}:{months}")
+    builder.button(text="❌ Отмена", callback_data="buy:cancel")
+    builder.adjust(1)
+    if callback.message:
+        hint = _format_method_hint(method)
+        await callback.message.answer(
+            f"{consent_text}\n\nСпособ оплаты: {hint}.",
+            reply_markup=builder.as_markup(),
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+async def _request_contact_details(
+    callback: CallbackQuery,
+    state: FSMContext,
+    method: str,
+    months: int,
+    price: int,
+) -> None:
+    """Запросить у пользователя контактные данные для формирования чека."""
+
+    await state.set_state(BuyContactState.waiting_for_contact)
+    await state.update_data(
+        pending_method=method,
+        pending_months=months,
+        pending_price=price,
+    )
+    if callback.message:
+        await callback.message.answer(
+            "Укажи телефон в формате +7XXXXXXXXXX или email, чтобы получить чек.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    await callback.answer("Ожидаю контакт для чека.")
+
+
+async def _handle_buy_callback(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
+    """Общая логика создания платежей по выбранному тарифу."""
 
     user_id = callback.from_user.id
     parts = (callback.data or "").split(":")
+    method = "sbp"
+    months_value = None
+    confirmed = False
+    if len(parts) >= 4 and parts[1] == "confirm":
+        confirmed = True
+        method = _normalize_payment_method(parts[2])
+        months_value = parts[3]
+    elif len(parts) >= 4 and parts[1] == "method":
+        method = _normalize_payment_method(parts[2])
+        months_value = parts[3]
+    elif len(parts) >= 3:
+        months_value = parts[2]
     try:
-        months = int(parts[2])
-    except (IndexError, ValueError):
+        months = int(months_value) if months_value is not None else 0
+    except (TypeError, ValueError):
+        months = 0
+    if months <= 0:
         await callback.answer("Не удалось определить срок подписки.", show_alert=True)
         return
     prices = await db.get_prices_dict()
@@ -1119,33 +1373,168 @@ async def handle_buy(callback: CallbackQuery, db: DB) -> None:
     if price is None:
         await callback.answer("Тариф не найден.", show_alert=True)
         return
+    user_row = await db.get_user(user_id)
+    if not confirmed:
+        await _send_payment_consent(callback, method, months, price, user_row)
+        return
+    await _request_contact_details(callback, state, method, months, price)
+    return
+
+
+async def _send_sbp_payment_details(
+    message: Message,
+    user_id: int,
+    months: int,
+    price: int,
+    payment_id: str,
+    db: DB,
+) -> None:
+    """Сформировать QR/ссылку для оплаты через СБП и отправить пользователю."""
+
     try:
-        payment_url = await create_payment(user_id, price, months)
+        qr_result = await form_sbp_qr(user_id, payment_id, db=db)
     except Exception as err:  # noqa: BLE001
-        logging.exception("Не удалось создать платёж", exc_info=err)
-        await callback.answer("Не удалось создать платёж. Попробуйте позже.", show_alert=True)
+        logger.exception("Не удалось получить QR для СБП", exc_info=err)
+        await message.answer(
+            "Не удалось сформировать QR. Попробуйте позже.",
+            reply_markup=main_menu_markup(),
+        )
         return
 
-    payment = await db.get_latest_payment(user_id, status="PENDING")
-    payment_id = payment["payment_id"] if payment else None
+    if qr_result is None:
+        warning_text = "❗ Ошибка получения QR для СБП. Попробуйте позже или оплатите позже."
+        await message.answer(warning_text, reply_markup=main_menu_markup())
+        return
+
     builder = InlineKeyboardBuilder()
-    builder.button(text="Перейти к оплате 💳", url=payment_url)
-    if payment_id:
-        builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
+    qr_url = qr_result.get("qr_url")
+    payload_url = qr_result.get("payload")
+    payment_link = qr_url or payload_url
+    if payment_link:
+        builder.button(text="Оплатить", url=str(payment_link))
+    builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
     builder.button(text="🏠 Главное меню", callback_data="menu:home")
     builder.adjust(1)
-    if callback.message:
-        text_lines = [
-            f"💳 Оплата подписки на {months} мес.",
-            f"Сумма к оплате: {price}₽.",
-            "Нажмите кнопку ниже, чтобы перейти к платёжной странице.",
-        ]
-        await callback.message.answer(
-            "\n".join(text_lines),
-            reply_markup=builder.as_markup(),
-            disable_web_page_preview=True,
+
+    message_lines = [
+        "📲 Оплата подписки через СБП.",
+        f"Срок: {months} мес., сумма: {price}₽.",
+        "Отсканируйте QR-код в приложении банка.",
+    ]
+
+    if not payment_link:
+        payload_text = qr_result.get("payload") or "(данные QR недоступны)"
+        message_lines.extend([
+            "",
+            "QR payload:",
+            str(payload_text),
+        ])
+    await message.answer(
+        "\n".join(message_lines),
+        reply_markup=builder.as_markup(),
+        disable_web_page_preview=True,
+    )
+
+
+async def _create_sbp_payment_with_contact(
+    message: Message,
+    db: DB,
+    user_id: int,
+    months: int,
+    price: int,
+    contact_type: str,
+    contact_value: str,
+) -> None:
+    """Создать платёж СБП с учётом контактных данных и отправить ссылку оплаты."""
+
+    try:
+        init_result = await init_sbp_payment(
+            user_id,
+            months,
+            price,
+            contact_type,
+            contact_value,
+            db=db,
         )
-    await callback.answer("Ссылка на оплату готова.")
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Init СБП не удался", exc_info=err)
+        await message.answer(
+            "Не удалось создать платёж СБП. Попробуйте позже.",
+            reply_markup=main_menu_markup(),
+        )
+        return
+
+    payment_id = init_result.get("payment_id")
+    if not payment_id:
+        await message.answer(
+            "T-Bank не вернул PaymentId. Попробуйте позже.",
+            reply_markup=main_menu_markup(),
+        )
+        return
+
+    await _send_sbp_payment_details(message, user_id, months, price, payment_id, db)
+
+@router.callback_query(F.data.startswith("buy:months:"))
+async def handle_buy(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
+    """Совместимость со старыми кнопками покупки."""
+
+    await _handle_buy_callback(callback, db, state)
+
+
+@router.callback_query(F.data.startswith("buy:method:"))
+async def handle_buy_with_method(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
+    """Создание оплаты с указанием конкретного способа."""
+
+    await _handle_buy_callback(callback, db, state)
+
+
+@router.callback_query(F.data.startswith("buy:confirm:"))
+async def handle_buy_confirm(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
+    """Создание оплаты после подтверждения согласия."""
+
+    await _handle_buy_callback(callback, db, state)
+
+
+@router.message(BuyContactState.waiting_for_contact)
+async def handle_buy_contact_input(message: Message, state: FSMContext, db: DB) -> None:
+    """Получить телефон или email для формирования чека перед оплатой."""
+
+    contact_type, contact_value = _validate_contact_value(message.text or "")
+    if not contact_type:
+        await message.answer("Отправь телефон в формате +7XXXXXXXXXX или email.")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+    try:
+        months = int(data.get("pending_months") or 0)
+    except (TypeError, ValueError):
+        months = 0
+    try:
+        price = int(data.get("pending_price") or 0)
+    except (TypeError, ValueError):
+        price = 0
+    method = str(data.get("pending_method") or "sbp").strip().lower()
+    if months <= 0 or price <= 0:
+        await message.answer("Не удалось определить параметры оплаты. Попробуйте ещё раз.", reply_markup=main_menu_markup())
+        return
+    if method != "sbp":
+        method = "sbp"
+
+    try:
+        await db.set_user_contact(message.from_user.id, contact_value)
+    except Exception as err:  # noqa: BLE001
+        logger.debug("Не удалось сохранить контакт пользователя %s: %s", message.from_user.id, err)
+
+    await _create_sbp_payment_with_contact(
+        message,
+        db,
+        message.from_user.id,
+        months,
+        price,
+        contact_type,
+        contact_value,
+    )
 
 
 @router.callback_query(F.data.startswith("payment:check:"))
@@ -1165,6 +1554,12 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
         return
 
     try:
+        payment_method = str(payment["method"] or "")
+    except (KeyError, TypeError, ValueError):
+        payment_method = ""
+    is_sbp_payment = payment_method.strip().lower() == "sbp"
+
+    try:
         confirmed = await check_payment_status(payment_id)
     except RuntimeError as err:
         await callback.answer(str(err), show_alert=True)
@@ -1179,6 +1574,15 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
     await db.set_payment_status(payment_id, "CONFIRMED")
+    if not is_sbp_payment:
+        try:
+            await db.set_auto_renew(user_id, True)
+        except Exception as err:  # noqa: BLE001
+            logger.debug(
+                "Не удалось включить автопродление после подтверждения платежа %s: %s",
+                payment_id,
+                err,
+            )
 
     subscription_end = await db.get_subscription_end(user_id) or 0
     formatted_expiry = format_expiry(subscription_end) if subscription_end else None
@@ -1201,6 +1605,60 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
     await callback.answer("Оплата подтверждена.")
 
 
+@router.callback_query(F.data == RETRY_PAYMENT_CALLBACK)
+async def handle_retry_payment(callback: CallbackQuery, db: DB) -> None:
+    """Повторить списание через сохранённую карту."""
+
+    user_id = callback.from_user.id
+    user = await db.get_user(user_id)
+    if user is None:
+        await callback.answer("Сначала выполните /start.", show_alert=True)
+        return
+
+    row = dict(user)
+    rebill_id = (row.get("rebill_id") or "").strip()
+    customer_key = (row.get("customer_key") or "").strip()
+    parent_payment = (row.get("rebill_parent_payment") or "").strip()
+
+    missing = []
+    if not rebill_id:
+        missing.append("RebillId")
+    if not customer_key:
+        missing.append("CustomerKey")
+    if not parent_payment:
+        missing.append("родительский платёж")
+
+    if missing:
+        message = (
+            "⚠️ Не удалось выполнить повторное списание: отсутствуют сохранённые данные карты. "
+            "Оформите оплату заново с галочкой «Сохранить карту» или оплатите вручную."
+        )
+        if callback.message:
+            await callback.message.answer(message)
+        await callback.answer("Нет сохранённых данных для списания.", show_alert=True)
+        return
+
+    now_ts = int(datetime.utcnow().timestamp())
+    result = await try_auto_renew(
+        callback.bot,
+        db,
+        user,
+        now_ts,
+        force=True,
+    )
+
+    if result.success:
+        if callback.message:
+            try:
+                await callback.message.edit_reply_markup()
+            except TelegramBadRequest:
+                pass
+        await callback.answer("Подписка продлена.")
+        return
+
+    await callback.answer("Не удалось выполнить списание. Попробуйте позже.", show_alert=True)
+
+
 @router.callback_query(F.data == "ar:toggle")
 async def handle_toggle_autorenew(callback: CallbackQuery, db: DB) -> None:
     """Переключить автопродление пользователя."""
@@ -1215,7 +1673,8 @@ async def handle_toggle_autorenew(callback: CallbackQuery, db: DB) -> None:
     await db.set_auto_renew(user_id, new_flag)
     if callback.message:
         await refresh_user_menu(callback.message, db, user_id)
-    await callback.answer("Статус обновлён.")
+    message = "Автопродление включено." if new_flag else "Автопродление отключено."
+    await callback.answer(message)
 
 
 @router.callback_query(F.data == "invite:once")
@@ -1270,7 +1729,7 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     if not has_active_subscription and not has_active_trial:
         if callback.message:
             builder = InlineKeyboardBuilder()
-            builder.button(text="💳 Купить доступ", callback_data="buy:open")
+            builder.button(text="📲 Оплатить через СБП", callback_data="buy:open:sbp")
             builder.button(text="🎟 Ввести промокод", callback_data="promo:enter")
             builder.button(text="🏠 Главное меню", callback_data="menu:home")
             builder.adjust(1)
@@ -1293,13 +1752,13 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     try:
         member = await bot.get_chat_member(chat_id, callback.from_user.id)
     except TelegramForbiddenError as err:
-        logging.warning("Не удалось проверить участие пользователя %s: %s", callback.from_user.id, err)
+        logger.warning("Не удалось проверить участие пользователя %s: %s", callback.from_user.id, err)
         ok, info, hint = await make_one_time_invite(bot, db)
         await send_invite_failure(info, hint)
         await callback.answer("Бот не имеет доступа к чату", show_alert=True)
         return
     except TelegramBadRequest as err:
-        logging.warning(
+        logger.warning(
             "Ошибка Telegram при проверке участия пользователя %s: %s",
             callback.from_user.id,
             err,
@@ -1309,7 +1768,7 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         await callback.answer("Не удалось проверить участие", show_alert=True)
         return
     except Exception as err:  # noqa: BLE001
-        logging.exception(
+        logger.exception(
             "Сбой при проверке участия пользователя %s в канале", callback.from_user.id, exc_info=err
         )
         if callback.message:
@@ -1551,7 +2010,7 @@ async def process_bind_username(
                 last_error = err
                 continue
             except Exception as err:
-                logging.exception("Ошибка при получении чата", exc_info=err)
+                logger.exception("Ошибка при получении чата", exc_info=err)
                 await message.answer(
                     escape_md("Произошла ошибка при получении чата. Попробуйте позже."),
                     parse_mode=ParseMode.MARKDOWN_V2,
@@ -1563,7 +2022,7 @@ async def process_bind_username(
                 break
 
         if chat is None:
-            logging.warning(
+            logger.warning(
                 "Не удалось подобрать чат по числовому идентификатору: %s", compact
             )
             await message.answer(
@@ -1572,7 +2031,7 @@ async def process_bind_username(
                 disable_web_page_preview=True,
             )
             if last_error is not None:
-                logging.debug("Последняя ошибка Telegram: %s", last_error)
+                logger.debug("Последняя ошибка Telegram: %s", last_error)
             return
     else:
         if not compact.startswith("@"):
@@ -1624,7 +2083,7 @@ async def process_bind_username(
         )
         return
     except TelegramBadRequest as err:
-        logging.exception("Ошибка при проверке прав бота", exc_info=err)
+        logger.exception("Ошибка при проверке прав бота", exc_info=err)
         await message.answer(
             escape_md("Не удалось проверить права бота. Проверьте настройки чата."),
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -1632,7 +2091,7 @@ async def process_bind_username(
         )
         return
     except Exception as err:
-        logging.exception("Неожиданная ошибка при проверке прав бота", exc_info=err)
+        logger.exception("Неожиданная ошибка при проверке прав бота", exc_info=err)
         await message.answer(
             escape_md("Не удалось проверить права бота. См. логи."),
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -1702,11 +2161,11 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     try:
         chat = await bot.get_chat(chat_id)
     except (TelegramBadRequest, TelegramForbiddenError) as err:
-        logging.exception("Не удалось получить чат", exc_info=err)
+        logger.exception("Не удалось получить чат", exc_info=err)
         await callback.answer("Не удалось получить чат. Привяжите его заново.", show_alert=True)
         return
     except Exception as err:
-        logging.exception("Неожиданная ошибка при получении чата", exc_info=err)
+        logger.exception("Неожиданная ошибка при получении чата", exc_info=err)
         await callback.answer("Не удалось получить чат. Попробуйте позже.", show_alert=True)
         return
 
@@ -1737,7 +2196,7 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
             "• Рекомендация: откройте права бота → включите «Пригласительные ссылки».",
         ]
     except Exception as err:
-        logging.exception("Ошибка при проверке прав бота", exc_info=err)
+        logger.exception("Ошибка при проверке прав бота", exc_info=err)
         lines = base_lines + [
             "• Статус: не удалось проверить",
             "• Пригласительные ссылки: ❌",
@@ -1783,19 +2242,19 @@ async def admin_prices(callback: CallbackQuery, state: FSMContext, db: DB) -> No
         return
     await state.clear()
     if callback.message:
-        await render_price_list(callback.message, db)
+        await render_price_list(callback.message, db, state)
     await callback.answer()
 
 
 @router.callback_query(F.data == "price:list")
-async def price_list_back(callback: CallbackQuery, db: DB) -> None:
+async def price_list_back(callback: CallbackQuery, state: FSMContext, db: DB) -> None:
     """Вернуться к списку тарифов."""
 
     if not is_super_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
     if callback.message:
-        await render_price_list(callback.message, db)
+        await render_price_list(callback.message, db, state)
     await callback.answer()
 
 
@@ -1860,7 +2319,7 @@ async def price_add_months(message: Message, state: FSMContext, db: DB, bot: Bot
     await state.update_data(new_price_months=months)
     await state.set_state(AdminPrice.AddPrice)
     await message.answer(
-        escape_md("Введите цену в ₽ (целое, ≥0)."),
+        escape_md("Введите цену в ₽ (целое, ≥10)."),
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
         reply_markup=CANCEL_REPLY,
@@ -1896,9 +2355,9 @@ async def price_add_price(message: Message, state: FSMContext, db: DB, bot: Bot)
         )
         return
     price = int(text)
-    if price < 0:
+    if price < 10:
         await message.answer(
-            escape_md("Цена должна быть ≥0."),
+            escape_md("Цена должна быть не меньше 10 ₽ из-за ограничений СБП."),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
@@ -1966,7 +2425,7 @@ async def price_edit_price(callback: CallbackQuery, state: FSMContext) -> None:
     )
     if callback.message:
         await callback.message.answer(
-            escape_md("Введите новую цену в ₽ (целое, ≥0)."),
+            escape_md("Введите новую цену в ₽ (целое, ≥10)."),
             reply_markup=CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
@@ -2003,9 +2462,9 @@ async def price_edit_price_input(message: Message, state: FSMContext, db: DB, bo
         )
         return
     new_price = int(text)
-    if new_price < 0:
+    if new_price < 10:
         await message.answer(
-            escape_md("Цена должна быть ≥0."),
+            escape_md("Цена должна быть не меньше 10 ₽ из-за ограничений СБП."),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
@@ -2133,6 +2592,19 @@ async def price_edit_months_input(message: Message, state: FSMContext, db: DB, b
         await render_price_list_by_state(bot, state, db)
         await state.clear()
         return
+    if current_price < 10:
+        await message.answer(
+            escape_md(
+                "Сначала обновите цену тарифа до 10 ₽ и выше, затем меняйте длительность."
+            ),
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await render_price_list_by_state(bot, state, db)
+        await state.clear()
+        return
+
     await db.upsert_price(new_months, current_price)
     await db.delete_price(int(old_months))
     await message.answer(
@@ -2164,7 +2636,7 @@ async def price_delete(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("price:confirm_del:"))
-async def price_confirm_delete(callback: CallbackQuery, db: DB) -> None:
+async def price_confirm_delete(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
     """Удалить тариф после подтверждения."""
 
     if not is_super_admin(callback.from_user.id):
@@ -2178,7 +2650,7 @@ async def price_confirm_delete(callback: CallbackQuery, db: DB) -> None:
         return
     deleted = await db.delete_price(months)
     if callback.message:
-        await render_price_list(callback.message, db)
+        await render_price_list(callback.message, db, state)
     if deleted:
         await callback.answer("Тариф удалён.")
     else:
@@ -2325,3 +2797,69 @@ async def admin_save_custom_code(message: Message, state: FSMContext, db: DB, bo
     )
     await refresh_admin_panel_by_state(bot, state, db)
     await state.clear()
+
+
+async def handle_sbp_notification_payload(
+    payload: Mapping[str, Any], db: DB, bot: Bot | None = None
+) -> bool:
+    """Обработать уведомление T-Bank с AccountToken для СБП."""
+
+    if not isinstance(payload, Mapping):
+        return False
+    request_key = str(
+        payload.get("RequestKey")
+        or payload.get("requestKey")
+        or payload.get("REQUESTKEY")
+        or ""
+    ).strip()
+    if not request_key:
+        return False
+
+    user_id = await db.get_user_by_request_key(request_key)
+    if not user_id:
+        logger.warning("СБП-уведомление: RequestKey %s не найден", request_key)
+        return False
+
+    params = payload.get("Params") if isinstance(payload.get("Params"), Mapping) else {}
+    status = (payload.get("Status") or payload.get("status") or "").upper()
+    account_token = (
+        payload.get("AccountToken")
+        or payload.get("accountToken")
+        or (params.get("AccountToken") if isinstance(params, Mapping) else None)
+    )
+    bank_member_id = (
+        payload.get("BankMemberId")
+        or (params.get("BankMemberId") if isinstance(params, Mapping) else None)
+    )
+    bank_member_name = (
+        payload.get("BankMemberName")
+        or (params.get("BankMemberName") if isinstance(params, Mapping) else None)
+    )
+
+    if status:
+        await db.update_sbp_status(user_id, status)
+    if account_token:
+        await db.save_account_token(
+            user_id,
+            str(account_token),
+            bank_member_id=str(bank_member_id) if bank_member_id else None,
+            bank_member_name=str(bank_member_name) if bank_member_name else None,
+        )
+        await db.set_auto_renew(user_id, True)
+        payment_row = await db.get_payment_by_request_key(request_key)
+        if payment_row and payment_row["payment_id"]:
+            await db.set_payment_account_token(
+                payment_row["payment_id"], str(account_token)
+            )
+        if bot:
+            try:
+                await bot.send_message(
+                    user_id,
+                    "Ваш счёт привязан, автопродление работает.",
+                )
+            except Exception:
+                logger.debug(
+                    "Не удалось отправить уведомление о привязке счёта пользователю %s",
+                    user_id,
+                )
+    return True
