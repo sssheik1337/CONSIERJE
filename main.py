@@ -50,7 +50,9 @@ def compute_token(payload: dict, password: str) -> str:
     items.append(("Password", password))
     items.sort(key=lambda item: item[0])
     concatenated = "".join(value for _, value in items)
-    return hashlib.sha256(concatenated.encode("utf-8")).hexdigest()
+    token_hash = hashlib.sha256(concatenated.encode("utf-8")).hexdigest()
+    logger.debug("Контрольный хэш webhook подписи T-Bank: %s", token_hash)
+    return token_hash
 
 
 async def _notify_user_payment_confirmed(

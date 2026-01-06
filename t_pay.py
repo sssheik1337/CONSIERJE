@@ -83,7 +83,11 @@ def _generate_token(payload: Dict[str, Any], password: str) -> str:
         # Пропускаем None
         if value is None:
             continue
-        items.append((key, str(value)))
+        if isinstance(value, bool):
+            value_str = "true" if value else "false"
+        else:
+            value_str = str(value)
+        items.append((key, value_str))
     # Добавляем секретный пароль
     items.append(("Password", password))
     # Сортировка по ключу
@@ -91,7 +95,9 @@ def _generate_token(payload: Dict[str, Any], password: str) -> str:
     # Конкатенация только значений
     token_string = "".join(v for _, v in items)
     # SHA‑256 хэш
-    return hashlib.sha256(token_string.encode("utf-8")).hexdigest()
+    token_hash = hashlib.sha256(token_string.encode("utf-8")).hexdigest()
+    logger.debug("Контрольный хэш подписи T-Bank: %s", token_hash)
+    return token_hash
 
 
 def _post_sync(

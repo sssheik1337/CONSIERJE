@@ -16,6 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     ChatMember,
+    ChatMemberUpdated,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
@@ -371,25 +372,10 @@ async def make_one_time_invite(
         err_text = str(err)
         lower = err_text.lower()
         if "chat_admin_required" in lower or "not enough rights" in lower:
-            try:
-                fallback = await bot.export_chat_invite_link(chat_id)
-            except (TelegramBadRequest, TelegramForbiddenError):
-                return (
-                    False,
-                    "Недостаточно прав для создания одноразовой ссылки.",
-                    "Дайте право «Пригласительные ссылки».",
-                )
-            except Exception as export_err:
-                logger.exception("Ошибка при получении постоянной ссылки", exc_info=export_err)
-                return (
-                    False,
-                    "Недостаточно прав для создания одноразовой ссылки.",
-                    "Дайте право «Пригласительные ссылки».",
-                )
             return (
                 False,
-                "⚠️ Можно выдать постоянную ссылку (неодноразовая). Разрешите «Пригласительные ссылки», чтобы выдавать одноразовые.",
-                fallback,
+                "Недостаточно прав для создания одноразовой ссылки.",
+                "Дайте боту право «Пригласительные ссылки».",
             )
         if "user_not_participant" in lower or "chat not found" in lower or "chat_not_found" in lower:
             return (
@@ -1818,7 +1804,11 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
 
     ok, info, hint = await make_one_time_invite(bot, db)
     if ok:
-        await db.set_invite_issued(callback.from_user.id, True)
+        logger.info(
+            "Выдана одноразовая ссылка пользователю %s для чата %s",
+            callback.from_user.id,
+            chat_id,
+        )
 
     if callback.message:
         if ok:
@@ -1834,6 +1824,29 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         await callback.answer()
     else:
         await callback.answer("Не удалось создать ссылку.", show_alert=True)
+
+
+@router.chat_member()
+async def handle_chat_member_update(event: ChatMemberUpdated, db: DB) -> None:
+    """Отметить использование одноразовой ссылки при вступлении пользователя."""
+
+    target_chat_id = await db.get_target_chat_id()
+    if target_chat_id is None or event.chat.id != target_chat_id:
+        return
+
+    joined_statuses = {"member", "administrator", "creator"}
+    new_status = event.new_chat_member.status
+    old_status = event.old_chat_member.status
+    new_value = new_status.value if hasattr(new_status, "value") else str(new_status)
+    old_value = old_status.value if hasattr(old_status, "value") else str(old_status)
+    if new_value in joined_statuses and old_value not in joined_statuses:
+        user_id = event.new_chat_member.user.id
+        await db.set_invite_issued(user_id, True)
+        logger.info(
+            "Подтверждено вступление пользователя %s в чат %s, ссылка помечена как использованная",
+            user_id,
+            target_chat_id,
+        )
 
 
 @router.callback_query(F.data == "promo:enter")
@@ -2177,6 +2190,7 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
     base_lines = [
         "🛡️ Права бота:",
         f"• Чат: {title} (id {chat_id}, {chat.type})",
+        "• Требуемая роль: администратор",
     ]
 
     try:
@@ -2210,15 +2224,25 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
             invite_flag = "—"
         else:
             invite_flag = "✅" if can_invite_attr else "❌"
+        can_ban_attr = getattr(member, "can_restrict_members", None)
+        if can_ban_attr is None:
+            can_ban_attr = getattr(member, "can_ban_users", None)
+        if can_ban_attr is None:
+            ban_flag = "—"
+        else:
+            ban_flag = "✅" if can_ban_attr else "❌"
         if status_display not in {"administrator", "creator"}:
             recommendation = "• Рекомендация: назначьте бота администратором."
         elif can_invite_attr is False:
             recommendation = "• Рекомендация: откройте права бота → включите «Пригласительные ссылки»."
+        elif can_ban_attr is False:
+            recommendation = "• Рекомендация: откройте права бота → включите «Бан пользователей»."
         else:
             recommendation = "• Рекомендация: всё в порядке."
         lines = base_lines + [
             f"• Статус: {status_display}",
             f"• Пригласительные ссылки: {invite_flag}",
+            f"• Бан пользователей: {ban_flag}",
             recommendation,
         ]
 

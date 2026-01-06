@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
     accepted_legal INTEGER NOT NULL DEFAULT 0,
     accepted_at INTEGER,
     invite_issued INTEGER NOT NULL DEFAULT 0,
+    pending_removal INTEGER NOT NULL DEFAULT 0,
     trial_start INTEGER DEFAULT 0,
     trial_end INTEGER DEFAULT 0,
     email TEXT,
@@ -166,6 +167,7 @@ class DB:
                 "ALTER TABLE users ADD COLUMN accepted_legal INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN accepted_at INTEGER",
                 "ALTER TABLE users ADD COLUMN invite_issued INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN pending_removal INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN trial_start INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN trial_end INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN email TEXT",
@@ -309,6 +311,7 @@ class DB:
                     u.accepted_legal,
                     u.accepted_at,
                     u.invite_issued,
+                    u.pending_removal,
                     u.trial_start,
                     u.trial_end,
                     u.email,
@@ -584,6 +587,16 @@ class DB:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 "UPDATE users SET invite_issued=? WHERE user_id=?",
+                (1 if flag else 0, user_id),
+            )
+            await db.commit()
+
+    async def set_pending_removal(self, user_id: int, flag: bool) -> None:
+        """Отметить пользователя как ожидающего удаления из чата."""
+
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET pending_removal=? WHERE user_id=?",
                 (1 if flag else 0, user_id),
             )
             await db.commit()
