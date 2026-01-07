@@ -1208,6 +1208,9 @@ class DB:
                     u.invite_issued,
                     u.trial_start,
                     u.trial_end,
+                    u.email,
+                    u.customer_key,
+                    u.rebill_id,
                     s.end_at AS subscription_end_at,
                     s.updated_at AS subscription_updated_at
                 FROM users AS u

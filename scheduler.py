@@ -19,7 +19,7 @@ from config import config
 from db import DB
 from logger import logger
 from payments import charge_sbp_autopayment
-from t_pay import TBankApiError, TBankHttpError
+from t_pay import TBankApiError, TBankHttpError, finalize_rebill, init_rebill_payment
 
 DEFAULT_RECURRENT_IP = "127.0.0.1"
 RETRY_PAYMENT_CALLBACK = "payment:retry"
@@ -79,6 +79,85 @@ async def _was_last_payment_sbp(db: DB, user_id: int) -> bool:
     except (KeyError, TypeError, ValueError):
         return False
     return method == "sbp"
+
+
+def _has_active_subscription(row) -> bool:
+    """Понять, есть ли у пользователя платная подписка в истории."""
+
+    if row is None:
+        return False
+    try:
+        subscription_end = int(row.get("subscription_end_at") or 0)
+    except (TypeError, ValueError, KeyError):
+        subscription_end = 0
+    return subscription_end > 0
+
+
+async def _try_card_autorenew(bot: Bot, db: DB, row) -> bool:
+    """Попытаться продлить подписку по карте через RebillId."""
+
+    row_data = dict(row)
+    user_id = int(row_data.get("user_id") or 0)
+    if user_id <= 0:
+        return False
+    rebill_id = str(row_data.get("rebill_id") or "").strip()
+    if not rebill_id:
+        return False
+    if not _has_active_subscription(row_data):
+        return False
+
+    try:
+        last_payment = await db.get_latest_payment(user_id)
+    except Exception:  # noqa: BLE001
+        last_payment = None
+    if not last_payment:
+        return False
+    try:
+        months = int(last_payment.get("months") or 0)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001
+        months = 0
+    try:
+        amount = int(last_payment.get("amount") or 0)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001
+        amount = 0
+    if months <= 0 or amount <= 0:
+        return False
+
+    try:
+        payment_id = await init_rebill_payment(row_data, amount, months)
+        state = await finalize_rebill(payment_id)
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Не удалось выполнить автосписание по карте", exc_info=err)
+        return False
+
+    status = str(state.get("Status") or "").upper()
+    if status == "CONFIRMED":
+        await db.extend_subscription(user_id, months)
+        await db.set_paid_only(user_id, False)
+        await db.add_payment(
+            user_id=user_id,
+            payment_id=payment_id,
+            order_id=f"card_rebill_{user_id}_{months}_{int(datetime.utcnow().timestamp())}",
+            amount=amount,
+            months=months,
+            status="CONFIRMED",
+            method="card",
+            customer_key=str(row_data.get("customer_key") or ""),
+        )
+        await db.set_auto_renew(user_id, True)
+        await bot.send_message(
+            user_id,
+            "✅ Списание по карте прошло успешно, подписка продлена.",
+        )
+        return True
+    if status == "REJECTED":
+        await db.set_auto_renew(user_id, False)
+        await bot.send_message(
+            user_id,
+            "⚠️ Не удалось списать оплату по карте. Автопродление отключено.",
+        )
+        return False
+    return False
 
 
 async def try_auto_renew(
@@ -322,6 +401,16 @@ async def daily_check(bot: Bot, db: DB):
                 auto_flag = bool(row_dict.get("auto_renew"))
                 if auto_flag:
                     await db.set_auto_renew(user_id, False)
+
+                card_renewed = False
+                if auto_flag and row_dict.get("rebill_id"):
+                    try:
+                        card_renewed = await _try_card_autorenew(bot, db, row_dict)
+                    except Exception:  # noqa: BLE001
+                        card_renewed = False
+                if card_renewed:
+                    skipped_count += 1
+                    return
 
                 sbp_recent = False
                 if not renew_result.attempted and not auto_flag:
