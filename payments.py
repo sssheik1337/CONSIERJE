@@ -104,7 +104,7 @@ async def create_card_payment(user_id: int, months: int, price: int) -> str:
         pay_type="O",
         recurrent="Y",
         receipt=receipt,
-        notification_url=config.TINKOFF_NOTIFY_URL or None,
+        email=email_value,
         extra={"Email": email_value},
     )
 
