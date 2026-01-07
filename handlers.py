@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from collections.abc import Mapping, Sequence
 from typing import Any
 import re
+import time
 
 import aiosqlite
 from aiogram import Bot, F, Router
@@ -27,8 +28,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import config, get_docs_map
 from db import DB
+from keyboards import build_payment_method_keyboard
 from logger import logger
 from payments import check_payment_status, form_sbp_qr, init_sbp_payment
+from t_pay import init_payment
 from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
 
 router = Router()
@@ -80,12 +83,16 @@ def _normalize_payment_method(raw: str | None) -> str:
     lowered = raw.strip().lower()
     if lowered == "sbp":
         return "sbp"
+    if lowered == "card":
+        return "card"
     return "sbp"
 
 
 def _format_method_hint(method: str) -> str:
     """Вернуть описание способа оплаты для текстов пользователю."""
 
+    if method == "card":
+        return "картой"
     return "через СБП"
 
 
@@ -119,8 +126,8 @@ def _build_consent_text(months: int, price: int, method: str) -> str:
     else:
         details = [
             "",
-            "При оплате картой автопродление будет включено автоматически.",
-            "Вы сможете отключить его в любой момент в личном меню бота (кнопка «Автопродление»).",
+            "При оплате картой автопродление будет доступно после подтверждения оплаты и получения RebillId.",
+            "Вы сможете управлять автопродлением в личном меню бота (кнопка «Автопродление»).",
             "",
             "Списания будут происходить автоматически, если автопродление активно.",
             "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
@@ -513,7 +520,7 @@ def build_user_menu_keyboard(
     """Собрать пользовательскую inline-клавиатуру."""
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Купить подписку", callback_data="buy:open:sbp")
+    builder.button(text="💳 Купить подписку", callback_data="buy:open")
     builder.button(
         text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
         callback_data="ar:toggle",
@@ -531,7 +538,7 @@ def build_subscription_purchase_menu() -> InlineKeyboardMarkup:
     """Построить меню для пользователя без активной подписки."""
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Купить подписку", callback_data="buy:open:sbp")
+    builder.button(text="💳 Купить подписку", callback_data="buy:open")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -1241,13 +1248,27 @@ async def docs_back(callback: CallbackQuery, db: DB) -> None:
             )
     await callback.answer()
 
+async def _send_payment_method_menu(callback: CallbackQuery) -> None:
+    """Показать пользователю выбор способа оплаты."""
+
+    if callback.message:
+        await callback.message.answer(
+            "Выберите способ оплаты:",
+            reply_markup=build_payment_method_keyboard(),
+        )
+    await callback.answer()
+
 
 @router.callback_query(F.data.startswith("buy:open"))
 async def handle_buy_open(callback: CallbackQuery, db: DB) -> None:
     """Показать пользователю список тарифов для оплаты."""
 
     parts = (callback.data or "").split(":")
-    method = _normalize_payment_method(parts[2] if len(parts) > 2 else None)
+    method_raw = parts[2] if len(parts) > 2 else None
+    if method_raw is None:
+        await _send_payment_method_menu(callback)
+        return
+    method = _normalize_payment_method(method_raw)
     prices = await db.get_all_prices()
     if not prices:
         await callback.answer("Тарифы пока не настроены.", show_alert=True)
@@ -1422,6 +1443,95 @@ async def _send_sbp_payment_details(
     )
 
 
+async def _send_card_payment_details(
+    message: Message,
+    months: int,
+    price: int,
+    payment_id: str,
+    payment_url: str | None,
+) -> None:
+    """Отправить пользователю ссылку на оплату картой."""
+
+    builder = InlineKeyboardBuilder()
+    if payment_url:
+        builder.button(text="Оплатить", url=str(payment_url))
+    builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
+    builder.adjust(1)
+
+    message_lines = [
+        "💳 Оплата подписки картой (3%).",
+        f"Срок: {months} мес., сумма: {price}₽.",
+        "Оплатите на стороне T-Bank.",
+    ]
+    await message.answer(
+        "\n".join(message_lines),
+        reply_markup=builder.as_markup(),
+        disable_web_page_preview=True,
+    )
+
+
+async def create_card_payment(
+    user_id: int,
+    months: int,
+    price: int,
+    *,
+    db: DB | None = None,
+    contact_type: str | None = None,
+    contact_value: str | None = None,
+) -> dict[str, object]:
+    """Создать платёж картой и вернуть данные оплаты."""
+
+    resolved_db = db or DB(config.DB_PATH)
+    if not contact_type or not contact_value:
+        user_row = await resolved_db.get_user(user_id)
+        stored_contact = ""
+        if user_row and hasattr(user_row, "keys") and "email" in user_row.keys():
+            stored_contact = str(user_row["email"] or "")
+        contact_type, contact_value = _validate_contact_value(stored_contact)
+
+    if not contact_type or not contact_value:
+        raise ValueError("Не указан контакт для чека оплаты картой")
+
+    amount_minor = price * 100
+    order_id = f"card_{user_id}_{months}_{int(time.time())}"
+    description = f"Подписка картой на {months} мес. (user {user_id})"
+    email_value = contact_value if contact_type == "email" else None
+    phone_value = contact_value if contact_type == "phone" else None
+
+    response = await init_payment(
+        amount=amount_minor,
+        order_id=order_id,
+        description=description,
+        recurrent="Y",
+        pay_type="O",
+        notification_url=config.TINKOFF_NOTIFY_URL or None,
+        email=email_value,
+        phone=phone_value,
+    )
+
+    payment_id = str(response.get("PaymentId") or "")
+    if not payment_id:
+        raise RuntimeError("Init не вернул идентификатор платежа")
+
+    await resolved_db.add_payment(
+        user_id=user_id,
+        payment_id=payment_id,
+        order_id=order_id,
+        amount=amount_minor,
+        months=months,
+        method="card",
+        is_sbp=False,
+    )
+
+    return {
+        "payment_id": payment_id,
+        "payment_url": response.get("PaymentURL"),
+        "order_id": order_id,
+        "amount": amount_minor,
+    }
+
+
 async def _create_sbp_payment_with_contact(
     message: Message,
     db: DB,
@@ -1504,13 +1614,49 @@ async def handle_buy_contact_input(message: Message, state: FSMContext, db: DB) 
     if months <= 0 or price <= 0:
         await message.answer("Не удалось определить параметры оплаты. Попробуйте ещё раз.", reply_markup=main_menu_markup())
         return
-    if method != "sbp":
+    if method not in {"sbp", "card"}:
         method = "sbp"
 
     try:
         await db.set_user_contact(message.from_user.id, contact_value)
     except Exception as err:  # noqa: BLE001
         logger.debug("Не удалось сохранить контакт пользователя %s: %s", message.from_user.id, err)
+
+    if method == "card":
+        try:
+            init_result = await create_card_payment(
+                message.from_user.id,
+                months,
+                price,
+                db=db,
+                contact_type=contact_type,
+                contact_value=contact_value,
+            )
+        except Exception as err:  # noqa: BLE001
+            logger.exception("Init оплаты картой не удался", exc_info=err)
+            await message.answer(
+                "Не удалось создать платёж картой. Попробуйте позже.",
+                reply_markup=main_menu_markup(),
+            )
+            return
+
+        payment_id = str(init_result.get("payment_id") or "")
+        payment_url = init_result.get("payment_url")
+        if not payment_id:
+            await message.answer(
+                "T-Bank не вернул PaymentId. Попробуйте позже.",
+                reply_markup=main_menu_markup(),
+            )
+            return
+
+        await _send_card_payment_details(
+            message,
+            months,
+            price,
+            payment_id,
+            str(payment_url) if payment_url else None,
+        )
+        return
 
     await _create_sbp_payment_with_contact(
         message,
