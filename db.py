@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS users (
     trial_start INTEGER DEFAULT 0,
     trial_end INTEGER DEFAULT 0,
     email TEXT,
-    account_token TEXT
+    account_token TEXT,
+    customer_key TEXT,
+    rebill_id TEXT,
+    rebill_parent_payment TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -173,6 +176,9 @@ class DB:
                 "ALTER TABLE users ADD COLUMN trial_end INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN email TEXT",
                 "ALTER TABLE users ADD COLUMN account_token TEXT",
+                "ALTER TABLE users ADD COLUMN customer_key TEXT",
+                "ALTER TABLE users ADD COLUMN rebill_id TEXT",
+                "ALTER TABLE users ADD COLUMN rebill_parent_payment TEXT",
                 "ALTER TABLE payments ADD COLUMN order_id TEXT",
                 "ALTER TABLE payments ADD COLUMN customer_key TEXT",
                 "CREATE TABLE IF NOT EXISTS payment_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT, created_at INTEGER, message TEXT, payment_type TEXT)",
@@ -386,6 +392,49 @@ class DB:
             await db.execute(
                 "UPDATE users SET email=? WHERE user_id=?",
                 (contact_value, user_id),
+            )
+            await db.commit()
+
+    async def set_user_customer_key(self, user_id: int, customer_key: str) -> None:
+        """Сохранить CustomerKey пользователя, если он ещё не задан."""
+
+        value = (customer_key or "").strip()
+        if not value:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                UPDATE users
+                SET customer_key=?
+                WHERE user_id=? AND (customer_key IS NULL OR TRIM(customer_key)='')
+                """,
+                (value, user_id),
+            )
+            await db.commit()
+
+    async def set_user_rebill_id(self, user_id: int, rebill_id: str) -> None:
+        """Сохранить RebillId пользователя."""
+
+        value = (rebill_id or "").strip()
+        if not value:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET rebill_id=? WHERE user_id=?",
+                (value, user_id),
+            )
+            await db.commit()
+
+    async def set_user_rebill_parent_payment(self, user_id: int, payment_id: str) -> None:
+        """Сохранить идентификатор родительского платежа для автосписаний."""
+
+        value = (payment_id or "").strip()
+        if not value:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET rebill_parent_payment=? WHERE user_id=?",
+                (value, user_id),
             )
             await db.commit()
 

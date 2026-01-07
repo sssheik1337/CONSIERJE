@@ -187,6 +187,17 @@ async def tbank_notify(request: web.Request) -> web.Response:
             if payment_row:
                 target_payment_id = payment_row["payment_id"]
 
+        params = data.get("Params") or data.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        success_raw = data.get("Success")
+        if success_raw is None:
+            success_raw = data.get("success")
+        if isinstance(success_raw, bool):
+            success_flag = success_raw
+        else:
+            success_flag = str(success_raw or "").strip().lower() in {"true", "1", "yes", "y"}
+
         account_token_value = data.get("AccountToken") or data.get("accountToken")
         if account_token_value:
             logger.info("[TBank Webhook] AccountToken найден в уведомлении")
@@ -228,8 +239,47 @@ async def tbank_notify(request: web.Request) -> web.Response:
                     )
                 logger.info("[TBank Webhook] AccountToken обновлён")
 
-        if status_upper in {"CONFIRMED", "AUTHORIZED"} and target_payment_id:
-            payment_before = await db.get_payment_by_payment_id(target_payment_id)
+        payment_row = None
+        if target_payment_id:
+            payment_row = await db.get_payment_by_payment_id(target_payment_id)
+        elif order_id:
+            payment_row = await db.get_payment_by_order_id(order_id)
+        payment_info = dict(payment_row) if payment_row is not None else {}
+
+        stored_method = ""
+        user_id = 0
+        months = 0
+        if payment_info:
+            user_id = int(payment_info.get("user_id") or 0)
+            months = int(payment_info.get("months") or 0)
+            try:
+                stored_method = str(payment_info.get("method") or "").strip().lower()
+            except (KeyError, TypeError, ValueError):
+                stored_method = ""
+
+        payment_type = payments.detect_payment_type(data)
+        is_sbp_payment = payment_type == "sbp" or stored_method == "sbp"
+        is_card_payment = not is_sbp_payment
+
+        rebill_id_value = params.get("RebillId") or data.get("RebillId")
+        customer_key_value = params.get("CustomerKey") or data.get("CustomerKey")
+
+        if rebill_id_value and user_id:
+            await db.set_user_rebill_id(user_id, str(rebill_id_value))
+            await db.set_user_rebill_parent_payment(user_id, target_payment_id or "")
+        if customer_key_value and user_id:
+            await db.set_user_customer_key(user_id, str(customer_key_value))
+
+        if status_upper == "AUTHORIZED" and is_card_payment and target_payment_id:
+            logger.info(
+                "[TBank Webhook] Авторизация по карте без списания: payment_id=%s user_id=%s",
+                target_payment_id,
+                user_id,
+            )
+            await db.set_payment_status(target_payment_id, "AUTHORIZED")
+            processed = True
+        elif status_upper in {"CONFIRMED", "AUTHORIZED"} and target_payment_id:
+            payment_before = payment_row
             was_confirmed = False
             if payment_before is not None:
                 was_confirmed = (payment_before["status"] or "").upper() == "CONFIRMED"
@@ -237,38 +287,29 @@ async def tbank_notify(request: web.Request) -> web.Response:
             processed = applied
             if applied:
                 logger.info("[TBank Webhook] Оплата подтверждена")
-                payment_row = await db.get_payment_by_payment_id(target_payment_id)
-                stored_method = ""
-                user_id = 0
-                months = 0
-                if payment_row:
-                    user_id = int(payment_row["user_id"] or 0)
-                    months = int(payment_row["months"] or 0)
+                if user_id > 0 and months > 0 and not was_confirmed:
+                    await _notify_user_payment_confirmed(
+                        bot, db, user_id, months, sbp_hint=is_sbp_payment
+                    )
+                if user_id > 0:
                     try:
-                        stored_method = str(payment_row["method"] or "").strip().lower()
-                    except (KeyError, TypeError, ValueError):
-                        stored_method = ""
-
-                    payment_type = payments.detect_payment_type(data)
-                    is_sbp = payment_type == "sbp" or stored_method == "sbp"
-
-                    if user_id > 0 and months > 0 and not was_confirmed:
-                        await _notify_user_payment_confirmed(
-                            bot, db, user_id, months, sbp_hint=is_sbp
+                        await db.set_payment_method(target_payment_id, payment_type)
+                    except Exception as err:  # noqa: BLE001
+                        logger.debug(
+                            "Не удалось сохранить способ оплаты %s для платежа %s: %s",
+                            payment_type,
+                            target_payment_id,
+                            err,
                         )
-                    if user_id > 0:
-                        try:
-                            await db.set_payment_method(target_payment_id, payment_type)
-                        except Exception as err:  # noqa: BLE001
-                            logger.debug(
-                                "Не удалось сохранить способ оплаты %s для платежа %s: %s",
-                                payment_type,
-                                target_payment_id,
-                                err,
-                            )
-                        if account_token_value:
-                            await db.save_account_token(user_id, str(account_token_value))
-                            await db.set_auto_renew(user_id, True)
+                    if account_token_value:
+                        await db.save_account_token(user_id, str(account_token_value))
+                        await db.set_auto_renew(user_id, True)
+                    if is_card_payment and success_flag and rebill_id_value:
+                        await db.set_auto_renew(user_id, True)
+                        logger.info(
+                            "[TBank Webhook] Автопродление по карте включено: user_id=%s",
+                            user_id,
+                        )
         elif status_upper:
             if target_payment_id:
                 await db.set_payment_status(target_payment_id, status_upper)
