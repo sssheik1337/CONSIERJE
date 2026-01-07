@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS payments (
     is_sbp INTEGER NOT NULL DEFAULT 0,
     request_key TEXT,
     account_token TEXT,
-    customer_key TEXT
+    customer_key TEXT,
+    rebill_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_payment_id ON payments(payment_id);
@@ -181,6 +182,7 @@ class DB:
                 "ALTER TABLE users ADD COLUMN rebill_parent_payment TEXT",
                 "ALTER TABLE payments ADD COLUMN order_id TEXT",
                 "ALTER TABLE payments ADD COLUMN customer_key TEXT",
+                "ALTER TABLE payments ADD COLUMN rebill_id TEXT",
                 "CREATE TABLE IF NOT EXISTS payment_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT, created_at INTEGER, message TEXT, payment_type TEXT)",
                 "ALTER TABLE payment_logs ADD COLUMN payment_type TEXT",
                 "ALTER TABLE payments ADD COLUMN method TEXT",
@@ -811,6 +813,7 @@ class DB:
         *,
         method: Optional[str] = None,
         customer_key: Optional[str] = None,
+        rebill_id: Optional[str] = None,
         request_key: Optional[str] = None,
         account_token: Optional[str] = None,
         is_sbp: Optional[bool] = None,
@@ -821,6 +824,7 @@ class DB:
         normalized_method = (method or "card").strip().lower() or "card"
         sbp_flag = 1 if (is_sbp if is_sbp is not None else normalized_method == "sbp") else 0
         customer_value = (customer_key or "").strip() or None
+        rebill_value = (rebill_id or "").strip() or None
         request_value = (request_key or "").strip() or None
         account_value = (account_token or "").strip() or None
         async with aiosqlite.connect(self.path) as db:
@@ -834,7 +838,7 @@ class DB:
                 await db.execute(
                     """
                     UPDATE payments
-                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?, method=?, is_sbp=?, request_key=?, account_token=?, customer_key=?
+                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?, method=?, is_sbp=?, request_key=?, account_token=?, customer_key=?, rebill_id=?
                     WHERE id=?
                     """,
                     (
@@ -849,6 +853,7 @@ class DB:
                         request_value,
                         account_value,
                         customer_value,
+                        rebill_value,
                         row["id"],
                     ),
                 )
@@ -856,8 +861,8 @@ class DB:
                 created_at = int(time.time())
                 await db.execute(
                     """
-                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at, method, is_sbp, request_key, account_token, customer_key)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at, method, is_sbp, request_key, account_token, customer_key, rebill_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id,
@@ -872,6 +877,7 @@ class DB:
                         request_value,
                         account_value,
                         customer_value,
+                        rebill_value,
                     ),
                 )
             await db.commit()
