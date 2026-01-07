@@ -61,6 +61,74 @@ def _build_order_id(prefix: str, user_id: int, months: int) -> str:
     return f"{prefix}_{user_id}_{months}_{int(time.time())}"
 
 
+async def create_card_payment(user_id: int, months: int, price: int) -> str:
+    """Создать платёж по карте и вернуть ссылку PaymentURL."""
+
+    if user_id <= 0:
+        raise ValueError("Некорректный идентификатор пользователя")
+    if months <= 0 or price <= 0:
+        raise ValueError("Некорректные параметры оплаты")
+
+    resolved_db = _get_db()
+    user_row = await resolved_db.get_user(user_id)
+    email_value = None
+    if user_row is not None and hasattr(user_row, "keys") and "email" in user_row.keys():
+        email_value = str(user_row["email"] or "").strip() or None
+    if not email_value:
+        raise ValueError("Не указан email пользователя для чека")
+
+    order_id = _build_order_id("card", user_id, months)
+    amount = price
+    receipt = {
+        "FfdVersion": "1.05",
+        "Taxation": "usn_income",
+        "Items": [
+            {
+                "Name": "Подписка",
+                "Price": amount,
+                "Quantity": 1,
+                "Amount": amount,
+                "PaymentMethod": "full_prepayment",
+                "PaymentObject": "service",
+                "Tax": "none",
+            }
+        ],
+        "Payments": {"Electronic": amount},
+        "Email": email_value,
+    }
+    response = await init_payment(
+        amount=amount,
+        order_id=order_id,
+        description="Подписка",
+        customer_key=str(user_id),
+        pay_type="O",
+        recurrent="Y",
+        receipt=receipt,
+        notification_url=config.TINKOFF_NOTIFY_URL or None,
+        extra={"Email": email_value},
+    )
+
+    payment_id = str(response.get("PaymentId") or "")
+    if not payment_id:
+        raise RuntimeError("Init не вернул идентификатор платежа")
+
+    await resolved_db.add_payment(
+        user_id=user_id,
+        payment_id=payment_id,
+        order_id=order_id,
+        amount=amount,
+        months=months,
+        status="PENDING",
+        method="card",
+        customer_key=str(user_id),
+    )
+
+    payment_url = response.get("PaymentURL")
+    if not payment_url:
+        raise RuntimeError("Init не вернул ссылку оплаты")
+    return str(payment_url)
+
+
 def _value_contains_sbp(value: Any) -> bool:
     """Понять, содержит ли значение признаки оплаты через СБП."""
 

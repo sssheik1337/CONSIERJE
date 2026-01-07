@@ -74,7 +74,8 @@ CREATE TABLE IF NOT EXISTS payments (
     method TEXT DEFAULT 'card',
     is_sbp INTEGER NOT NULL DEFAULT 0,
     request_key TEXT,
-    account_token TEXT
+    account_token TEXT,
+    customer_key TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_payment_id ON payments(payment_id);
@@ -173,6 +174,7 @@ class DB:
                 "ALTER TABLE users ADD COLUMN email TEXT",
                 "ALTER TABLE users ADD COLUMN account_token TEXT",
                 "ALTER TABLE payments ADD COLUMN order_id TEXT",
+                "ALTER TABLE payments ADD COLUMN customer_key TEXT",
                 "CREATE TABLE IF NOT EXISTS payment_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT, created_at INTEGER, message TEXT, payment_type TEXT)",
                 "ALTER TABLE payment_logs ADD COLUMN payment_type TEXT",
                 "ALTER TABLE payments ADD COLUMN method TEXT",
@@ -759,6 +761,7 @@ class DB:
         status: str = "PENDING",
         *,
         method: Optional[str] = None,
+        customer_key: Optional[str] = None,
         request_key: Optional[str] = None,
         account_token: Optional[str] = None,
         is_sbp: Optional[bool] = None,
@@ -768,6 +771,7 @@ class DB:
         normalized_status = status.upper() if status else "PENDING"
         normalized_method = (method or "card").strip().lower() or "card"
         sbp_flag = 1 if (is_sbp if is_sbp is not None else normalized_method == "sbp") else 0
+        customer_value = (customer_key or "").strip() or None
         request_value = (request_key or "").strip() or None
         account_value = (account_token or "").strip() or None
         async with aiosqlite.connect(self.path) as db:
@@ -781,7 +785,7 @@ class DB:
                 await db.execute(
                     """
                     UPDATE payments
-                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?, method=?, is_sbp=?, request_key=?, account_token=?
+                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?, method=?, is_sbp=?, request_key=?, account_token=?, customer_key=?
                     WHERE id=?
                     """,
                     (
@@ -795,6 +799,7 @@ class DB:
                         sbp_flag,
                         request_value,
                         account_value,
+                        customer_value,
                         row["id"],
                     ),
                 )
@@ -802,8 +807,8 @@ class DB:
                 created_at = int(time.time())
                 await db.execute(
                     """
-                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at, method, is_sbp, request_key, account_token)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at, method, is_sbp, request_key, account_token, customer_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id,
@@ -817,6 +822,7 @@ class DB:
                         sbp_flag,
                         request_value,
                         account_value,
+                        customer_value,
                     ),
                 )
             await db.commit()

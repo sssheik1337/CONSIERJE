@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from collections.abc import Mapping, Sequence
 from typing import Any
 import re
-import time
 
 import aiosqlite
 from aiogram import Bot, F, Router
@@ -30,8 +29,7 @@ from config import config, get_docs_map
 from db import DB
 from keyboards import build_payment_method_keyboard
 from logger import logger
-from payments import check_payment_status, form_sbp_qr, init_sbp_payment
-from t_pay import init_payment
+from payments import check_payment_status, create_card_payment, form_sbp_qr, init_sbp_payment
 from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
 
 router = Router()
@@ -1471,67 +1469,6 @@ async def _send_card_payment_details(
     )
 
 
-async def create_card_payment(
-    user_id: int,
-    months: int,
-    price: int,
-    *,
-    db: DB | None = None,
-    contact_type: str | None = None,
-    contact_value: str | None = None,
-) -> dict[str, object]:
-    """Создать платёж картой и вернуть данные оплаты."""
-
-    resolved_db = db or DB(config.DB_PATH)
-    if not contact_type or not contact_value:
-        user_row = await resolved_db.get_user(user_id)
-        stored_contact = ""
-        if user_row and hasattr(user_row, "keys") and "email" in user_row.keys():
-            stored_contact = str(user_row["email"] or "")
-        contact_type, contact_value = _validate_contact_value(stored_contact)
-
-    if not contact_type or not contact_value:
-        raise ValueError("Не указан контакт для чека оплаты картой")
-
-    amount_minor = price * 100
-    order_id = f"card_{user_id}_{months}_{int(time.time())}"
-    description = f"Подписка картой на {months} мес. (user {user_id})"
-    email_value = contact_value if contact_type == "email" else None
-    phone_value = contact_value if contact_type == "phone" else None
-
-    response = await init_payment(
-        amount=amount_minor,
-        order_id=order_id,
-        description=description,
-        recurrent="Y",
-        pay_type="O",
-        notification_url=config.TINKOFF_NOTIFY_URL or None,
-        email=email_value,
-        phone=phone_value,
-    )
-
-    payment_id = str(response.get("PaymentId") or "")
-    if not payment_id:
-        raise RuntimeError("Init не вернул идентификатор платежа")
-
-    await resolved_db.add_payment(
-        user_id=user_id,
-        payment_id=payment_id,
-        order_id=order_id,
-        amount=amount_minor,
-        months=months,
-        method="card",
-        is_sbp=False,
-    )
-
-    return {
-        "payment_id": payment_id,
-        "payment_url": response.get("PaymentURL"),
-        "order_id": order_id,
-        "amount": amount_minor,
-    }
-
-
 async def _create_sbp_payment_with_contact(
     message: Message,
     db: DB,
@@ -1624,13 +1561,10 @@ async def handle_buy_contact_input(message: Message, state: FSMContext, db: DB) 
 
     if method == "card":
         try:
-            init_result = await create_card_payment(
+            payment_url = await create_card_payment(
                 message.from_user.id,
                 months,
                 price,
-                db=db,
-                contact_type=contact_type,
-                contact_value=contact_value,
             )
         except Exception as err:  # noqa: BLE001
             logger.exception("Init оплаты картой не удался", exc_info=err)
@@ -1640,8 +1574,13 @@ async def handle_buy_contact_input(message: Message, state: FSMContext, db: DB) 
             )
             return
 
-        payment_id = str(init_result.get("payment_id") or "")
-        payment_url = init_result.get("payment_url")
+        latest_payment = await db.get_latest_payment(message.from_user.id)
+        payment_id = ""
+        if latest_payment is not None:
+            try:
+                payment_id = str(latest_payment["payment_id"] or "")
+            except (KeyError, TypeError, ValueError):
+                payment_id = ""
         if not payment_id:
             await message.answer(
                 "T-Bank не вернул PaymentId. Попробуйте позже.",
@@ -1654,7 +1593,7 @@ async def handle_buy_contact_input(message: Message, state: FSMContext, db: DB) 
             months,
             price,
             payment_id,
-            str(payment_url) if payment_url else None,
+            str(payment_url),
         )
         return
 
