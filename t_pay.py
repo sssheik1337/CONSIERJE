@@ -372,6 +372,93 @@ async def init_payment(
     return response
 
 
+async def init_rebill_payment(user, amount: int, months: int) -> str:
+    """Создать рекуррентный платёж по карте и вернуть PaymentId."""
+
+    (
+        base_url,
+        terminal_key,
+        password,
+        _,
+        _,
+        _,
+        api_token,
+    ) = _read_env()
+
+    def _read_value(source, key: str) -> Optional[str]:
+        if source is None:
+            return None
+        if isinstance(source, dict):
+            return str(source.get(key) or "").strip() or None
+        if hasattr(source, key):
+            return str(getattr(source, key) or "").strip() or None
+        return None
+
+    rebill_id = _read_value(user, "rebill_id")
+    customer_key = _read_value(user, "customer_key")
+    email_value = _read_value(user, "email")
+    if not rebill_id or not customer_key:
+        raise ValueError("Не указаны данные карты для рекуррентного платежа")
+
+    taxation = getattr(config, "T_PAY_TAXATION", None) or "usn_income"
+    receipt: Dict[str, Any] = {
+        "FfdVersion": "1.05",
+        "Taxation": taxation,
+        "Items": [
+            {
+                "Name": "Подписка",
+                "Price": amount,
+                "Quantity": 1,
+                "Amount": amount,
+                "PaymentMethod": "full_prepayment",
+                "PaymentObject": "service",
+                "Tax": "none",
+            }
+        ],
+        "Payments": {"Electronic": amount},
+    }
+    if email_value:
+        receipt["Email"] = email_value
+
+    payload: Dict[str, Any] = {
+        "Amount": amount,
+        "OrderId": f"card_{customer_key}_{months}_{int(time.time())}",
+        "OperationInitiatorType": "R",
+        "RebillId": rebill_id,
+        "CustomerKey": customer_key,
+        "Recurrent": "Y",
+        "PayType": "O",
+        "Receipt": receipt,
+    }
+    if email_value:
+        payload["DATA"] = {"Email": email_value}
+
+    response = await _post(
+        "Init",
+        payload,
+        base_url=base_url,
+        terminal_key=terminal_key,
+        password=password,
+        api_token=api_token,
+    )
+
+    payment_id = str(response.get("PaymentId") or "")
+    if not payment_id:
+        raise RuntimeError("Init не вернул PaymentId")
+    return payment_id
+
+
+async def finalize_rebill(payment_id: str) -> Dict[str, Any]:
+    """Завершить рекуррентный платёж, подтверждая двухстадийный сценарий при необходимости."""
+
+    state = await get_payment_state(payment_id)
+    pay_type = str(state.get("PayType") or state.get("payType") or "").upper()
+    status = str(state.get("Status") or "").upper()
+    if pay_type == "T" and status == "AUTHORIZED":
+        return await confirm_payment(payment_id)
+    return state
+
+
 async def get_qr(payment_id: str, *, data_type: str = "PAYLOAD") -> Dict[str, Any]:
     """Получить QR-данные для оплаты через СБП."""
 
@@ -1164,6 +1251,8 @@ __all__ = [
     "TBankHttpError",
     "init_payment",
     "confirm_payment",
+    "init_rebill_payment",
+    "finalize_rebill",
     "get_payment_state",
     "charge_payment",
     "charge_saved_card",
