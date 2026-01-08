@@ -425,7 +425,15 @@ async def main() -> None:
     logger.info("Запускаем polling aiogram и фоновый сервер вебхуков")
 
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        await dp.start_polling(
+            bot,
+            allowed_updates=[
+                "message",
+                "callback_query",
+                "my_chat_member",
+                "chat_member",
+            ],
+        )
     finally:
         if webhook_task:
             webhook_task.cancel()

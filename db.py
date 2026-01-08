@@ -731,7 +731,26 @@ class DB:
     async def set_target_chat_id(self, chat_id: int) -> None:
         await self.set_setting("target_chat_id", str(chat_id))
 
+    async def set_target_chat_active(self, active: bool) -> None:
+        await self.set_setting("target_chat_active", "1" if active else "0")
+
+    async def get_target_chat_active(self) -> bool:
+        value = await self.get_setting("target_chat_active")
+        if value is None:
+            return True
+        return value in {"1", "true", "True", "TRUE"}
+
+    async def upsert_chat(self, chat_id: int, username: str | None, is_active: bool) -> None:
+        await self.set_target_chat_id(chat_id)
+        await self.set_target_chat_username(username or "")
+        await self.set_target_chat_active(is_active)
+
+    async def set_chat_active(self, is_active: bool) -> None:
+        await self.set_target_chat_active(is_active)
+
     async def get_target_chat_id(self) -> Optional[int]:
+        if not await self.get_target_chat_active():
+            return None
         value = await self.get_setting("target_chat_id")
         if value is None:
             return None

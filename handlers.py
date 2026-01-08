@@ -488,6 +488,23 @@ def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMa
     return builder.as_markup()
 
 
+async def _save_channel(event: ChatMemberUpdated, db: DB) -> None:
+    """Сохранить канал при изменении статуса бота."""
+
+    if event.chat.type != "channel":
+        return
+    status_raw = event.new_chat_member.status
+    status_value = status_raw.value if hasattr(status_raw, "value") else str(status_raw)
+    if status_value in {"member", "administrator"}:
+        username = getattr(event.chat, "username", None)
+        username_value = f"@{username}" if username else ""
+        await db.upsert_chat(event.chat.id, username_value, True)
+        logger.info("Канал обнаружен и активирован: chat_id=%s", event.chat.id)
+    elif status_value in {"left", "kicked"}:
+        await db.set_chat_active(False)
+        logger.info("Бот удалён из канала: chat_id=%s", event.chat.id)
+
+
 DOCS_SETTINGS = {
     "newsletter": ("docs_newsletter_url", "Согласие на рассылку"),
     "pd_consent": ("docs_pd_consent_url", "Согласие на обработку ПД"),
@@ -1950,6 +1967,10 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
 async def handle_chat_member_update(event: ChatMemberUpdated, db: DB) -> None:
     """Отметить использование одноразовой ссылки при вступлении пользователя."""
 
+    if event.new_chat_member.user.id == event.bot.id:
+        await _save_channel(event, db)
+        return
+
     target_chat_id = await db.get_target_chat_id()
     if target_chat_id is None or event.chat.id != target_chat_id:
         return
@@ -1967,6 +1988,13 @@ async def handle_chat_member_update(event: ChatMemberUpdated, db: DB) -> None:
             user_id,
             target_chat_id,
         )
+
+
+@router.my_chat_member()
+async def handle_my_chat_member_update(event: ChatMemberUpdated, db: DB) -> None:
+    """Обработать изменения статуса бота в чате/канале."""
+
+    await _save_channel(event, db)
 
 
 @router.callback_query(F.data == "promo:enter")
