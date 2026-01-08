@@ -185,6 +185,12 @@ class Admin(StatesGroup):
     WaitCustomCode = State()
 
 
+class AdminDocs(StatesGroup):
+    """Состояния администратора для настройки ссылок на документы."""
+
+    WaitUrl = State()
+
+
 class AdminBroadcast(StatesGroup):
     """Состояния администратора для рассылки сообщений."""
 
@@ -482,10 +488,30 @@ def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMa
     return builder.as_markup()
 
 
-def build_docs_message() -> tuple[str, str]:
+DOCS_SETTINGS = {
+    "newsletter": ("docs_newsletter_url", "Согласие на рассылку"),
+    "pd_consent": ("docs_pd_consent_url", "Согласие на обработку ПД"),
+    "pd_policy": ("docs_pd_policy_url", "Политика обработки ПД"),
+    "offer": ("docs_offer_url", "Оферта"),
+}
+
+
+async def _get_docs_map(db: DB) -> dict[str, str]:
+    """Вернуть словарь ссылок на документы с учётом настроек в БД."""
+
+    defaults = get_docs_map()
+    result: dict[str, str] = {}
+    for key, (setting_key, _) in DOCS_SETTINGS.items():
+        stored = await db.get_setting(setting_key)
+        value = (stored or "").strip()
+        result[key] = value or defaults.get(key, "")
+    return result
+
+
+async def build_docs_message(db: DB) -> tuple[str, str]:
     """Сформировать текст и режим форматирования для списка документов."""
 
-    docs = get_docs_map()
+    docs = await _get_docs_map(db)
     items = [
         ("Согласие на рассылку", docs.get("newsletter", "")),
         ("Согласие на обработку ПД", docs.get("pd_consent", "")),
@@ -502,10 +528,10 @@ def build_docs_message() -> tuple[str, str]:
     return text, "Markdown"
 
 
-def build_welcome_with_legal() -> tuple[str, InlineKeyboardMarkup]:
+async def build_welcome_with_legal(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     """Подготовить приветствие с обязательным согласием и клавиатурой."""
 
-    docs_text, _ = build_docs_message()
+    docs_text, _ = await build_docs_message(db)
     text = (
         "👋 Добро пожаловать!\n"
         "Прежде чем продолжить, ознакомьтесь с документами ниже.\n"
@@ -646,9 +672,10 @@ async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
         callback_data="admin:auto_default",
     )
     builder.button(text="🏷️ Создать пробный промокод", callback_data="admin:create_coupon")
+    builder.button(text="📄 Ссылки на документы", callback_data="admin:docs")
     builder.button(text="📣 Опубликовать пост", callback_data="admin:broadcast")
     builder.button(text="🛡️ Проверить права бота", callback_data="admin:check_rights")
-    builder.adjust(2, 2, 1, 1, 1)
+    builder.adjust(2, 2, 1, 1, 1, 1)
 
     return text, builder.as_markup()
 
@@ -976,7 +1003,7 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
     if not user:
         return
     if not await db.has_accepted_legal(user_id):
-        text, markup = build_welcome_with_legal()
+        text, markup = await build_welcome_with_legal(db)
         await message.answer(
             text,
             reply_markup=markup,
@@ -1018,7 +1045,7 @@ async def handle_menu_home(callback: CallbackQuery, state: FSMContext, db: DB) -
 
     if not await db.has_accepted_legal(user_id):
         if callback.message:
-            text, markup = build_welcome_with_legal()
+            text, markup = await build_welcome_with_legal(db)
             await callback.message.answer(
                 text,
                 reply_markup=markup,
@@ -1087,7 +1114,7 @@ async def legal_show_docs(callback: CallbackQuery, state: FSMContext, bot: Bot) 
                 await bot.delete_message(prev_chat, prev_message)
             except TelegramBadRequest:
                 pass
-        text, parse_mode = build_docs_message()
+        text, parse_mode = await build_docs_message(db)
         builder = InlineKeyboardBuilder()
         builder.button(text="⬅️ Назад", callback_data="legal:back")
         builder.adjust(1)
@@ -1124,7 +1151,7 @@ async def legal_back(callback: CallbackQuery, state: FSMContext) -> None:
         try:
             await callback.message.delete()
         except TelegramBadRequest:
-            text, markup = build_welcome_with_legal()
+            text, markup = await build_welcome_with_legal(db)
             try:
                 await callback.message.edit_text(
                     text,
@@ -1209,7 +1236,7 @@ async def docs_open(callback: CallbackQuery, db: DB) -> None:
         await callback.answer("Сначала подтвердите согласие.", show_alert=True)
         return
     if callback.message:
-        text, parse_mode = build_docs_message()
+        text, parse_mode = await build_docs_message(db)
         builder = InlineKeyboardBuilder()
         builder.button(text="⬅️ Назад", callback_data="docs:back")
         builder.adjust(1)
@@ -2135,6 +2162,91 @@ async def admin_bind_chat(callback: CallbackQuery, state: FSMContext) -> None:
             disable_web_page_preview=True,
         )
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin:docs")
+async def admin_docs_menu(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
+    """Показать меню настройки ссылок на документы."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.clear()
+    docs = await _get_docs_map(db)
+    lines = ["📄 Ссылки на документы:"]
+    for key, (_, title) in DOCS_SETTINGS.items():
+        value = docs.get(key, "")
+        if value:
+            lines.append(f"• {title}: {value}")
+        else:
+            lines.append(f"• {title}: не указана")
+    text = "\n".join(escape_md(line) for line in lines)
+    builder = InlineKeyboardBuilder()
+    for key, (_, title) in DOCS_SETTINGS.items():
+        builder.button(text=f"✏️ {title}", callback_data=f"admin:docs:edit:{key}")
+    builder.button(text="⬅️ Назад", callback_data="admin:open")
+    builder.adjust(1)
+    if callback.message:
+        await callback.message.answer(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:docs:edit:"))
+async def admin_docs_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    """Запросить новую ссылку на документ."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    key = parts[-1] if parts else ""
+    if key not in DOCS_SETTINGS:
+        await callback.answer("Неизвестный документ.", show_alert=True)
+        return
+    await state.set_state(AdminDocs.WaitUrl)
+    await state.update_data(doc_key=key)
+    title = DOCS_SETTINGS[key][1]
+    if callback.message:
+        await callback.message.answer(
+            escape_md(
+                f"Отправьте новую ссылку для «{title}».\n"
+                "Чтобы очистить, отправьте «-»."
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.message(AdminDocs.WaitUrl)
+async def admin_docs_save(message: Message, state: FSMContext, db: DB) -> None:
+    """Сохранить ссылку на документ."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    data = await state.get_data()
+    key = data.get("doc_key")
+    if key not in DOCS_SETTINGS:
+        await message.answer("Не удалось определить документ.")
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    setting_key, title = DOCS_SETTINGS[key]
+    value = "" if raw == "-" else raw
+    await db.set_setting(setting_key, value)
+    await message.answer(
+        escape_md(f"Ссылка для «{title}» обновлена."),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    await state.clear()
 
 
 @router.message(BindChat.wait_username)
