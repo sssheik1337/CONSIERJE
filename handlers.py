@@ -50,6 +50,11 @@ CANCEL_REPLY = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+ADMIN_CANCEL_REPLY = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Отмена")]],
+    resize_keyboard=True,
+)
+
 START_TEXT = "🎟️ Доступ в канал\nВыберите действие ниже.\n\nℹ️ Пробный период доступен по промокоду."
 
 
@@ -3268,7 +3273,7 @@ async def admin_create_coupon(callback: CallbackQuery, state: FSMContext) -> Non
         )
         await callback.message.answer(
             escape_md("Пришлите промокод (латиница/цифры/дефис, 4–32 символа)."),
-            reply_markup=CANCEL_REPLY,
+            reply_markup=ADMIN_CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
