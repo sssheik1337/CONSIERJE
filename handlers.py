@@ -201,7 +201,8 @@ class AdminBroadcast(StatesGroup):
 
     WaitMessage = State()
     WaitButtonsMenu = State()
-    WaitButtonInput = State()
+    WaitButtonText = State()
+    WaitButtonUrl = State()
     WaitConfirm = State()
 
 
@@ -2269,10 +2270,9 @@ async def admin_broadcast_buttons_menu(message: Message, state: FSMContext) -> N
         await message.answer("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
         return
     if choice == "➕ Добавить кнопку":
-        await state.set_state(AdminBroadcast.WaitButtonInput)
+        await state.set_state(AdminBroadcast.WaitButtonText)
         await message.answer(
-            "Отправьте кнопку в формате:\n"
-            "Текст кнопки | https://example.com",
+            "Отправьте текст для кнопки.",
         )
         return
     if choice == "➕ Кнопка оплаты":
@@ -2296,33 +2296,51 @@ async def admin_broadcast_buttons_menu(message: Message, state: FSMContext) -> N
     )
 
 
-@router.message(AdminBroadcast.WaitButtonInput)
-async def admin_broadcast_button_input(message: Message, state: FSMContext) -> None:
-    """Принять данные кнопки рассылки."""
+@router.message(AdminBroadcast.WaitButtonText)
+async def admin_broadcast_button_text(message: Message, state: FSMContext) -> None:
+    """Принять текст кнопки рассылки."""
 
     if not is_super_admin(message.from_user.id):
         await message.answer("Недостаточно прав.")
         await state.clear()
         return
-    text = (message.text or "").strip()
-    if is_cancel(text):
+    button_text = (message.text or "").strip()
+    if is_cancel(button_text):
         await state.clear()
         await message.answer("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
         return
-    parts = [part.strip() for part in text.split("|", 1)]
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        await message.answer(
-            "Не удалось распознать кнопку. Отправьте в формате:\n"
-            "Текст кнопки | https://example.com",
-        )
+    if not button_text:
+        await message.answer("Текст кнопки не должен быть пустым. Попробуйте снова.")
         return
-    button_text, button_url = parts
+    await state.update_data(broadcast_button_text=button_text)
+    await state.set_state(AdminBroadcast.WaitButtonUrl)
+    await message.answer("Теперь отправьте ссылку для кнопки.")
+
+
+@router.message(AdminBroadcast.WaitButtonUrl)
+async def admin_broadcast_button_url(message: Message, state: FSMContext) -> None:
+    """Принять ссылку для кнопки рассылки."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    button_url = (message.text or "").strip()
+    if is_cancel(button_url):
+        await state.clear()
+        await message.answer("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
+        return
     if not (button_url.startswith("https://") or button_url.startswith("http://")):
         await message.answer(
             "Ссылка для кнопки должна начинаться с http:// или https://. Попробуйте снова.",
         )
         return
     data = await state.get_data()
+    button_text = str(data.get("broadcast_button_text") or "").strip()
+    if not button_text:
+        await state.set_state(AdminBroadcast.WaitButtonText)
+        await message.answer("Текст кнопки не найден. Отправьте текст кнопки заново.")
+        return
     buttons = list(data.get("broadcast_buttons") or [])
     buttons.append({"kind": "url", "text": button_text, "url": button_url})
     await state.update_data(broadcast_buttons=buttons)
