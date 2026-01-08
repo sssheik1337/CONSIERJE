@@ -802,6 +802,15 @@ class DB:
         prices = await self.get_all_prices()
         return {months: price for months, price in prices}
 
+    async def list_users_for_broadcast(self) -> list[int]:
+        """Вернуть список user_id для рассылки."""
+
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT user_id FROM users")
+            rows = await cur.fetchall()
+        return [int(row["user_id"]) for row in rows if row and row["user_id"]]
+
     async def add_payment(
         self,
         user_id: int,

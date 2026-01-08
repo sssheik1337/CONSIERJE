@@ -29,6 +29,18 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    """Считать число с плавающей точкой из окружения."""
+
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _optional_env(name: str) -> Optional[str]:
     """Вернуть строку из окружения или None, если значение пустое."""
 
@@ -69,6 +81,9 @@ class Config:
     )
     SBP_TEST_INTERVAL_MINUTES: Optional[int] = field(
         default_factory=lambda: _env_int("SBP_TEST_INTERVAL_MINUTES", 0) or None
+    )
+    BROADCAST_DELAY_SECONDS: float = field(
+        default_factory=lambda: _env_float("BROADCAST_DELAY_SECONDS", 0.1)
     )
 
     TINKOFF_NOTIFY_URL: str = TINKOFF_NOTIFY_URL

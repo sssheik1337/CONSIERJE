@@ -185,6 +185,13 @@ class Admin(StatesGroup):
     WaitCustomCode = State()
 
 
+class AdminBroadcast(StatesGroup):
+    """Состояния администратора для рассылки сообщений."""
+
+    WaitMessage = State()
+    WaitConfirm = State()
+
+
 class AdminPrice(StatesGroup):
     """Состояния администратора для управления тарифами."""
 
@@ -639,8 +646,9 @@ async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
         callback_data="admin:auto_default",
     )
     builder.button(text="🏷️ Создать пробный промокод", callback_data="admin:create_coupon")
+    builder.button(text="📣 Опубликовать пост", callback_data="admin:broadcast")
     builder.button(text="🛡️ Проверить права бота", callback_data="admin:check_rights")
-    builder.adjust(2, 2, 1, 1)
+    builder.adjust(2, 2, 1, 1, 1)
 
     return text, builder.as_markup()
 
@@ -1989,6 +1997,118 @@ async def open_admin_panel(callback: CallbackQuery, db: DB) -> None:
         return
     if callback.message:
         await render_admin_panel(callback.message, db)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начать рассылку поста администратором."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.set_state(AdminBroadcast.WaitMessage)
+    if callback.message:
+        await callback.message.answer(
+            "Отправьте текст поста в формате MarkdownV2.\n"
+            "Для отмены вернитесь в админ-панель.",
+        )
+    await callback.answer()
+
+
+@router.message(AdminBroadcast.WaitMessage)
+async def admin_broadcast_message(message: Message, state: FSMContext) -> None:
+    """Принять текст рассылки от администратора."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    text = message.text or ""
+    if not text.strip():
+        await message.answer("Пост не должен быть пустым. Отправьте текст заново.")
+        return
+    await state.update_data(broadcast_text=text)
+    await state.set_state(AdminBroadcast.WaitConfirm)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Отправить", callback_data="admin:broadcast:confirm")
+    builder.button(text="❌ Отмена", callback_data="admin:broadcast:cancel")
+    builder.adjust(1)
+    await message.answer(
+        "Предпросмотр сообщения ниже. Отправить рассылку?",
+        reply_markup=builder.as_markup(),
+    )
+    await message.answer(
+        text,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data == "admin:broadcast:cancel")
+async def admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отменить рассылку поста."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.clear()
+    if callback.message:
+        await callback.message.answer("Рассылка отменена.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast:confirm")
+async def admin_broadcast_confirm(
+    callback: CallbackQuery, db: DB, state: FSMContext
+) -> None:
+    """Подтвердить и выполнить рассылку поста."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    data = await state.get_data()
+    text = str(data.get("broadcast_text") or "")
+    if not text.strip():
+        await callback.answer("Текст рассылки не найден.", show_alert=True)
+        await state.clear()
+        return
+
+    users = await db.list_users_for_broadcast()
+    sent_count = 0
+    blocked_count = 0
+    error_count = 0
+    delay_seconds = max(0.0, float(config.BROADCAST_DELAY_SECONDS or 0.0))
+
+    for user_id in users:
+        try:
+            await callback.bot.send_message(
+                user_id,
+                text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            sent_count += 1
+        except TelegramForbiddenError:
+            blocked_count += 1
+        except TelegramBadRequest as err:
+            error_count += 1
+            logger.debug("Ошибка рассылки для пользователя %s: %s", user_id, err)
+        except Exception as err:  # noqa: BLE001
+            error_count += 1
+            logger.exception("Неожиданная ошибка рассылки для %s", user_id, exc_info=err)
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+
+    summary = (
+        "Рассылка завершена.\n"
+        f"Отправлено: {sent_count}\n"
+        f"Заблокировали бота: {blocked_count}\n"
+        f"Ошибки: {error_count}"
+    )
+    if callback.message:
+        await callback.message.answer(summary)
+    await state.clear()
     await callback.answer()
 
 
