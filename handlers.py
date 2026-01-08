@@ -2169,7 +2169,8 @@ async def admin_broadcast_message(message: Message, state: FSMContext) -> None:
     if not text.strip():
         await message.answer("Пост не должен быть пустым. Отправьте текст заново.")
         return
-    await state.update_data(broadcast_text=text)
+    entities = message.entities or []
+    await state.update_data(broadcast_text=text, broadcast_entities=entities)
     await state.set_state(AdminBroadcast.WaitConfirm)
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Отправить", callback_data="admin:broadcast:confirm")
@@ -2179,11 +2180,18 @@ async def admin_broadcast_message(message: Message, state: FSMContext) -> None:
         "Предпросмотр сообщения ниже. Отправить рассылку?",
         reply_markup=builder.as_markup(),
     )
-    await message.answer(
-        text,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        disable_web_page_preview=True,
-    )
+    if entities:
+        await message.answer(
+            text,
+            entities=entities,
+            disable_web_page_preview=True,
+        )
+    else:
+        await message.answer(
+            text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
 
 
 @router.callback_query(F.data == "admin:broadcast:cancel")
@@ -2210,6 +2218,7 @@ async def admin_broadcast_confirm(
         return
     data = await state.get_data()
     text = str(data.get("broadcast_text") or "")
+    entities = data.get("broadcast_entities") or []
     if not text.strip():
         await callback.answer("Текст рассылки не найден.", show_alert=True)
         await state.clear()
@@ -2223,12 +2232,20 @@ async def admin_broadcast_confirm(
 
     for user_id in users:
         try:
-            await callback.bot.send_message(
-                user_id,
-                text,
-                parse_mode=ParseMode.MARKDOWN_V2,
-                disable_web_page_preview=True,
-            )
+            if entities:
+                await callback.bot.send_message(
+                    user_id,
+                    text,
+                    entities=entities,
+                    disable_web_page_preview=True,
+                )
+            else:
+                await callback.bot.send_message(
+                    user_id,
+                    text,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_web_page_preview=True,
+                )
             sent_count += 1
         except TelegramForbiddenError:
             blocked_count += 1
