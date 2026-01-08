@@ -3191,7 +3191,7 @@ async def admin_trial_days(callback: CallbackQuery, state: FSMContext) -> None:
         )
         await callback.message.answer(
             escape_md("Пришлите количество дней пробного периода."),
-            reply_markup=CANCEL_REPLY,
+            reply_markup=ADMIN_CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
