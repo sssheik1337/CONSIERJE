@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from collections.abc import Mapping, Sequence
 from typing import Any
+import json
 import re
 
 import aiosqlite
@@ -33,8 +34,6 @@ from payments import check_payment_status, create_card_payment, form_sbp_qr, ini
 from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
 
 router = Router()
-
-ADMIN_IDS = set(config.SUPER_ADMIN_IDS)
 
 DEFAULT_TRIAL_DAYS = 3
 DEFAULT_AUTO_RENEW = True
@@ -198,6 +197,13 @@ class AdminBroadcast(StatesGroup):
     WaitConfirm = State()
 
 
+class AdminAuth(StatesGroup):
+    """Состояния авторизации администратора."""
+
+    WaitLogin = State()
+    WaitPassword = State()
+
+
 class AdminPrice(StatesGroup):
     """Состояния администратора для управления тарифами."""
 
@@ -237,10 +243,49 @@ def format_short_date(ts: int) -> str:
     return datetime.utcfromtimestamp(ts).strftime("%d.%m.%Y")
 
 
+def _load_admin_ids() -> set[int]:
+    """Загрузить список администраторов из файла."""
+
+    path = (config.ADMIN_AUTH_FILE or "").strip()
+    if not path:
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return set()
+    except Exception as err:  # noqa: BLE001
+        logger.debug("Не удалось прочитать список администраторов: %s", err)
+        return set()
+    if isinstance(payload, dict):
+        raw_ids = payload.get("admins", [])
+    else:
+        raw_ids = payload
+    if not isinstance(raw_ids, list):
+        return set()
+    return {int(item) for item in raw_ids if str(item).isdigit()}
+
+
+def _save_admin_id(user_id: int) -> None:
+    """Сохранить пользователя в список администраторов."""
+
+    path = (config.ADMIN_AUTH_FILE or "").strip()
+    if not path:
+        return
+    ids = _load_admin_ids()
+    ids.add(int(user_id))
+    payload = {"admins": sorted(ids)}
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Не удалось сохранить список администраторов", exc_info=err)
+
+
 def is_super_admin(user_id: int) -> bool:
     """Проверить, является ли пользователь суперадмином."""
 
-    return user_id in ADMIN_IDS
+    return user_id in _load_admin_ids()
 
 
 def inline_emoji(flag: bool) -> str:
@@ -999,7 +1044,7 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
 
     await state.clear()
     user_id = message.from_user.id
-    if user_id in ADMIN_IDS:
+    if is_super_admin(user_id):
         await show_admin_panel(message, db)
         return
     now_ts = int(datetime.utcnow().timestamp())
@@ -2041,6 +2086,42 @@ async def cmd_use(message: Message, state: FSMContext, db: DB) -> None:
         )
         return
     await redeem_promo_code(message, db, parts[1], remove_keyboard=False)
+
+
+@router.message(Command("admin_auth"))
+async def admin_auth_start(message: Message, state: FSMContext) -> None:
+    """Запустить скрытую авторизацию администратора."""
+
+    await state.set_state(AdminAuth.WaitLogin)
+    await message.answer("Введите логин администратора.")
+
+
+@router.message(AdminAuth.WaitLogin)
+async def admin_auth_login(message: Message, state: FSMContext) -> None:
+    """Принять логин администратора."""
+
+    login = (message.text or "").strip()
+    if not login:
+        await message.answer("Логин не должен быть пустым. Введите ещё раз.")
+        return
+    await state.update_data(admin_login=login)
+    await state.set_state(AdminAuth.WaitPassword)
+    await message.answer("Введите пароль администратора.")
+
+
+@router.message(AdminAuth.WaitPassword)
+async def admin_auth_password(message: Message, state: FSMContext) -> None:
+    """Принять пароль администратора и авторизовать пользователя."""
+
+    password = (message.text or "").strip()
+    data = await state.get_data()
+    login = str(data.get("admin_login") or "")
+    if login == config.ADMIN_LOGIN and password == config.ADMIN_PASSWORD:
+        _save_admin_id(message.from_user.id)
+        await message.answer("✅ Администратор успешно авторизован.")
+    else:
+        await message.answer("❌ Неверный логин или пароль.")
+    await state.clear()
 
 
 @router.callback_query(F.data == "admin:open")

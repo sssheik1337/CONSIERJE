@@ -57,6 +57,9 @@ class Config:
     SUPER_ADMIN_IDS: set[int] = field(
         default_factory=lambda: _parse_ids(os.getenv("SUPER_ADMIN_IDS", ""))
     )
+    ADMIN_LOGIN: str = os.getenv("ADMIN_LOGIN", "")
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "")
+    ADMIN_AUTH_FILE: str = os.getenv("ADMIN_AUTH_FILE", "./admins.json")
 
     DB_PATH: str = os.getenv("DB_PATH", "./concierge.sqlite3")
     TIMEZONE: str = os.getenv("TIMEZONE", "Europe/Moscow")
