@@ -2249,28 +2249,92 @@ async def admin_broadcast_confirm(
 
 
 @router.callback_query(F.data == "admin:bind_chat")
-async def admin_bind_chat(callback: CallbackQuery, state: FSMContext) -> None:
+async def admin_bind_chat(callback: CallbackQuery, state: FSMContext, db: DB) -> None:
     """Запросить у администратора идентификатор целевого чата."""
 
     if not is_super_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
-    await state.set_state(BindChat.wait_username)
+    await state.clear()
     if callback.message:
-        await state.update_data(
-            panel_chat_id=callback.message.chat.id,
-            panel_message_id=callback.message.message_id,
+        chat_id = await db.get_target_chat_id()
+        chat_username = await db.get_target_chat_username()
+        if chat_id is None:
+            await callback.message.answer(
+                escape_md(
+                    "Каналы не обнаружены. Добавьте бота в канал, затем вернитесь сюда."
+                ),
+                reply_markup=main_menu_markup(),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            await callback.answer()
+            return
+        title = chat_username or f"id {chat_id}"
+        builder = InlineKeyboardBuilder()
+        builder.button(
+            text=f"📌 {title}",
+            callback_data=f"admin:bind_chat:select:{chat_id}",
         )
+        builder.button(text="⬅️ Назад", callback_data="admin:open")
+        builder.adjust(1)
         await callback.message.answer(
-            escape_md(
-                "Пришлите @username, username или chat_id канала/группы.\n\n"
-                "Можно нажать «⬅️ Назад» или «🏠 Главное меню»."
-            ),
-            reply_markup=CANCEL_REPLY,
+            escape_md("Выберите канал для привязки:"),
+            reply_markup=builder.as_markup(),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:bind_chat:select:"))
+async def admin_bind_chat_select(callback: CallbackQuery, bot: Bot, db: DB) -> None:
+    """Привязать канал по выбранной кнопке."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    raw_chat_id = parts[-1] if parts else ""
+    try:
+        chat_id = int(raw_chat_id)
+    except ValueError:
+        await callback.answer("Некорректный идентификатор чата.", show_alert=True)
+        return
+    try:
+        chat = await bot.get_chat(chat_id)
+        me = await bot.me()
+        member = await bot.get_chat_member(chat_id, me.id)
+    except TelegramBadRequest as err:
+        logger.exception("Ошибка при получении чата", exc_info=err)
+        await callback.answer("Не удалось получить чат. Проверьте права бота.", show_alert=True)
+        return
+    except TelegramForbiddenError as err:
+        logger.exception("Боту запрещён доступ к чату", exc_info=err)
+        await callback.answer("Нет доступа к чату. Назначьте бота админом.", show_alert=True)
+        return
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Не удалось проверить чат", exc_info=err)
+        await callback.answer("Не удалось проверить чат. См. логи.", show_alert=True)
+        return
+
+    status_raw = getattr(member, "status", "")
+    status_value = status_raw.value if hasattr(status_raw, "value") else str(status_raw)
+    if status_value not in {"administrator", "creator"}:
+        await callback.answer("Бот не администратор в чате.", show_alert=True)
+        return
+    invite_allowed = getattr(member, "can_invite_users", None)
+    if invite_allowed is False:
+        await callback.answer("Нет права «Пригласительные ссылки».", show_alert=True)
+        return
+
+    username = getattr(chat, "username", None)
+    username_value = f"@{username}" if username else ""
+    await db.set_target_chat_username(username_value)
+    await db.set_target_chat_id(chat_id)
+    await callback.answer("Чат привязан.", show_alert=True)
+    if callback.message:
+        await render_admin_panel(callback.message, db)
 
 
 @router.callback_query(F.data == "admin:docs")
