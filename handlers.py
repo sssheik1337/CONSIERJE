@@ -200,7 +200,8 @@ class AdminBroadcast(StatesGroup):
     """Состояния администратора для рассылки сообщений."""
 
     WaitMessage = State()
-    WaitButton = State()
+    WaitButtonsMenu = State()
+    WaitButtonInput = State()
     WaitConfirm = State()
 
 
@@ -299,6 +300,20 @@ def inline_emoji(flag: bool) -> str:
     """Вернуть эмодзи статуса."""
 
     return "✅" if flag else "❌"
+
+
+def build_broadcast_buttons_menu() -> ReplyKeyboardMarkup:
+    """Собрать клавиатуру управления кнопками для рассылки."""
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Добавить кнопку")],
+            [KeyboardButton(text="➕ Кнопка оплаты")],
+            [KeyboardButton(text="Пропустить")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 def _normalize_control_text(text: str | None) -> str:
@@ -2159,75 +2174,38 @@ async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext) -> N
     await callback.answer()
 
 
-@router.message(AdminBroadcast.WaitMessage)
-async def admin_broadcast_message(message: Message, state: FSMContext) -> None:
-    """Принять текст рассылки от администратора."""
+def _build_broadcast_inline_markup(buttons: list[dict[str, str]]) -> InlineKeyboardMarkup | None:
+    """Собрать инлайн-клавиатуру для рассылки из сохранённых кнопок."""
 
-    if not is_super_admin(message.from_user.id):
-        await message.answer("Недостаточно прав.")
-        await state.clear()
-        return
-    text = message.text or ""
-    if not text.strip():
-        await message.answer("Пост не должен быть пустым. Отправьте текст заново.")
-        return
-    entities = message.entities or []
-    await state.update_data(broadcast_text=text, broadcast_entities=entities)
-    await state.set_state(AdminBroadcast.WaitButton)
-    await message.answer(
-        "Если нужно добавить кнопку со ссылкой, отправьте её в формате:\n"
-        "Текст кнопки | https://example.com\n"
-        "Или отправьте «-», чтобы продолжить без кнопки.",
-    )
+    if not buttons:
+        return None
+    builder = InlineKeyboardBuilder()
+    added = False
+    for entry in buttons:
+        kind = entry.get("kind")
+        if kind == "payment":
+            builder.button(text="💳 Купить подписку", callback_data="buy:open")
+            added = True
+            continue
+        text = entry.get("text", "")
+        url = entry.get("url", "")
+        if text and url:
+            builder.button(text=text, url=url)
+            added = True
+    if not added:
+        return None
+    builder.adjust(1)
+    return builder.as_markup()
 
 
-@router.message(AdminBroadcast.WaitButton)
-async def admin_broadcast_button(message: Message, state: FSMContext) -> None:
-    """Принять данные кнопки рассылки или пропустить её."""
+async def _show_broadcast_preview(message: Message, state: FSMContext) -> None:
+    """Показать предпросмотр рассылки и запросить подтверждение."""
 
-    if not is_super_admin(message.from_user.id):
-        await message.answer("Недостаточно прав.")
-        await state.clear()
-        return
-    text = (message.text or "").strip()
-    if is_cancel(text):
-        await state.clear()
-        await message.answer("Рассылка отменена.")
-        return
-    skip_values = {"-", "нет", "без", "без кнопки"}
-    button_text = ""
-    button_url = ""
-    if text and text.lower() not in skip_values:
-        parts = [part.strip() for part in text.split("|", 1)]
-        if len(parts) != 2 or not parts[0] or not parts[1]:
-            await message.answer(
-                "Не удалось распознать кнопку. Отправьте в формате:\n"
-                "Текст кнопки | https://example.com\n"
-                "Или отправьте «-», чтобы продолжить без кнопки.",
-            )
-            return
-        button_text, button_url = parts
-        if not (button_url.startswith("https://") or button_url.startswith("http://")):
-            await message.answer(
-                "Ссылка для кнопки должна начинаться с http:// или https://. Попробуйте снова.",
-            )
-            return
-
-    await state.update_data(
-        broadcast_button_text=button_text,
-        broadcast_button_url=button_url,
-    )
-    await state.set_state(AdminBroadcast.WaitConfirm)
     data = await state.get_data()
     preview_text = str(data.get("broadcast_text") or "")
     preview_entities = data.get("broadcast_entities") or []
-    preview_button_text = str(data.get("broadcast_button_text") or "").strip()
-    preview_button_url = str(data.get("broadcast_button_url") or "").strip()
-    preview_markup = None
-    if preview_button_text and preview_button_url:
-        preview_builder = InlineKeyboardBuilder()
-        preview_builder.button(text=preview_button_text, url=preview_button_url)
-        preview_markup = preview_builder.as_markup()
+    preview_buttons = data.get("broadcast_buttons") or []
+    preview_markup = _build_broadcast_inline_markup(preview_buttons)
     if preview_entities:
         await message.answer(
             preview_text,
@@ -2249,6 +2227,109 @@ async def admin_broadcast_button(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Предпросмотр сообщения ниже. Отправить рассылку?",
         reply_markup=builder.as_markup(),
+    )
+
+
+@router.message(AdminBroadcast.WaitMessage)
+async def admin_broadcast_message(message: Message, state: FSMContext) -> None:
+    """Принять текст рассылки от администратора."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    text = message.text or ""
+    if not text.strip():
+        await message.answer("Пост не должен быть пустым. Отправьте текст заново.")
+        return
+    entities = message.entities or []
+    await state.update_data(
+        broadcast_text=text,
+        broadcast_entities=entities,
+        broadcast_buttons=[],
+    )
+    await state.set_state(AdminBroadcast.WaitButtonsMenu)
+    await message.answer(
+        "Добавьте кнопку для поста или пропустите этот шаг.",
+        reply_markup=build_broadcast_buttons_menu(),
+    )
+
+
+@router.message(AdminBroadcast.WaitButtonsMenu)
+async def admin_broadcast_buttons_menu(message: Message, state: FSMContext) -> None:
+    """Обработать выбор админа по кнопкам рассылки."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    choice = (message.text or "").strip()
+    if is_cancel(choice):
+        await state.clear()
+        await message.answer("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
+        return
+    if choice == "➕ Добавить кнопку":
+        await state.set_state(AdminBroadcast.WaitButtonInput)
+        await message.answer(
+            "Отправьте кнопку в формате:\n"
+            "Текст кнопки | https://example.com",
+        )
+        return
+    if choice == "➕ Кнопка оплаты":
+        data = await state.get_data()
+        buttons = list(data.get("broadcast_buttons") or [])
+        buttons.append({"kind": "payment"})
+        await state.update_data(broadcast_buttons=buttons)
+        await message.answer(
+            "Кнопка оплаты добавлена. Добавим ещё кнопку?",
+            reply_markup=build_broadcast_buttons_menu(),
+        )
+        return
+    if choice == "Пропустить":
+        await state.set_state(AdminBroadcast.WaitConfirm)
+        await message.answer("Готовлю предпросмотр.", reply_markup=ReplyKeyboardRemove())
+        await _show_broadcast_preview(message, state)
+        return
+    await message.answer(
+        "Выберите действие кнопками ниже.",
+        reply_markup=build_broadcast_buttons_menu(),
+    )
+
+
+@router.message(AdminBroadcast.WaitButtonInput)
+async def admin_broadcast_button_input(message: Message, state: FSMContext) -> None:
+    """Принять данные кнопки рассылки."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if is_cancel(text):
+        await state.clear()
+        await message.answer("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
+        return
+    parts = [part.strip() for part in text.split("|", 1)]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        await message.answer(
+            "Не удалось распознать кнопку. Отправьте в формате:\n"
+            "Текст кнопки | https://example.com",
+        )
+        return
+    button_text, button_url = parts
+    if not (button_url.startswith("https://") or button_url.startswith("http://")):
+        await message.answer(
+            "Ссылка для кнопки должна начинаться с http:// или https://. Попробуйте снова.",
+        )
+        return
+    data = await state.get_data()
+    buttons = list(data.get("broadcast_buttons") or [])
+    buttons.append({"kind": "url", "text": button_text, "url": button_url})
+    await state.update_data(broadcast_buttons=buttons)
+    await state.set_state(AdminBroadcast.WaitButtonsMenu)
+    await message.answer(
+        "Кнопка добавлена. Добавим ещё?",
+        reply_markup=build_broadcast_buttons_menu(),
     )
 
 
@@ -2277,8 +2358,7 @@ async def admin_broadcast_confirm(
     data = await state.get_data()
     text = str(data.get("broadcast_text") or "")
     entities = data.get("broadcast_entities") or []
-    button_text = str(data.get("broadcast_button_text") or "").strip()
-    button_url = str(data.get("broadcast_button_url") or "").strip()
+    buttons = data.get("broadcast_buttons") or []
     if not text.strip():
         await callback.answer("Текст рассылки не найден.", show_alert=True)
         await state.clear()
@@ -2289,11 +2369,7 @@ async def admin_broadcast_confirm(
     blocked_count = 0
     error_count = 0
     delay_seconds = max(0.0, float(config.BROADCAST_DELAY_SECONDS or 0.0))
-    markup = None
-    if button_text and button_url:
-        builder = InlineKeyboardBuilder()
-        builder.button(text=button_text, url=button_url)
-        markup = builder.as_markup()
+    markup = _build_broadcast_inline_markup(buttons)
 
     for user_id in users:
         if user_id == callback.from_user.id:
