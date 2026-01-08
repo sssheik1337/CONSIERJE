@@ -2272,7 +2272,7 @@ async def admin_broadcast_buttons_menu(message: Message, state: FSMContext) -> N
     if choice == "➕ Добавить кнопку":
         await state.set_state(AdminBroadcast.WaitButtonText)
         await message.answer(
-            "Отправьте текст для кнопки.",
+            "Отправьте текст для кнопки. Ссылка будет запрошена следующим сообщением.",
         )
         return
     if choice == "➕ Кнопка оплаты":
