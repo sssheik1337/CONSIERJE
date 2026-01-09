@@ -27,7 +27,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import config, get_docs_map
+from config import config
 from db import DB
 from keyboards import build_payment_method_keyboard
 from logger import logger
@@ -584,12 +584,11 @@ DOCS_SETTINGS = {
 async def _get_docs_map(db: DB) -> dict[str, str]:
     """Вернуть словарь ссылок на документы с учётом настроек в БД."""
 
-    defaults = get_docs_map()
     result: dict[str, str] = {}
     for key, (setting_key, _) in DOCS_SETTINGS.items():
         stored = await db.get_setting(setting_key)
         value = (stored or "").strip()
-        result[key] = value or defaults.get(key, "")
+        result[key] = value
     return result
 
 
