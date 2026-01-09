@@ -29,14 +29,13 @@ class TBankApiError(RuntimeError):
 """
 Этот модуль инкапсулирует работу с API интернет‑эквайринга T‑Bank (Tinkoff).
 Для всех вызовов необходим TerminalKey и пароль, которые считываются из
-переменных окружения. Дополнительно можно задавать success/fail URL, URL
-уведомлений и API токен.
+переменных окружения. Дополнительно можно задавать URL уведомлений.
 
 Примечание: сумма передаётся в копейках (например, 100₽ = 10000).
 """
 
 
-def _read_env() -> Tuple[str, str, str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+def _read_env() -> Tuple[str, str, str, Optional[str]]:
     """Прочитать и провалидировать настройки окружения для T-Bank."""
 
     base_url = (config.T_PAY_BASE_URL or "https://securepay.tinkoff.ru/v2").rstrip("/")
@@ -45,19 +44,13 @@ def _read_env() -> Tuple[str, str, str, Optional[str], Optional[str], Optional[s
     if not terminal_key or not password:
         raise RuntimeError("T_PAY_TERMINAL_KEY/T_PAY_PASSWORD не заданы")
 
-    success_url = (config.T_PAY_SUCCESS_URL or "").strip() or None
-    fail_url = (config.T_PAY_FAIL_URL or "").strip() or None
     notification_url = (config.TINKOFF_NOTIFY_URL or "").strip() or None
-    api_token = (config.T_PAY_API_TOKEN or "").strip() or None
 
     return (
         base_url,
         terminal_key,
         password,
-        success_url,
-        fail_url,
         notification_url,
-        api_token,
     )
 
 
@@ -107,7 +100,6 @@ def _post_sync(
     base_url: str,
     terminal_key: str,
     password: str,
-    api_token: Optional[str],
 ) -> Dict[str, Any]:
     """Синхронно выполнить POST‑запрос к T‑Bank через requests."""
 
@@ -124,8 +116,6 @@ def _post_sync(
         "Accept": "application/json",
         "User-Agent": "ConciergeBot/1.0",
     }
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
 
     logger.info("T-Bank запрос: %s payload=%s", endpoint, body)
     try:
@@ -177,7 +167,6 @@ async def _post(
     base_url: str,
     terminal_key: str,
     password: str,
-    api_token: Optional[str],
 ) -> Dict[str, Any]:
     """Асинхронно вызвать T‑Bank API через поток с requests."""
 
@@ -188,7 +177,6 @@ async def _post(
         base_url=base_url,
         terminal_key=terminal_key,
         password=password,
-        api_token=api_token,
     )
 
 
@@ -254,8 +242,6 @@ async def init_payment(
     recurrent: Optional[str] = None,
     receipt: Optional[Dict[str, Any]] = None,
     notification_url: Optional[str] = None,
-    success_url: Optional[str] = None,
-    fail_url: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -275,8 +261,6 @@ async def init_payment(
     :param recurrent: (опционально) 'Y' для сохранения реквизитов карты.
     :param receipt: (опционально) объект с данными для чека.
     :param notification_url: (опционально) override для URL уведомлений.
-    :param success_url: (опционально) override для URL успеха.
-    :param fail_url: (опционально) override для URL ошибки.
     :param extra: (опционально) дополнительные поля (будут вложены в DATA).
     :return: ответ метода Init (словарь). Полезные поля: PaymentURL, PaymentId, Status.
     """
@@ -284,10 +268,7 @@ async def init_payment(
         base_url,
         terminal_key,
         password,
-        success_url_env,
-        fail_url_env,
         notification_url_env,
-        api_token,
     ) = _read_env()
 
     logger.info(
@@ -339,10 +320,6 @@ async def init_payment(
         payload["Recurrent"] = recurrent
     if notification_url or notification_url_env:
         payload["NotificationURL"] = notification_url or notification_url_env
-    if success_url or success_url_env:
-        payload["SuccessURL"] = success_url or success_url_env
-    if fail_url or fail_url_env:
-        payload["FailURL"] = fail_url or fail_url_env
     # Кастомные параметры в DATA
     if extra:
         payload["DATA"] = extra
@@ -360,7 +337,6 @@ async def init_payment(
             base_url=base_url,
             terminal_key=terminal_key,
             password=password,
-            api_token=api_token,
         )
     except TBankHttpError as err:
         logger.error("NETWORK/HTTP: %s (проверьте whitelist/host)", err)
@@ -380,9 +356,6 @@ async def init_rebill_payment(user, amount: int, months: int) -> str:
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     def _read_value(source, key: str) -> Optional[str]:
@@ -439,7 +412,6 @@ async def init_rebill_payment(user, amount: int, months: int) -> str:
         base_url=base_url,
         terminal_key=terminal_key,
         password=password,
-        api_token=api_token,
     )
 
     payment_id = str(response.get("PaymentId") or "")
@@ -634,9 +606,6 @@ async def confirm_payment(
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     payload: Dict[str, Any] = {
@@ -654,7 +623,6 @@ async def confirm_payment(
         base_url=base_url,
         terminal_key=terminal_key,
         password=password,
-        api_token=api_token,
     )
 
 
@@ -671,9 +639,6 @@ async def get_payment_state(payment_id: str, ip: Optional[str] = None) -> Dict[s
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     payload: Dict[str, Any] = {
@@ -688,7 +653,6 @@ async def get_payment_state(payment_id: str, ip: Optional[str] = None) -> Dict[s
             base_url=base_url,
             terminal_key=terminal_key,
             password=password,
-            api_token=api_token,
         )
     except TBankHttpError as err:
         logger.error("NETWORK/HTTP: %s (проверьте whitelist/host)", err)
@@ -713,9 +677,6 @@ async def charge_payment(
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     payload: Dict[str, Any] = {
@@ -735,7 +696,6 @@ async def charge_payment(
         base_url=base_url,
         terminal_key=terminal_key,
         password=password,
-        api_token=api_token,
     )
 
 
@@ -753,9 +713,6 @@ def charge_saved_card(
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     payload: Dict[str, Any] = {
@@ -786,8 +743,6 @@ def charge_saved_card(
         "Accept": "application/json",
         "User-Agent": "ConciergeBot/Charge/1.0",
     }
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
 
     logger.info(
         "Charge saved card: payment=%s rebill=%s", payment_id, rebill_id
@@ -840,9 +795,6 @@ async def get_customer(customer_key: str) -> Dict[str, Any]:
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     payload: Dict[str, Any] = {
@@ -855,7 +807,6 @@ async def get_customer(customer_key: str) -> Dict[str, Any]:
         base_url=base_url,
         terminal_key=terminal_key,
         password=password,
-        api_token=api_token,
     )
 
 
@@ -873,9 +824,6 @@ async def add_customer(
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     payload: Dict[str, Any] = {
@@ -894,7 +842,6 @@ async def add_customer(
         base_url=base_url,
         terminal_key=terminal_key,
         password=password,
-        api_token=api_token,
     )
 
 
@@ -919,9 +866,6 @@ async def init_add_card(
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     payload: Dict[str, Any] = {
@@ -937,7 +881,6 @@ async def init_add_card(
         base_url=base_url,
         terminal_key=terminal_key,
         password=password,
-        api_token=api_token,
     )
 
 
@@ -955,9 +898,6 @@ async def attach_card(
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     payload: Dict[str, Any] = {
@@ -974,7 +914,6 @@ async def attach_card(
         base_url=base_url,
         terminal_key=terminal_key,
         password=password,
-        api_token=api_token,
     )
 
 
@@ -986,9 +925,6 @@ async def get_add_card_state(request_key: str) -> Dict[str, Any]:
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     payload: Dict[str, Any] = {
@@ -1001,7 +937,6 @@ async def get_add_card_state(request_key: str) -> Dict[str, Any]:
         base_url=base_url,
         terminal_key=terminal_key,
         password=password,
-        api_token=api_token,
     )
 
 
@@ -1216,9 +1151,6 @@ async def finish_authorize(
         terminal_key,
         password,
         _,
-        _,
-        _,
-        api_token,
     ) = _read_env()
 
     payload: Dict[str, Any] = {
@@ -1242,7 +1174,6 @@ async def finish_authorize(
         base_url=base_url,
         terminal_key=terminal_key,
         password=password,
-        api_token=api_token,
     )
 
 

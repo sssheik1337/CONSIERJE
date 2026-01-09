@@ -58,9 +58,6 @@ class Config:
     T_PAY_BASE_URL: str = os.getenv("T_PAY_BASE_URL", "https://securepay.tinkoff.ru/v2")
     T_PAY_TERMINAL_KEY: str = os.getenv("T_PAY_TERMINAL_KEY", "")
     T_PAY_PASSWORD: str = os.getenv("T_PAY_PASSWORD", "")
-    T_PAY_SUCCESS_URL: str = os.getenv("T_PAY_SUCCESS_URL", "")
-    T_PAY_FAIL_URL: str = os.getenv("T_PAY_FAIL_URL", "")
-    T_PAY_API_TOKEN: str = os.getenv("T_PAY_API_TOKEN", "")
 
     LOG_LEVEL: str = (os.getenv("LOG_LEVEL") or "INFO").strip() or "INFO"
     LOG_PATH: str = (os.getenv("LOG_PATH") or "./payments.log").strip() or "./payments.log"
