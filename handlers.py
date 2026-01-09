@@ -1533,9 +1533,17 @@ async def _request_contact_details(
         pending_price=price,
     )
     if callback.message:
+        contact_keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="📱 Поделиться телефоном", request_contact=True)],
+                [KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
         await callback.message.answer(
             "Укажи телефон в формате +7XXXXXXXXXX или email, чтобы получить чек.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=contact_keyboard,
         )
     await callback.answer("Ожидаю контакт для чека.")
 
@@ -1723,7 +1731,15 @@ async def handle_buy_confirm(callback: CallbackQuery, db: DB, state: FSMContext)
 async def handle_buy_contact_input(message: Message, state: FSMContext, db: DB) -> None:
     """Получить телефон или email для формирования чека перед оплатой."""
 
-    contact_type, contact_value = _validate_contact_value(message.text or "")
+    contact_type = None
+    contact_value = None
+    if message.contact and message.contact.phone_number:
+        raw_phone = str(message.contact.phone_number).strip()
+        if raw_phone and not raw_phone.startswith("+"):
+            raw_phone = f"+{raw_phone}"
+        contact_type, contact_value = "phone", raw_phone
+    else:
+        contact_type, contact_value = _validate_contact_value(message.text or "")
     if not contact_type:
         await message.answer("Отправь телефон в формате +7XXXXXXXXXX или email.")
         return
