@@ -72,7 +72,6 @@ class Config:
     TINKOFF_NOTIFY_URL: str = TINKOFF_NOTIFY_URL
     WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")
     WEBHOOK_PORT: int = _env_int("WEBHOOK_PORT", 8000)
-    TINKOFF_WEBHOOK_SECRET: Optional[str] = _optional_env("TINKOFF_WEBHOOK_SECRET")
 
 
 config = Config()

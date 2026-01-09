@@ -131,12 +131,6 @@ async def tbank_notify(request: web.Request) -> web.Response:
             logger.warning("Отклонён webhook T-Bank: некорректный TerminalKey")
             return web.Response(status=403)
 
-        if config.TINKOFF_WEBHOOK_SECRET:
-            secret_header = headers.get("X-Tbank-Secret") or headers.get("X-TBank-Secret")
-            if secret_header != config.TINKOFF_WEBHOOK_SECRET:
-                logger.warning("Отклонён webhook T-Bank: неверный X-Tbank-Secret")
-                return web.Response(status=403)
-
         token = data.get("Token") or data.get("token")
         if token:
             expected = compute_token(data, config.T_PAY_PASSWORD)
