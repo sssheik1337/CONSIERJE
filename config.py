@@ -11,12 +11,6 @@ load_dotenv(override=True)
 TINKOFF_NOTIFY_URL: str = os.getenv("TINKOFF_NOTIFY_URL", "")
 
 
-def _parse_ids(raw: str) -> set[int]:
-    """Разбираем список идентификаторов администраторов."""
-
-    return {int(part.strip()) for part in raw.split(",") if part.strip()} if raw else set()
-
-
 def _env_int(name: str, default: int) -> int:
     """Считать целое значение из окружения с запасным вариантом."""
 
@@ -54,9 +48,6 @@ def _optional_env(name: str) -> Optional[str]:
 class Config:
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 
-    SUPER_ADMIN_IDS: set[int] = field(
-        default_factory=lambda: _parse_ids(os.getenv("SUPER_ADMIN_IDS", ""))
-    )
     ADMIN_LOGIN: str = os.getenv("ADMIN_LOGIN", "")
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "")
     ADMIN_AUTH_FILE: str = os.getenv("ADMIN_AUTH_FILE", "./admins.json")
@@ -76,9 +67,6 @@ class Config:
 
     TEST_RENEW_INTERVAL_MINUTES: Optional[int] = field(
         default_factory=lambda: _env_int("TEST_RENEW_INTERVAL_MINUTES", 0) or None
-    )
-    SBP_TEST_INTERVAL_MINUTES: Optional[int] = field(
-        default_factory=lambda: _env_int("SBP_TEST_INTERVAL_MINUTES", 0) or None
     )
     BROADCAST_DELAY_SECONDS: float = field(
         default_factory=lambda: _env_float("BROADCAST_DELAY_SECONDS", 0.1)

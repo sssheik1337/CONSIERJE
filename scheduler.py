@@ -43,6 +43,31 @@ class AutoRenewResult(NamedTuple):
     amount: int
     user_notified: bool = False
 
+
+def _load_admin_ids() -> list[int]:
+    """Загрузить идентификаторы администраторов из файла авторизации."""
+
+    path = (config.ADMIN_AUTH_FILE or "").strip()
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return []
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Не удалось прочитать файл администраторов", exc_info=err)
+        return []
+    raw_ids = payload.get("admins", [])
+    result: list[int] = []
+    for raw in raw_ids:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        result.append(value)
+    return result
+
 def _retry_markup() -> InlineKeyboardMarkup:
     """Построить клавиатуру для повторного списания."""
 
@@ -176,7 +201,7 @@ async def try_auto_renew(
     row_dict = dict(user_row)
     user_id = int(row_dict.get("user_id", 0))
     auto_renew_flag = bool(row_dict.get("auto_renew"))
-    test_interval = config.SBP_TEST_INTERVAL_MINUTES or config.TEST_RENEW_INTERVAL_MINUTES
+    test_interval = config.TEST_RENEW_INTERVAL_MINUTES
     account_token = (row_dict.get("account_token") or "").strip()
     if not account_token:
         account_token = (await db.get_account_token(user_id)) or ""
@@ -457,7 +482,7 @@ async def daily_check(bot: Bot, db: DB):
                         f"user_id: {user_id}\n"
                         "Проверьте право «Бан пользователей» у бота."
                     )
-                    for admin_id in config.SUPER_ADMIN_IDS:
+                    for admin_id in _load_admin_ids():
                         try:
                             await bot.send_message(admin_id, summary_text)
                         except Exception:
@@ -505,7 +530,7 @@ async def daily_check(bot: Bot, db: DB):
             if auto_success_amount > 0:
                 summary_lines.append(f"💰 Сумма: {auto_success_amount / 100:.2f} ₽")
             summary_text = "\n".join(summary_lines)
-            for admin_id in config.SUPER_ADMIN_IDS:
+            for admin_id in _load_admin_ids():
                 try:
                     await bot.send_message(admin_id, summary_text)
                 except Exception:
@@ -527,7 +552,7 @@ async def daily_check(bot: Bot, db: DB):
 
 def setup_scheduler(bot: Bot, db: DB, tz_name: str = "Europe/Moscow") -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=pytz.timezone(tz_name))
-    interval_minutes = config.SBP_TEST_INTERVAL_MINUTES or config.TEST_RENEW_INTERVAL_MINUTES
+    interval_minutes = config.TEST_RENEW_INTERVAL_MINUTES
     if interval_minutes:
         scheduler.add_job(
             daily_check,
