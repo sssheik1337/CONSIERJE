@@ -51,7 +51,7 @@ def _normalize_amount_inputs(
 
     # Сумма из базы хранится в рублях, но API T-Bank принимает копейки,
     # поэтому всегда переводим в минорные единицы независимо от источника.
-    amount_minor = resolved_amount * 100
+    amount_minor = int(resolved_amount * 100)
     return resolved_months, resolved_amount, amount_minor
 
 
@@ -77,27 +77,29 @@ async def create_card_payment(user_id: int, months: int, price: int) -> str:
     if not email_value:
         raise ValueError("Не указан email пользователя для чека")
 
-    order_id = _build_order_id("card", user_id, months)
-    amount = price
+    resolved_months, resolved_price, amount_minor = _normalize_amount_inputs(
+        months, price, explicit_db=True
+    )
+    order_id = _build_order_id("card", user_id, resolved_months)
     receipt = {
         "FfdVersion": "1.05",
         "Taxation": "usn_income",
         "Items": [
             {
                 "Name": "Подписка",
-                "Price": amount,
+                "Price": amount_minor,
                 "Quantity": 1,
-                "Amount": amount,
+                "Amount": amount_minor,
                 "PaymentMethod": "full_prepayment",
                 "PaymentObject": "service",
                 "Tax": "none",
             }
         ],
-        "Payments": {"Electronic": amount},
+        "Payments": {"Electronic": amount_minor},
         "Email": email_value,
     }
     response = await init_payment(
-        amount=amount,
+        amount=amount_minor,
         order_id=order_id,
         description="Подписка",
         customer_key=str(user_id),
@@ -116,8 +118,8 @@ async def create_card_payment(user_id: int, months: int, price: int) -> str:
         user_id=user_id,
         payment_id=payment_id,
         order_id=order_id,
-        amount=amount,
-        months=months,
+        amount=amount_minor,
+        months=resolved_months,
         status="PENDING",
         method="card",
         customer_key=str(user_id),
