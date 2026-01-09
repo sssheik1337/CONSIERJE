@@ -722,6 +722,18 @@ async def refresh_user_menu(message: Message, db: DB, user_id: int) -> None:
 async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     """Сформировать текст и клавиатуру админ-панели."""
 
+    text = escape_md("🛠️ Админ-панель. Выберите действие.")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚙️ Настройки бота", callback_data="admin:settings")
+    builder.button(text="📣 Опубликовать пост", callback_data="admin:broadcast")
+    builder.adjust(1)
+
+    return text, builder.as_markup()
+
+
+async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
+    """Сформировать текст и клавиатуру настроек бота."""
+
     chat_username = await db.get_target_chat_username()
     chat_id = await db.get_target_chat_id()
     if chat_id is None:
@@ -740,7 +752,7 @@ async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     else:
         price_text = "не настроен"
     lines = [
-        "📊 Текущие настройки:",
+        "⚙️ Настройки бота:",
         chat_line,
         f"• Пробный период: {trial_days} дн.",
         f"• Автопродление по умолчанию: {inline_emoji(auto_default)}",
@@ -758,9 +770,9 @@ async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     )
     builder.button(text="🏷️ Создать пробный промокод", callback_data="admin:create_coupon")
     builder.button(text="📄 Ссылки на документы", callback_data="admin:docs")
-    builder.button(text="📣 Опубликовать пост", callback_data="admin:broadcast")
     builder.button(text="🛡️ Проверить права бота", callback_data="admin:check_rights")
-    builder.adjust(2, 2, 1, 1, 1, 1)
+    builder.button(text="⬅️ Назад", callback_data="admin:open")
+    builder.adjust(2, 2, 1, 1, 1, 1, 1)
 
     return text, builder.as_markup()
 
@@ -825,6 +837,66 @@ async def refresh_admin_panel_by_state(bot: Bot, state: FSMContext, db: DB) -> N
         )
 
 
+async def show_admin_settings_panel(message: Message, db: DB) -> None:
+    """Показать суперадмину меню настроек бота."""
+
+    text, markup = await build_admin_settings_panel(db)
+    await message.answer(
+        text,
+        reply_markup=markup,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+
+
+async def render_admin_settings_panel(message: Message, db: DB) -> None:
+    """Отобразить или обновить меню настроек бота в заданном сообщении."""
+
+    text, markup = await build_admin_settings_panel(db)
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
+
+async def refresh_admin_settings_by_state(bot: Bot, state: FSMContext, db: DB) -> None:
+    """Перерисовать меню настроек по сохранённым идентификаторам."""
+
+    data = await state.get_data()
+    chat_id = data.get("panel_chat_id")
+    message_id = data.get("panel_message_id")
+    if not chat_id or not message_id:
+        return
+    text, markup = await build_admin_settings_panel(db)
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        await bot.send_message(
+            chat_id,
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
+
 async def build_price_list_view(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     """Сформировать текст и клавиатуру списка тарифов."""
 
@@ -839,7 +911,7 @@ async def build_price_list_view(db: DB) -> tuple[str, InlineKeyboardMarkup]:
             callback_data=f"price:edit:{months}",
         )
     builder.button(text="➕ Добавить тариф", callback_data="price:add")
-    builder.button(text="⬅️ Назад", callback_data="admin:open")
+    builder.button(text="⬅️ Назад", callback_data="admin:settings")
     builder.adjust(1)
     return text, builder.as_markup()
 
@@ -2159,6 +2231,18 @@ async def open_admin_panel(callback: CallbackQuery, db: DB) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin:settings")
+async def open_admin_settings(callback: CallbackQuery, db: DB) -> None:
+    """Открыть меню настроек бота."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    if callback.message:
+        await render_admin_settings_panel(callback.message, db)
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admin:broadcast")
 async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext) -> None:
     """Начать рассылку поста администратором."""
@@ -2461,7 +2545,7 @@ async def admin_bind_chat(callback: CallbackQuery, state: FSMContext, db: DB) ->
             text=f"📌 {title}",
             callback_data=f"admin:bind_chat:select:{chat_id}",
         )
-        builder.button(text="⬅️ Назад", callback_data="admin:open")
+        builder.button(text="⬅️ Назад", callback_data="admin:settings")
         builder.adjust(1)
         await callback.message.answer(
             escape_md("Выберите канал для привязки:"),
@@ -2519,7 +2603,7 @@ async def admin_bind_chat_select(callback: CallbackQuery, bot: Bot, db: DB) -> N
     await db.set_target_chat_id(chat_id)
     await callback.answer("Чат привязан.", show_alert=True)
     if callback.message:
-        await render_admin_panel(callback.message, db)
+        await render_admin_settings_panel(callback.message, db)
 
 
 @router.callback_query(F.data == "admin:docs")
@@ -2542,7 +2626,7 @@ async def admin_docs_menu(callback: CallbackQuery, db: DB, state: FSMContext) ->
     builder = InlineKeyboardBuilder()
     for key, (_, title) in DOCS_SETTINGS.items():
         builder.button(text=f"✏️ {title}", callback_data=f"admin:docs:edit:{key}")
-    builder.button(text="⬅️ Назад", callback_data="admin:open")
+    builder.button(text="⬅️ Назад", callback_data="admin:settings")
     builder.adjust(1)
     if callback.message:
         await callback.message.answer(
@@ -2828,7 +2912,7 @@ async def process_bind_username(
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
-    await refresh_admin_panel_by_state(bot, state, db)
+    await refresh_admin_settings_by_state(bot, state, db)
     await state.clear()
 
 
@@ -2858,7 +2942,7 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         return
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ Назад", callback_data="admin:open")
+    builder.button(text="⬅️ Назад", callback_data="admin:settings")
     builder.adjust(1)
 
     title = chat.title or "без названия"
@@ -3420,7 +3504,7 @@ async def admin_set_trial_days(message: Message, state: FSMContext, db: DB, bot:
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
-    await refresh_admin_panel_by_state(bot, state, db)
+    await refresh_admin_settings_by_state(bot, state, db)
     await state.clear()
 
 
@@ -3434,7 +3518,7 @@ async def admin_toggle_auto_default(callback: CallbackQuery, db: DB) -> None:
     current = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
     await db.set_auto_renew_default(not current)
     if callback.message:
-        await render_admin_panel(callback.message, db)
+        await render_admin_settings_panel(callback.message, db)
     await callback.answer("Настройки обновлены.")
 
 
@@ -3494,7 +3578,7 @@ async def admin_save_custom_code(message: Message, state: FSMContext, db: DB, bo
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
-    await refresh_admin_panel_by_state(bot, state, db)
+    await refresh_admin_settings_by_state(bot, state, db)
     await state.clear()
 
 
