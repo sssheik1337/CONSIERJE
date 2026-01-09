@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 
 from collections.abc import Mapping, Sequence
 from typing import Any
+import asyncio
+import json
 import re
 
 import aiosqlite
@@ -16,6 +18,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     ChatMember,
+    ChatMemberUpdated,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
@@ -24,15 +27,14 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import config, get_docs_map
+from config import config
 from db import DB
+from keyboards import build_payment_method_keyboard
 from logger import logger
-from payments import check_payment_status, form_sbp_qr, init_sbp_payment
+from payments import check_payment_status, create_card_payment, form_sbp_qr, init_sbp_payment
 from scheduler import RETRY_PAYMENT_CALLBACK, daily_check, try_auto_renew
 
 router = Router()
-
-ADMIN_IDS = set(config.SUPER_ADMIN_IDS)
 
 DEFAULT_TRIAL_DAYS = 3
 DEFAULT_AUTO_RENEW = True
@@ -46,6 +48,11 @@ CANCEL_REPLY = ReplyKeyboardMarkup(
         [KeyboardButton(text="🏠 Главное меню")],
         [KeyboardButton(text="Отмена")],
     ],
+    resize_keyboard=True,
+)
+
+ADMIN_CANCEL_REPLY = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Отмена")]],
     resize_keyboard=True,
 )
 
@@ -79,12 +86,16 @@ def _normalize_payment_method(raw: str | None) -> str:
     lowered = raw.strip().lower()
     if lowered == "sbp":
         return "sbp"
+    if lowered == "card":
+        return "card"
     return "sbp"
 
 
 def _format_method_hint(method: str) -> str:
     """Вернуть описание способа оплаты для текстов пользователю."""
 
+    if method == "card":
+        return "картой"
     return "через СБП"
 
 
@@ -118,8 +129,8 @@ def _build_consent_text(months: int, price: int, method: str) -> str:
     else:
         details = [
             "",
-            "При оплате картой автопродление будет включено автоматически.",
-            "Вы сможете отключить его в любой момент в личном меню бота (кнопка «Автопродление»).",
+            "При оплате картой автопродление будет доступно после подтверждения оплаты и получения RebillId.",
+            "Вы сможете управлять автопродлением в личном меню бота (кнопка «Автопродление»).",
             "",
             "Списания будут происходить автоматически, если автопродление активно.",
             "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
@@ -179,6 +190,29 @@ class Admin(StatesGroup):
     WaitCustomCode = State()
 
 
+class AdminDocs(StatesGroup):
+    """Состояния администратора для настройки ссылок на документы."""
+
+    WaitUrl = State()
+
+
+class AdminBroadcast(StatesGroup):
+    """Состояния администратора для рассылки сообщений."""
+
+    WaitMessage = State()
+    WaitButtonsMenu = State()
+    WaitButtonText = State()
+    WaitButtonUrl = State()
+    WaitConfirm = State()
+
+
+class AdminAuth(StatesGroup):
+    """Состояния авторизации администратора."""
+
+    WaitLogin = State()
+    WaitPassword = State()
+
+
 class AdminPrice(StatesGroup):
     """Состояния администратора для управления тарифами."""
 
@@ -218,16 +252,69 @@ def format_short_date(ts: int) -> str:
     return datetime.utcfromtimestamp(ts).strftime("%d.%m.%Y")
 
 
+def _load_admin_ids() -> set[int]:
+    """Загрузить список администраторов из файла."""
+
+    path = (config.ADMIN_AUTH_FILE or "").strip()
+    if not path:
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return set()
+    except Exception as err:  # noqa: BLE001
+        logger.debug("Не удалось прочитать список администраторов: %s", err)
+        return set()
+    if isinstance(payload, dict):
+        raw_ids = payload.get("admins", [])
+    else:
+        raw_ids = payload
+    if not isinstance(raw_ids, list):
+        return set()
+    return {int(item) for item in raw_ids if str(item).isdigit()}
+
+
+def _save_admin_id(user_id: int) -> None:
+    """Сохранить пользователя в список администраторов."""
+
+    path = (config.ADMIN_AUTH_FILE or "").strip()
+    if not path:
+        return
+    ids = _load_admin_ids()
+    ids.add(int(user_id))
+    payload = {"admins": sorted(ids)}
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Не удалось сохранить список администраторов", exc_info=err)
+
+
 def is_super_admin(user_id: int) -> bool:
     """Проверить, является ли пользователь суперадмином."""
 
-    return user_id in ADMIN_IDS
+    return user_id in _load_admin_ids()
 
 
 def inline_emoji(flag: bool) -> str:
     """Вернуть эмодзи статуса."""
 
     return "✅" if flag else "❌"
+
+
+def build_broadcast_buttons_menu() -> ReplyKeyboardMarkup:
+    """Собрать клавиатуру управления кнопками для рассылки."""
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Добавить кнопку")],
+            [KeyboardButton(text="➕ Кнопка оплаты")],
+            [KeyboardButton(text="Пропустить")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
 def _normalize_control_text(text: str | None) -> str:
@@ -371,25 +458,10 @@ async def make_one_time_invite(
         err_text = str(err)
         lower = err_text.lower()
         if "chat_admin_required" in lower or "not enough rights" in lower:
-            try:
-                fallback = await bot.export_chat_invite_link(chat_id)
-            except (TelegramBadRequest, TelegramForbiddenError):
-                return (
-                    False,
-                    "Недостаточно прав для создания одноразовой ссылки.",
-                    "Дайте право «Пригласительные ссылки».",
-                )
-            except Exception as export_err:
-                logger.exception("Ошибка при получении постоянной ссылки", exc_info=export_err)
-                return (
-                    False,
-                    "Недостаточно прав для создания одноразовой ссылки.",
-                    "Дайте право «Пригласительные ссылки».",
-                )
             return (
                 False,
-                "⚠️ Можно выдать постоянную ссылку (неодноразовая). Разрешите «Пригласительные ссылки», чтобы выдавать одноразовые.",
-                fallback,
+                "Недостаточно прав для создания одноразовой ссылки.",
+                "Дайте боту право «Пригласительные ссылки».",
             )
         if "user_not_participant" in lower or "chat not found" in lower or "chat_not_found" in lower:
             return (
@@ -484,10 +556,46 @@ def invite_button_markup(link: str, permanent: bool = False) -> InlineKeyboardMa
     return builder.as_markup()
 
 
-def build_docs_message() -> tuple[str, str]:
+async def _save_channel(event: ChatMemberUpdated, db: DB) -> None:
+    """Сохранить канал при изменении статуса бота."""
+
+    if event.chat.type != "channel":
+        return
+    status_raw = event.new_chat_member.status
+    status_value = status_raw.value if hasattr(status_raw, "value") else str(status_raw)
+    if status_value in {"member", "administrator"}:
+        username = getattr(event.chat, "username", None)
+        username_value = f"@{username}" if username else ""
+        await db.upsert_chat(event.chat.id, username_value, True)
+        logger.info("Канал обнаружен и активирован: chat_id=%s", event.chat.id)
+    elif status_value in {"left", "kicked"}:
+        await db.set_chat_active(False)
+        logger.info("Бот удалён из канала: chat_id=%s", event.chat.id)
+
+
+DOCS_SETTINGS = {
+    "newsletter": ("docs_newsletter_url", "Согласие на рассылку"),
+    "pd_consent": ("docs_pd_consent_url", "Согласие на обработку ПД"),
+    "pd_policy": ("docs_pd_policy_url", "Политика обработки ПД"),
+    "offer": ("docs_offer_url", "Оферта"),
+}
+
+
+async def _get_docs_map(db: DB) -> dict[str, str]:
+    """Вернуть словарь ссылок на документы с учётом настроек в БД."""
+
+    result: dict[str, str] = {}
+    for key, (setting_key, _) in DOCS_SETTINGS.items():
+        stored = await db.get_setting(setting_key)
+        value = (stored or "").strip()
+        result[key] = value
+    return result
+
+
+async def build_docs_message(db: DB) -> tuple[str, str]:
     """Сформировать текст и режим форматирования для списка документов."""
 
-    docs = get_docs_map()
+    docs = await _get_docs_map(db)
     items = [
         ("Согласие на рассылку", docs.get("newsletter", "")),
         ("Согласие на обработку ПД", docs.get("pd_consent", "")),
@@ -504,10 +612,10 @@ def build_docs_message() -> tuple[str, str]:
     return text, "Markdown"
 
 
-def build_welcome_with_legal() -> tuple[str, InlineKeyboardMarkup]:
+async def build_welcome_with_legal(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     """Подготовить приветствие с обязательным согласием и клавиатурой."""
 
-    docs_text, _ = build_docs_message()
+    docs_text, _ = await build_docs_message(db)
     text = (
         "👋 Добро пожаловать!\n"
         "Прежде чем продолжить, ознакомьтесь с документами ниже.\n"
@@ -527,7 +635,7 @@ def build_user_menu_keyboard(
     """Собрать пользовательскую inline-клавиатуру."""
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Купить подписку", callback_data="buy:open:sbp")
+    builder.button(text="💳 Купить подписку", callback_data="buy:open")
     builder.button(
         text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
         callback_data="ar:toggle",
@@ -545,7 +653,7 @@ def build_subscription_purchase_menu() -> InlineKeyboardMarkup:
     """Построить меню для пользователя без активной подписки."""
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Купить подписку", callback_data="buy:open:sbp")
+    builder.button(text="💳 Купить подписку", callback_data="buy:open")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -613,6 +721,18 @@ async def refresh_user_menu(message: Message, db: DB, user_id: int) -> None:
 async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     """Сформировать текст и клавиатуру админ-панели."""
 
+    text = escape_md("🛠️ Админ-панель. Выберите действие.")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚙️ Настройки бота", callback_data="admin:settings")
+    builder.button(text="📣 Опубликовать пост", callback_data="admin:broadcast")
+    builder.adjust(1)
+
+    return text, builder.as_markup()
+
+
+async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
+    """Сформировать текст и клавиатуру настроек бота."""
+
     chat_username = await db.get_target_chat_username()
     chat_id = await db.get_target_chat_id()
     if chat_id is None:
@@ -631,7 +751,7 @@ async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     else:
         price_text = "не настроен"
     lines = [
-        "📊 Текущие настройки:",
+        "⚙️ Настройки бота:",
         chat_line,
         f"• Пробный период: {trial_days} дн.",
         f"• Автопродление по умолчанию: {inline_emoji(auto_default)}",
@@ -648,8 +768,10 @@ async def build_admin_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]:
         callback_data="admin:auto_default",
     )
     builder.button(text="🏷️ Создать пробный промокод", callback_data="admin:create_coupon")
+    builder.button(text="📄 Ссылки на документы", callback_data="admin:docs")
     builder.button(text="🛡️ Проверить права бота", callback_data="admin:check_rights")
-    builder.adjust(2, 2, 1, 1)
+    builder.button(text="⬅️ Назад", callback_data="admin:open")
+    builder.adjust(2, 2, 1, 1, 1, 1, 1)
 
     return text, builder.as_markup()
 
@@ -714,6 +836,66 @@ async def refresh_admin_panel_by_state(bot: Bot, state: FSMContext, db: DB) -> N
         )
 
 
+async def show_admin_settings_panel(message: Message, db: DB) -> None:
+    """Показать суперадмину меню настроек бота."""
+
+    text, markup = await build_admin_settings_panel(db)
+    await message.answer(
+        text,
+        reply_markup=markup,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+
+
+async def render_admin_settings_panel(message: Message, db: DB) -> None:
+    """Отобразить или обновить меню настроек бота в заданном сообщении."""
+
+    text, markup = await build_admin_settings_panel(db)
+    try:
+        await message.edit_text(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        await message.answer(
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
+
+async def refresh_admin_settings_by_state(bot: Bot, state: FSMContext, db: DB) -> None:
+    """Перерисовать меню настроек по сохранённым идентификаторам."""
+
+    data = await state.get_data()
+    chat_id = data.get("panel_chat_id")
+    message_id = data.get("panel_message_id")
+    if not chat_id or not message_id:
+        return
+    text, markup = await build_admin_settings_panel(db)
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        await bot.send_message(
+            chat_id,
+            text,
+            reply_markup=markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
+
 async def build_price_list_view(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     """Сформировать текст и клавиатуру списка тарифов."""
 
@@ -728,7 +910,7 @@ async def build_price_list_view(db: DB) -> tuple[str, InlineKeyboardMarkup]:
             callback_data=f"price:edit:{months}",
         )
     builder.button(text="➕ Добавить тариф", callback_data="price:add")
-    builder.button(text="⬅️ Назад", callback_data="admin:open")
+    builder.button(text="⬅️ Назад", callback_data="admin:settings")
     builder.adjust(1)
     return text, builder.as_markup()
 
@@ -956,7 +1138,7 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
 
     await state.clear()
     user_id = message.from_user.id
-    if user_id in ADMIN_IDS:
+    if is_super_admin(user_id):
         await show_admin_panel(message, db)
         return
     now_ts = int(datetime.utcnow().timestamp())
@@ -977,7 +1159,7 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
     if not user:
         return
     if not await db.has_accepted_legal(user_id):
-        text, markup = build_welcome_with_legal()
+        text, markup = await build_welcome_with_legal(db)
         await message.answer(
             text,
             reply_markup=markup,
@@ -1019,7 +1201,7 @@ async def handle_menu_home(callback: CallbackQuery, state: FSMContext, db: DB) -
 
     if not await db.has_accepted_legal(user_id):
         if callback.message:
-            text, markup = build_welcome_with_legal()
+            text, markup = await build_welcome_with_legal(db)
             await callback.message.answer(
                 text,
                 reply_markup=markup,
@@ -1088,7 +1270,7 @@ async def legal_show_docs(callback: CallbackQuery, state: FSMContext, bot: Bot) 
                 await bot.delete_message(prev_chat, prev_message)
             except TelegramBadRequest:
                 pass
-        text, parse_mode = build_docs_message()
+        text, parse_mode = await build_docs_message(db)
         builder = InlineKeyboardBuilder()
         builder.button(text="⬅️ Назад", callback_data="legal:back")
         builder.adjust(1)
@@ -1125,7 +1307,7 @@ async def legal_back(callback: CallbackQuery, state: FSMContext) -> None:
         try:
             await callback.message.delete()
         except TelegramBadRequest:
-            text, markup = build_welcome_with_legal()
+            text, markup = await build_welcome_with_legal(db)
             try:
                 await callback.message.edit_text(
                     text,
@@ -1210,7 +1392,7 @@ async def docs_open(callback: CallbackQuery, db: DB) -> None:
         await callback.answer("Сначала подтвердите согласие.", show_alert=True)
         return
     if callback.message:
-        text, parse_mode = build_docs_message()
+        text, parse_mode = await build_docs_message(db)
         builder = InlineKeyboardBuilder()
         builder.button(text="⬅️ Назад", callback_data="docs:back")
         builder.adjust(1)
@@ -1255,13 +1437,27 @@ async def docs_back(callback: CallbackQuery, db: DB) -> None:
             )
     await callback.answer()
 
+async def _send_payment_method_menu(callback: CallbackQuery) -> None:
+    """Показать пользователю выбор способа оплаты."""
+
+    if callback.message:
+        await callback.message.answer(
+            "Выберите способ оплаты:",
+            reply_markup=build_payment_method_keyboard(),
+        )
+    await callback.answer()
+
 
 @router.callback_query(F.data.startswith("buy:open"))
 async def handle_buy_open(callback: CallbackQuery, db: DB) -> None:
     """Показать пользователю список тарифов для оплаты."""
 
     parts = (callback.data or "").split(":")
-    method = _normalize_payment_method(parts[2] if len(parts) > 2 else None)
+    method_raw = parts[2] if len(parts) > 2 else None
+    if method_raw is None:
+        await _send_payment_method_menu(callback)
+        return
+    method = _normalize_payment_method(method_raw)
     prices = await db.get_all_prices()
     if not prices:
         await callback.answer("Тарифы пока не настроены.", show_alert=True)
@@ -1337,9 +1533,17 @@ async def _request_contact_details(
         pending_price=price,
     )
     if callback.message:
+        contact_keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="📱 Поделиться телефоном", request_contact=True)],
+                [KeyboardButton(text="Отмена")],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
         await callback.message.answer(
             "Укажи телефон в формате +7XXXXXXXXXX или email, чтобы получить чек.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=contact_keyboard,
         )
     await callback.answer("Ожидаю контакт для чека.")
 
@@ -1436,6 +1640,34 @@ async def _send_sbp_payment_details(
     )
 
 
+async def _send_card_payment_details(
+    message: Message,
+    months: int,
+    price: int,
+    payment_id: str,
+    payment_url: str | None,
+) -> None:
+    """Отправить пользователю ссылку на оплату картой."""
+
+    builder = InlineKeyboardBuilder()
+    if payment_url:
+        builder.button(text="Оплатить", url=str(payment_url))
+    builder.button(text="Я оплатил ✅", callback_data=f"payment:check:{payment_id}")
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
+    builder.adjust(1)
+
+    message_lines = [
+        "💳 Оплата подписки картой.",
+        f"Срок: {months} мес., сумма: {price}₽.",
+        "Оплатите на стороне T-Bank.",
+    ]
+    await message.answer(
+        "\n".join(message_lines),
+        reply_markup=builder.as_markup(),
+        disable_web_page_preview=True,
+    )
+
+
 async def _create_sbp_payment_with_contact(
     message: Message,
     db: DB,
@@ -1499,7 +1731,15 @@ async def handle_buy_confirm(callback: CallbackQuery, db: DB, state: FSMContext)
 async def handle_buy_contact_input(message: Message, state: FSMContext, db: DB) -> None:
     """Получить телефон или email для формирования чека перед оплатой."""
 
-    contact_type, contact_value = _validate_contact_value(message.text or "")
+    contact_type = None
+    contact_value = None
+    if message.contact and message.contact.phone_number:
+        raw_phone = str(message.contact.phone_number).strip()
+        if raw_phone and not raw_phone.startswith("+"):
+            raw_phone = f"+{raw_phone}"
+        contact_type, contact_value = "phone", raw_phone
+    else:
+        contact_type, contact_value = _validate_contact_value(message.text or "")
     if not contact_type:
         await message.answer("Отправь телефон в формате +7XXXXXXXXXX или email.")
         return
@@ -1518,13 +1758,51 @@ async def handle_buy_contact_input(message: Message, state: FSMContext, db: DB) 
     if months <= 0 or price <= 0:
         await message.answer("Не удалось определить параметры оплаты. Попробуйте ещё раз.", reply_markup=main_menu_markup())
         return
-    if method != "sbp":
+    if method not in {"sbp", "card"}:
         method = "sbp"
 
     try:
         await db.set_user_contact(message.from_user.id, contact_value)
     except Exception as err:  # noqa: BLE001
         logger.debug("Не удалось сохранить контакт пользователя %s: %s", message.from_user.id, err)
+
+    if method == "card":
+        try:
+            payment_url = await create_card_payment(
+                message.from_user.id,
+                months,
+                price,
+            )
+        except Exception as err:  # noqa: BLE001
+            logger.exception("Init оплаты картой не удался", exc_info=err)
+            await message.answer(
+                "Не удалось создать платёж картой. Попробуйте позже.",
+                reply_markup=main_menu_markup(),
+            )
+            return
+
+        latest_payment = await db.get_latest_payment(message.from_user.id)
+        payment_id = ""
+        if latest_payment is not None:
+            try:
+                payment_id = str(latest_payment["payment_id"] or "")
+            except (KeyError, TypeError, ValueError):
+                payment_id = ""
+        if not payment_id:
+            await message.answer(
+                "T-Bank не вернул PaymentId. Попробуйте позже.",
+                reply_markup=main_menu_markup(),
+            )
+            return
+
+        await _send_card_payment_details(
+            message,
+            months,
+            price,
+            payment_id,
+            str(payment_url),
+        )
+        return
 
     await _create_sbp_payment_with_contact(
         message,
@@ -1818,7 +2096,11 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
 
     ok, info, hint = await make_one_time_invite(bot, db)
     if ok:
-        await db.set_invite_issued(callback.from_user.id, True)
+        logger.info(
+            "Выдана одноразовая ссылка пользователю %s для чата %s",
+            callback.from_user.id,
+            chat_id,
+        )
 
     if callback.message:
         if ok:
@@ -1834,6 +2116,40 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         await callback.answer()
     else:
         await callback.answer("Не удалось создать ссылку.", show_alert=True)
+
+
+@router.chat_member()
+async def handle_chat_member_update(event: ChatMemberUpdated, db: DB) -> None:
+    """Отметить использование одноразовой ссылки при вступлении пользователя."""
+
+    if event.new_chat_member.user.id == event.bot.id:
+        await _save_channel(event, db)
+        return
+
+    target_chat_id = await db.get_target_chat_id()
+    if target_chat_id is None or event.chat.id != target_chat_id:
+        return
+
+    joined_statuses = {"member", "administrator", "creator"}
+    new_status = event.new_chat_member.status
+    old_status = event.old_chat_member.status
+    new_value = new_status.value if hasattr(new_status, "value") else str(new_status)
+    old_value = old_status.value if hasattr(old_status, "value") else str(old_status)
+    if new_value in joined_statuses and old_value not in joined_statuses:
+        user_id = event.new_chat_member.user.id
+        await db.set_invite_issued(user_id, True)
+        logger.info(
+            "Подтверждено вступление пользователя %s в чат %s, ссылка помечена как использованная",
+            user_id,
+            target_chat_id,
+        )
+
+
+@router.my_chat_member()
+async def handle_my_chat_member_update(event: ChatMemberUpdated, db: DB) -> None:
+    """Обработать изменения статуса бота в чате/канале."""
+
+    await _save_channel(event, db)
 
 
 @router.callback_query(F.data == "promo:enter")
@@ -1882,6 +2198,42 @@ async def cmd_use(message: Message, state: FSMContext, db: DB) -> None:
     await redeem_promo_code(message, db, parts[1], remove_keyboard=False)
 
 
+@router.message(Command("admin_auth"))
+async def admin_auth_start(message: Message, state: FSMContext) -> None:
+    """Запустить скрытую авторизацию администратора."""
+
+    await state.set_state(AdminAuth.WaitLogin)
+    await message.answer("Введите логин администратора.")
+
+
+@router.message(AdminAuth.WaitLogin)
+async def admin_auth_login(message: Message, state: FSMContext) -> None:
+    """Принять логин администратора."""
+
+    login = (message.text or "").strip()
+    if not login:
+        await message.answer("Логин не должен быть пустым. Введите ещё раз.")
+        return
+    await state.update_data(admin_login=login)
+    await state.set_state(AdminAuth.WaitPassword)
+    await message.answer("Введите пароль администратора.")
+
+
+@router.message(AdminAuth.WaitPassword)
+async def admin_auth_password(message: Message, state: FSMContext) -> None:
+    """Принять пароль администратора и авторизовать пользователя."""
+
+    password = (message.text or "").strip()
+    data = await state.get_data()
+    login = str(data.get("admin_login") or "")
+    if login == config.ADMIN_LOGIN and password == config.ADMIN_PASSWORD:
+        _save_admin_id(message.from_user.id)
+        await message.answer("✅ Администратор успешно авторизован.")
+    else:
+        await message.answer("❌ Неверный логин или пароль.")
+    await state.clear()
+
+
 @router.callback_query(F.data == "admin:open")
 async def open_admin_panel(callback: CallbackQuery, db: DB) -> None:
     """Открыть админ-панель."""
@@ -1894,29 +2246,464 @@ async def open_admin_panel(callback: CallbackQuery, db: DB) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin:settings")
+async def open_admin_settings(callback: CallbackQuery, db: DB) -> None:
+    """Открыть меню настроек бота."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    if callback.message:
+        await render_admin_settings_panel(callback.message, db)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начать рассылку поста администратором."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.set_state(AdminBroadcast.WaitMessage)
+    if callback.message:
+        await callback.message.answer(
+            "Отправьте текст поста в формате MarkdownV2.\n"
+            "Для отмены вернитесь в админ-панель.",
+        )
+    await callback.answer()
+
+
+def _build_broadcast_inline_markup(buttons: list[dict[str, str]]) -> InlineKeyboardMarkup | None:
+    """Собрать инлайн-клавиатуру для рассылки из сохранённых кнопок."""
+
+    if not buttons:
+        return None
+    builder = InlineKeyboardBuilder()
+    added = False
+    for entry in buttons:
+        kind = entry.get("kind")
+        if kind == "payment":
+            builder.button(text="💳 Купить подписку", callback_data="buy:open")
+            added = True
+            continue
+        text = entry.get("text", "")
+        url = entry.get("url", "")
+        if text and url:
+            builder.button(text=text, url=url)
+            added = True
+    if not added:
+        return None
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+async def _show_broadcast_preview(message: Message, state: FSMContext) -> None:
+    """Показать предпросмотр рассылки и запросить подтверждение."""
+
+    data = await state.get_data()
+    preview_text = str(data.get("broadcast_text") or "")
+    preview_entities = data.get("broadcast_entities") or []
+    preview_buttons = data.get("broadcast_buttons") or []
+    preview_markup = _build_broadcast_inline_markup(preview_buttons)
+    if preview_entities:
+        await message.answer(
+            preview_text,
+            entities=preview_entities,
+            disable_web_page_preview=True,
+            reply_markup=preview_markup,
+        )
+    else:
+        await message.answer(
+            preview_text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+            reply_markup=preview_markup,
+        )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Отправить", callback_data="admin:broadcast:confirm")
+    builder.button(text="❌ Отмена", callback_data="admin:broadcast:cancel")
+    builder.adjust(1)
+    await message.answer(
+        "Предпросмотр сообщения ниже. Отправить рассылку?",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.message(AdminBroadcast.WaitMessage)
+async def admin_broadcast_message(message: Message, state: FSMContext) -> None:
+    """Принять текст рассылки от администратора."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    text = message.text or ""
+    if not text.strip():
+        await message.answer("Пост не должен быть пустым. Отправьте текст заново.")
+        return
+    entities = message.entities or []
+    await state.update_data(
+        broadcast_text=text,
+        broadcast_entities=entities,
+        broadcast_buttons=[],
+    )
+    await state.set_state(AdminBroadcast.WaitButtonsMenu)
+    await message.answer(
+        "Добавьте кнопку для поста или пропустите этот шаг.",
+        reply_markup=build_broadcast_buttons_menu(),
+    )
+
+
+@router.message(AdminBroadcast.WaitButtonsMenu)
+async def admin_broadcast_buttons_menu(message: Message, state: FSMContext) -> None:
+    """Обработать выбор админа по кнопкам рассылки."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    choice = (message.text or "").strip()
+    if is_cancel(choice):
+        await state.clear()
+        await message.answer("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
+        return
+    if choice == "➕ Добавить кнопку":
+        await state.set_state(AdminBroadcast.WaitButtonText)
+        await message.answer(
+            "Отправьте текст для кнопки. Ссылка будет запрошена следующим сообщением.",
+        )
+        return
+    if choice == "➕ Кнопка оплаты":
+        data = await state.get_data()
+        buttons = list(data.get("broadcast_buttons") or [])
+        buttons.append({"kind": "payment"})
+        await state.update_data(broadcast_buttons=buttons)
+        await message.answer(
+            "Кнопка оплаты добавлена. Добавим ещё кнопку?",
+            reply_markup=build_broadcast_buttons_menu(),
+        )
+        return
+    if choice == "Пропустить":
+        await state.set_state(AdminBroadcast.WaitConfirm)
+        await message.answer("Готовлю предпросмотр.", reply_markup=ReplyKeyboardRemove())
+        await _show_broadcast_preview(message, state)
+        return
+    await message.answer(
+        "Выберите действие кнопками ниже.",
+        reply_markup=build_broadcast_buttons_menu(),
+    )
+
+
+@router.message(AdminBroadcast.WaitButtonText)
+async def admin_broadcast_button_text(message: Message, state: FSMContext) -> None:
+    """Принять текст кнопки рассылки."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    button_text = (message.text or "").strip()
+    if is_cancel(button_text):
+        await state.clear()
+        await message.answer("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
+        return
+    if not button_text:
+        await message.answer("Текст кнопки не должен быть пустым. Попробуйте снова.")
+        return
+    await state.update_data(broadcast_button_text=button_text)
+    await state.set_state(AdminBroadcast.WaitButtonUrl)
+    await message.answer("Теперь отправьте ссылку для кнопки.")
+
+
+@router.message(AdminBroadcast.WaitButtonUrl)
+async def admin_broadcast_button_url(message: Message, state: FSMContext) -> None:
+    """Принять ссылку для кнопки рассылки."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    button_url = (message.text or "").strip()
+    if is_cancel(button_url):
+        await state.clear()
+        await message.answer("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
+        return
+    if not (button_url.startswith("https://") or button_url.startswith("http://")):
+        await message.answer(
+            "Ссылка для кнопки должна начинаться с http:// или https://. Попробуйте снова.",
+        )
+        return
+    data = await state.get_data()
+    button_text = str(data.get("broadcast_button_text") or "").strip()
+    if not button_text:
+        await state.set_state(AdminBroadcast.WaitButtonText)
+        await message.answer("Текст кнопки не найден. Отправьте текст кнопки заново.")
+        return
+    buttons = list(data.get("broadcast_buttons") or [])
+    buttons.append({"kind": "url", "text": button_text, "url": button_url})
+    await state.update_data(broadcast_buttons=buttons)
+    await state.set_state(AdminBroadcast.WaitButtonsMenu)
+    await message.answer(
+        "Кнопка добавлена. Добавим ещё?",
+        reply_markup=build_broadcast_buttons_menu(),
+    )
+
+
+@router.callback_query(F.data == "admin:broadcast:cancel")
+async def admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отменить рассылку поста."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.clear()
+    if callback.message:
+        await callback.message.answer("Рассылка отменена.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast:confirm")
+async def admin_broadcast_confirm(
+    callback: CallbackQuery, db: DB, state: FSMContext
+) -> None:
+    """Подтвердить и выполнить рассылку поста."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    data = await state.get_data()
+    text = str(data.get("broadcast_text") or "")
+    entities = data.get("broadcast_entities") or []
+    buttons = data.get("broadcast_buttons") or []
+    if not text.strip():
+        await callback.answer("Текст рассылки не найден.", show_alert=True)
+        await state.clear()
+        return
+
+    users = await db.list_users_for_broadcast()
+    sent_count = 0
+    blocked_count = 0
+    error_count = 0
+    delay_seconds = max(0.0, float(config.BROADCAST_DELAY_SECONDS or 0.0))
+    markup = _build_broadcast_inline_markup(buttons)
+
+    for user_id in users:
+        if user_id == callback.from_user.id:
+            continue
+        try:
+            if entities:
+                await callback.bot.send_message(
+                    user_id,
+                    text,
+                    entities=entities,
+                    disable_web_page_preview=True,
+                    reply_markup=markup,
+                )
+            else:
+                await callback.bot.send_message(
+                    user_id,
+                    text,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_web_page_preview=True,
+                    reply_markup=markup,
+                )
+            sent_count += 1
+        except TelegramForbiddenError:
+            blocked_count += 1
+        except TelegramBadRequest as err:
+            error_count += 1
+            logger.debug("Ошибка рассылки для пользователя %s: %s", user_id, err)
+        except Exception as err:  # noqa: BLE001
+            error_count += 1
+            logger.exception("Неожиданная ошибка рассылки для %s", user_id, exc_info=err)
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+
+    summary = (
+        "Рассылка завершена.\n"
+        f"Отправлено: {sent_count}\n"
+        f"Заблокировали бота: {blocked_count}\n"
+        f"Ошибки: {error_count}"
+    )
+    if callback.message:
+        await callback.message.answer(summary)
+    await state.clear()
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admin:bind_chat")
-async def admin_bind_chat(callback: CallbackQuery, state: FSMContext) -> None:
+async def admin_bind_chat(callback: CallbackQuery, state: FSMContext, db: DB) -> None:
     """Запросить у администратора идентификатор целевого чата."""
 
     if not is_super_admin(callback.from_user.id):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
-    await state.set_state(BindChat.wait_username)
+    await state.clear()
     if callback.message:
-        await state.update_data(
-            panel_chat_id=callback.message.chat.id,
-            panel_message_id=callback.message.message_id,
+        chat_id = await db.get_target_chat_id()
+        chat_username = await db.get_target_chat_username()
+        if chat_id is None:
+            await callback.message.answer(
+                escape_md(
+                    "Каналы не обнаружены. Добавьте бота в канал, затем вернитесь сюда."
+                ),
+                reply_markup=main_menu_markup(),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+            await callback.answer()
+            return
+        title = chat_username or f"id {chat_id}"
+        builder = InlineKeyboardBuilder()
+        builder.button(
+            text=f"📌 {title}",
+            callback_data=f"admin:bind_chat:select:{chat_id}",
         )
+        builder.button(text="⬅️ Назад", callback_data="admin:settings")
+        builder.adjust(1)
         await callback.message.answer(
-            escape_md(
-                "Пришлите @username, username или chat_id канала/группы.\n\n"
-                "Можно нажать «⬅️ Назад» или «🏠 Главное меню»."
-            ),
-            reply_markup=CANCEL_REPLY,
+            escape_md("Выберите канал для привязки:"),
+            reply_markup=builder.as_markup(),
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:bind_chat:select:"))
+async def admin_bind_chat_select(callback: CallbackQuery, bot: Bot, db: DB) -> None:
+    """Привязать канал по выбранной кнопке."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    raw_chat_id = parts[-1] if parts else ""
+    try:
+        chat_id = int(raw_chat_id)
+    except ValueError:
+        await callback.answer("Некорректный идентификатор чата.", show_alert=True)
+        return
+    try:
+        chat = await bot.get_chat(chat_id)
+        me = await bot.me()
+        member = await bot.get_chat_member(chat_id, me.id)
+    except TelegramBadRequest as err:
+        logger.exception("Ошибка при получении чата", exc_info=err)
+        await callback.answer("Не удалось получить чат. Проверьте права бота.", show_alert=True)
+        return
+    except TelegramForbiddenError as err:
+        logger.exception("Боту запрещён доступ к чату", exc_info=err)
+        await callback.answer("Нет доступа к чату. Назначьте бота админом.", show_alert=True)
+        return
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Не удалось проверить чат", exc_info=err)
+        await callback.answer("Не удалось проверить чат. См. логи.", show_alert=True)
+        return
+
+    status_raw = getattr(member, "status", "")
+    status_value = status_raw.value if hasattr(status_raw, "value") else str(status_raw)
+    if status_value not in {"administrator", "creator"}:
+        await callback.answer("Бот не администратор в чате.", show_alert=True)
+        return
+    invite_allowed = getattr(member, "can_invite_users", None)
+    if invite_allowed is False:
+        await callback.answer("Нет права «Пригласительные ссылки».", show_alert=True)
+        return
+
+    username = getattr(chat, "username", None)
+    username_value = f"@{username}" if username else ""
+    await db.set_target_chat_username(username_value)
+    await db.set_target_chat_id(chat_id)
+    await callback.answer("Чат привязан.", show_alert=True)
+    if callback.message:
+        await render_admin_settings_panel(callback.message, db)
+
+
+@router.callback_query(F.data == "admin:docs")
+async def admin_docs_menu(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
+    """Показать меню настройки ссылок на документы."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.clear()
+    docs = await _get_docs_map(db)
+    lines = ["📄 Ссылки на документы:"]
+    for key, (_, title) in DOCS_SETTINGS.items():
+        value = docs.get(key, "")
+        if value:
+            lines.append(f"• {title}: {value}")
+        else:
+            lines.append(f"• {title}: не указана")
+    text = "\n".join(escape_md(line) for line in lines)
+    builder = InlineKeyboardBuilder()
+    for key, (_, title) in DOCS_SETTINGS.items():
+        builder.button(text=f"✏️ {title}", callback_data=f"admin:docs:edit:{key}")
+    builder.button(text="⬅️ Назад", callback_data="admin:settings")
+    builder.adjust(1)
+    if callback.message:
+        await callback.message.answer(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:docs:edit:"))
+async def admin_docs_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    """Запросить новую ссылку на документ."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    key = parts[-1] if parts else ""
+    if key not in DOCS_SETTINGS:
+        await callback.answer("Неизвестный документ.", show_alert=True)
+        return
+    await state.set_state(AdminDocs.WaitUrl)
+    await state.update_data(doc_key=key)
+    title = DOCS_SETTINGS[key][1]
+    if callback.message:
+        await callback.message.answer(
+            escape_md(
+                f"Отправьте новую ссылку для «{title}».\n"
+                "Чтобы очистить, отправьте «-»."
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.message(AdminDocs.WaitUrl)
+async def admin_docs_save(message: Message, state: FSMContext, db: DB) -> None:
+    """Сохранить ссылку на документ."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    data = await state.get_data()
+    key = data.get("doc_key")
+    if key not in DOCS_SETTINGS:
+        await message.answer("Не удалось определить документ.")
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    setting_key, title = DOCS_SETTINGS[key]
+    value = "" if raw == "-" else raw
+    await db.set_setting(setting_key, value)
+    await message.answer(
+        escape_md(f"Ссылка для «{title}» обновлена."),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    await state.clear()
 
 
 @router.message(BindChat.wait_username)
@@ -2140,7 +2927,7 @@ async def process_bind_username(
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
-    await refresh_admin_panel_by_state(bot, state, db)
+    await refresh_admin_settings_by_state(bot, state, db)
     await state.clear()
 
 
@@ -2170,13 +2957,14 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         return
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ Назад", callback_data="admin:open")
+    builder.button(text="⬅️ Назад", callback_data="admin:settings")
     builder.adjust(1)
 
     title = chat.title or "без названия"
     base_lines = [
         "🛡️ Права бота:",
         f"• Чат: {title} (id {chat_id}, {chat.type})",
+        "• Требуемая роль: администратор",
     ]
 
     try:
@@ -2210,15 +2998,25 @@ async def admin_check_rights(callback: CallbackQuery, bot: Bot, db: DB) -> None:
             invite_flag = "—"
         else:
             invite_flag = "✅" if can_invite_attr else "❌"
+        can_ban_attr = getattr(member, "can_restrict_members", None)
+        if can_ban_attr is None:
+            can_ban_attr = getattr(member, "can_ban_users", None)
+        if can_ban_attr is None:
+            ban_flag = "—"
+        else:
+            ban_flag = "✅" if can_ban_attr else "❌"
         if status_display not in {"administrator", "creator"}:
             recommendation = "• Рекомендация: назначьте бота администратором."
         elif can_invite_attr is False:
             recommendation = "• Рекомендация: откройте права бота → включите «Пригласительные ссылки»."
+        elif can_ban_attr is False:
+            recommendation = "• Рекомендация: откройте права бота → включите «Бан пользователей»."
         else:
             recommendation = "• Рекомендация: всё в порядке."
         lines = base_lines + [
             f"• Статус: {status_display}",
             f"• Пригласительные ссылки: {invite_flag}",
+            f"• Бан пользователей: {ban_flag}",
             recommendation,
         ]
 
@@ -2672,7 +3470,7 @@ async def admin_trial_days(callback: CallbackQuery, state: FSMContext) -> None:
         )
         await callback.message.answer(
             escape_md("Пришлите количество дней пробного периода."),
-            reply_markup=CANCEL_REPLY,
+            reply_markup=ADMIN_CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
@@ -2721,7 +3519,7 @@ async def admin_set_trial_days(message: Message, state: FSMContext, db: DB, bot:
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
-    await refresh_admin_panel_by_state(bot, state, db)
+    await refresh_admin_settings_by_state(bot, state, db)
     await state.clear()
 
 
@@ -2735,7 +3533,7 @@ async def admin_toggle_auto_default(callback: CallbackQuery, db: DB) -> None:
     current = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
     await db.set_auto_renew_default(not current)
     if callback.message:
-        await render_admin_panel(callback.message, db)
+        await render_admin_settings_panel(callback.message, db)
     await callback.answer("Настройки обновлены.")
 
 
@@ -2754,7 +3552,7 @@ async def admin_create_coupon(callback: CallbackQuery, state: FSMContext) -> Non
         )
         await callback.message.answer(
             escape_md("Пришлите промокод (латиница/цифры/дефис, 4–32 символа)."),
-            reply_markup=CANCEL_REPLY,
+            reply_markup=ADMIN_CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
@@ -2795,7 +3593,7 @@ async def admin_save_custom_code(message: Message, state: FSMContext, db: DB, bo
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
-    await refresh_admin_panel_by_state(bot, state, db)
+    await refresh_admin_settings_by_state(bot, state, db)
     await state.clear()
 
 
