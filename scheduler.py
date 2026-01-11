@@ -30,6 +30,9 @@ REMOVAL_THROTTLE_DELAY = 0.3
 REMOVAL_CHUNK_SIZE = 25
 REMOVAL_PARALLELISM = 5
 
+CARD_RENEW_ATTEMPTS = 3
+
+
 
 FAILURE_MESSAGE = "Не удалось списать, автопродление отключено."
 EXPIRED_MESSAGE = "Срок подписки истёк. Продлите, чтобы восстановить доступ."
@@ -148,40 +151,59 @@ async def _try_card_autorenew(bot: Bot, db: DB, row) -> bool:
     if months <= 0 or amount <= 0:
         return False
 
-    try:
-        payment_id = await init_rebill_payment(row_data, amount, months)
-        state = await finalize_rebill(payment_id)
-    except Exception as err:  # noqa: BLE001
-        logger.exception("Не удалось выполнить автосписание по карте", exc_info=err)
-        return False
 
-    status = str(state.get("Status") or "").upper()
-    if status == "CONFIRMED":
-        await db.extend_subscription(user_id, months)
-        await db.set_paid_only(user_id, False)
-        await db.add_payment(
-            user_id=user_id,
-            payment_id=payment_id,
-            order_id=f"card_rebill_{user_id}_{months}_{int(datetime.utcnow().timestamp())}",
-            amount=amount,
-            months=months,
-            status="CONFIRMED",
-            method="card",
-            customer_key=str(row_data.get("customer_key") or ""),
-        )
-        await db.set_auto_renew(user_id, True)
-        await bot.send_message(
+    last_error: str | None = None
+    for attempt in range(1, CARD_RENEW_ATTEMPTS + 1):
+        try:
+            payment_id = await init_rebill_payment(row_data, amount, months)
+            state = await finalize_rebill(payment_id)
+        except Exception as err:  # noqa: BLE001
+            last_error = str(err)
+            logger.exception(
+                "Не удалось выполнить автосписание по карте (попытка %s/%s)",
+                attempt,
+                CARD_RENEW_ATTEMPTS,
+                exc_info=err,
+            )
+            continue
+
+        status = str(state.get("Status") or "").upper()
+        if status == "CONFIRMED":
+            await db.extend_subscription(user_id, months)
+            await db.set_paid_only(user_id, False)
+            await db.add_payment(
+                user_id=user_id,
+                payment_id=payment_id,
+                order_id=f"card_rebill_{user_id}_{months}_{int(datetime.utcnow().timestamp())}",
+                amount=amount,
+                months=months,
+                status="CONFIRMED",
+                method="card",
+                customer_key=str(row_data.get("customer_key") or ""),
+            )
+            await db.set_auto_renew(user_id, True)
+            await bot.send_message(
+                user_id,
+                "✅ Списание по карте прошло успешно, подписка продлена.",
+            )
+            return True
+        if status == "REJECTED":
+            last_error = "REJECTED"
+            continue
+        last_error = status or "UNKNOWN"
+
+    await db.set_auto_renew(user_id, False)
+    await bot.send_message(
+        user_id,
+        "⚠️ Не удалось списать оплату по карте. Автопродление отключено.",
+    )
+    if last_error:
+        await db.log_payment_attempt(
             user_id,
-            "✅ Списание по карте прошло успешно, подписка продлена.",
+            "FAILED",
+            f"card: {last_error}",
+            payment_type="card",
         )
-        return True
-    if status == "REJECTED":
-        await db.set_auto_renew(user_id, False)
-        await bot.send_message(
-            user_id,
-            "⚠️ Не удалось списать оплату по карте. Автопродление отключено.",
-        )
-        return False
     return False
 
 
@@ -406,13 +428,20 @@ async def daily_check(bot: Bot, db: DB):
         removed_count = 0
         skipped_count = 0
         error_count = 0
+        removal_errors: list[tuple[int, str]] = []
         semaphore = asyncio.Semaphore(REMOVAL_PARALLELISM)
+        admin_ids = set(_load_admin_ids())
+        should_throttle = len(expired) > REMOVAL_PARALLELISM
+
 
         async def _process_row(row) -> None:
             nonlocal auto_success_count, auto_fail_count, auto_success_amount
             nonlocal removed_count, skipped_count, error_count
             user_id = int(row["user_id"])
             async with semaphore:
+                if user_id in admin_ids:
+                    skipped_count += 1
+                    return
                 renew_result = await try_auto_renew(bot, db, row, now_ts)
                 if renew_result.success:
                     auto_success_count += 1
@@ -428,7 +457,10 @@ async def daily_check(bot: Bot, db: DB):
                     await db.set_auto_renew(user_id, False)
 
                 card_renewed = False
+                card_attempted = False
                 if auto_flag and row_dict.get("rebill_id"):
+                    card_attempted = True
+
                     try:
                         card_renewed = await _try_card_autorenew(bot, db, row_dict)
                     except Exception:  # noqa: BLE001
@@ -473,23 +505,11 @@ async def daily_check(bot: Bot, db: DB):
                     logger.debug(
                         "Не удалось обновить признак pending_removal для пользователя %s",
                         user_id,
-                        exc_info=err,
+                        exc_info=err
                     )
                 if removal_error:
-                    summary_text = (
-                        "⚠️ Бот не смог удалить пользователя из канала.\n"
-                        f"chat_id: {target_chat_id}\n"
-                        f"user_id: {user_id}\n"
-                        "Проверьте право «Бан пользователей» у бота."
-                    )
-                    for admin_id in _load_admin_ids():
-                        try:
-                            await bot.send_message(admin_id, summary_text)
-                        except Exception:
-                            logger.debug(
-                                "Не удалось отправить администратору %s уведомление о правах бота",
-                                admin_id,
-                            )
+                    removal_errors.append((user_id, removal_error))
+
                 notify_text = None
                 notify_markup = None
                 if renew_result.attempted:
@@ -503,7 +523,10 @@ async def daily_check(bot: Bot, db: DB):
                         notify_markup = _retry_markup()
                     else:
                         notify_text = EXPIRED_MESSAGE
-                if notify_text:
+                if card_attempted:
+                    notify_text = None
+                if notify_text and (auto_flag or renew_result.attempted):
+
                     try:
                         await bot.send_message(
                             user_id,
@@ -515,7 +538,9 @@ async def daily_check(bot: Bot, db: DB):
                             "Не удалось уведомить пользователя %s об окончании подписки",
                             user_id,
                         )
-                await asyncio.sleep(REMOVAL_THROTTLE_DELAY)
+                if should_throttle:
+                    await asyncio.sleep(REMOVAL_THROTTLE_DELAY)
+
 
         for start in range(0, len(expired), REMOVAL_CHUNK_SIZE):
             chunk = expired[start : start + REMOVAL_CHUNK_SIZE]
@@ -538,6 +563,30 @@ async def daily_check(bot: Bot, db: DB):
                         "Не удалось отправить администратору %s сводку автосписаний",
                         admin_id,
                     )
+        if removal_errors:
+            error_count_value = len(removal_errors)
+            preview = removal_errors[:5]
+            lines = [
+                "⚠️ Бот не смог удалить пользователей из канала.",
+                f"chat_id: {target_chat_id}",
+                f"Ошибок: {error_count_value}",
+                "Проверьте право «Бан пользователей» у бота.",
+            ]
+            lines.append("Примеры:")
+            for user_id, err in preview:
+                lines.append(f"• user_id {user_id}: {err}")
+            if error_count_value > len(preview):
+                lines.append(f"…и ещё {error_count_value - len(preview)}")
+            summary_text = "\n".join(lines)
+            for admin_id in admin_ids:
+                try:
+                    await bot.send_message(admin_id, summary_text)
+                except Exception:
+                    logger.debug(
+                        "Не удалось отправить администратору %s уведомление об ошибках удаления",
+                        admin_id,
+                    )
+
         logger.info(
             "Итог проверки подписок: удалено=%s пропущено=%s ошибок=%s",
             removed_count,
