@@ -29,7 +29,9 @@ REMOVAL_RETRY_DELAY = 2
 REMOVAL_THROTTLE_DELAY = 0.3
 REMOVAL_CHUNK_SIZE = 25
 REMOVAL_PARALLELISM = 5
+
 CARD_RENEW_ATTEMPTS = 3
+
 
 
 FAILURE_MESSAGE = "Не удалось списать, автопродление отключено."
@@ -148,6 +150,7 @@ async def _try_card_autorenew(bot: Bot, db: DB, row) -> bool:
         amount = 0
     if months <= 0 or amount <= 0:
         return False
+
 
     last_error: str | None = None
     for attempt in range(1, CARD_RENEW_ATTEMPTS + 1):
@@ -430,6 +433,7 @@ async def daily_check(bot: Bot, db: DB):
         admin_ids = set(_load_admin_ids())
         should_throttle = len(expired) > REMOVAL_PARALLELISM
 
+
         async def _process_row(row) -> None:
             nonlocal auto_success_count, auto_fail_count, auto_success_amount
             nonlocal removed_count, skipped_count, error_count
@@ -456,6 +460,7 @@ async def daily_check(bot: Bot, db: DB):
                 card_attempted = False
                 if auto_flag and row_dict.get("rebill_id"):
                     card_attempted = True
+
                     try:
                         card_renewed = await _try_card_autorenew(bot, db, row_dict)
                     except Exception:  # noqa: BLE001
@@ -500,10 +505,11 @@ async def daily_check(bot: Bot, db: DB):
                     logger.debug(
                         "Не удалось обновить признак pending_removal для пользователя %s",
                         user_id,
-                        exc_info=err,
+                        exc_info=err
                     )
                 if removal_error:
                     removal_errors.append((user_id, removal_error))
+
                 notify_text = None
                 notify_markup = None
                 if renew_result.attempted:
@@ -520,6 +526,7 @@ async def daily_check(bot: Bot, db: DB):
                 if card_attempted:
                     notify_text = None
                 if notify_text and (auto_flag or renew_result.attempted):
+
                     try:
                         await bot.send_message(
                             user_id,
@@ -533,6 +540,7 @@ async def daily_check(bot: Bot, db: DB):
                         )
                 if should_throttle:
                     await asyncio.sleep(REMOVAL_THROTTLE_DELAY)
+
 
         for start in range(0, len(expired), REMOVAL_CHUNK_SIZE):
             chunk = expired[start : start + REMOVAL_CHUNK_SIZE]
@@ -578,6 +586,7 @@ async def daily_check(bot: Bot, db: DB):
                         "Не удалось отправить администратору %s уведомление об ошибках удаления",
                         admin_id,
                     )
+
         logger.info(
             "Итог проверки подписок: удалено=%s пропущено=%s ошибок=%s",
             removed_count,
