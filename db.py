@@ -20,10 +20,14 @@ CREATE TABLE IF NOT EXISTS users (
     accepted_legal INTEGER NOT NULL DEFAULT 0,
     accepted_at INTEGER,
     invite_issued INTEGER NOT NULL DEFAULT 0,
+    pending_removal INTEGER NOT NULL DEFAULT 0,
     trial_start INTEGER DEFAULT 0,
     trial_end INTEGER DEFAULT 0,
     email TEXT,
-    account_token TEXT
+    account_token TEXT,
+    customer_key TEXT,
+    rebill_id TEXT,
+    rebill_parent_payment TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -73,7 +77,9 @@ CREATE TABLE IF NOT EXISTS payments (
     method TEXT DEFAULT 'card',
     is_sbp INTEGER NOT NULL DEFAULT 0,
     request_key TEXT,
-    account_token TEXT
+    account_token TEXT,
+    customer_key TEXT,
+    rebill_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_payment_id ON payments(payment_id);
@@ -166,11 +172,17 @@ class DB:
                 "ALTER TABLE users ADD COLUMN accepted_legal INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN accepted_at INTEGER",
                 "ALTER TABLE users ADD COLUMN invite_issued INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN pending_removal INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN trial_start INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN trial_end INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN email TEXT",
                 "ALTER TABLE users ADD COLUMN account_token TEXT",
+                "ALTER TABLE users ADD COLUMN customer_key TEXT",
+                "ALTER TABLE users ADD COLUMN rebill_id TEXT",
+                "ALTER TABLE users ADD COLUMN rebill_parent_payment TEXT",
                 "ALTER TABLE payments ADD COLUMN order_id TEXT",
+                "ALTER TABLE payments ADD COLUMN customer_key TEXT",
+                "ALTER TABLE payments ADD COLUMN rebill_id TEXT",
                 "CREATE TABLE IF NOT EXISTS payment_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT, created_at INTEGER, message TEXT, payment_type TEXT)",
                 "ALTER TABLE payment_logs ADD COLUMN payment_type TEXT",
                 "ALTER TABLE payments ADD COLUMN method TEXT",
@@ -309,6 +321,7 @@ class DB:
                     u.accepted_legal,
                     u.accepted_at,
                     u.invite_issued,
+                    u.pending_removal,
                     u.trial_start,
                     u.trial_end,
                     u.email,
@@ -381,6 +394,49 @@ class DB:
             await db.execute(
                 "UPDATE users SET email=? WHERE user_id=?",
                 (contact_value, user_id),
+            )
+            await db.commit()
+
+    async def set_user_customer_key(self, user_id: int, customer_key: str) -> None:
+        """Сохранить CustomerKey пользователя, если он ещё не задан."""
+
+        value = (customer_key or "").strip()
+        if not value:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                UPDATE users
+                SET customer_key=?
+                WHERE user_id=? AND (customer_key IS NULL OR TRIM(customer_key)='')
+                """,
+                (value, user_id),
+            )
+            await db.commit()
+
+    async def set_user_rebill_id(self, user_id: int, rebill_id: str) -> None:
+        """Сохранить RebillId пользователя."""
+
+        value = (rebill_id or "").strip()
+        if not value:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET rebill_id=? WHERE user_id=?",
+                (value, user_id),
+            )
+            await db.commit()
+
+    async def set_user_rebill_parent_payment(self, user_id: int, payment_id: str) -> None:
+        """Сохранить идентификатор родительского платежа для автосписаний."""
+
+        value = (payment_id or "").strip()
+        if not value:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET rebill_parent_payment=? WHERE user_id=?",
+                (value, user_id),
             )
             await db.commit()
 
@@ -588,6 +644,16 @@ class DB:
             )
             await db.commit()
 
+    async def set_pending_removal(self, user_id: int, flag: bool) -> None:
+        """Отметить пользователя как ожидающего удаления из чата."""
+
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET pending_removal=? WHERE user_id=?",
+                (1 if flag else 0, user_id),
+            )
+            await db.commit()
+
     async def set_accepted_legal(
         self, user_id: int, flag: bool, ts: Optional[int] = None
     ) -> None:
@@ -665,7 +731,26 @@ class DB:
     async def set_target_chat_id(self, chat_id: int) -> None:
         await self.set_setting("target_chat_id", str(chat_id))
 
+    async def set_target_chat_active(self, active: bool) -> None:
+        await self.set_setting("target_chat_active", "1" if active else "0")
+
+    async def get_target_chat_active(self) -> bool:
+        value = await self.get_setting("target_chat_active")
+        if value is None:
+            return True
+        return value in {"1", "true", "True", "TRUE"}
+
+    async def upsert_chat(self, chat_id: int, username: str | None, is_active: bool) -> None:
+        await self.set_target_chat_id(chat_id)
+        await self.set_target_chat_username(username or "")
+        await self.set_target_chat_active(is_active)
+
+    async def set_chat_active(self, is_active: bool) -> None:
+        await self.set_target_chat_active(is_active)
+
     async def get_target_chat_id(self) -> Optional[int]:
+        if not await self.get_target_chat_active():
+            return None
         value = await self.get_setting("target_chat_id")
         if value is None:
             return None
@@ -736,6 +821,15 @@ class DB:
         prices = await self.get_all_prices()
         return {months: price for months, price in prices}
 
+    async def list_users_for_broadcast(self) -> list[int]:
+        """Вернуть список user_id для рассылки."""
+
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT user_id FROM users")
+            rows = await cur.fetchall()
+        return [int(row["user_id"]) for row in rows if row and row["user_id"]]
+
     async def add_payment(
         self,
         user_id: int,
@@ -746,6 +840,8 @@ class DB:
         status: str = "PENDING",
         *,
         method: Optional[str] = None,
+        customer_key: Optional[str] = None,
+        rebill_id: Optional[str] = None,
         request_key: Optional[str] = None,
         account_token: Optional[str] = None,
         is_sbp: Optional[bool] = None,
@@ -755,6 +851,8 @@ class DB:
         normalized_status = status.upper() if status else "PENDING"
         normalized_method = (method or "card").strip().lower() or "card"
         sbp_flag = 1 if (is_sbp if is_sbp is not None else normalized_method == "sbp") else 0
+        customer_value = (customer_key or "").strip() or None
+        rebill_value = (rebill_id or "").strip() or None
         request_value = (request_key or "").strip() or None
         account_value = (account_token or "").strip() or None
         async with aiosqlite.connect(self.path) as db:
@@ -768,7 +866,7 @@ class DB:
                 await db.execute(
                     """
                     UPDATE payments
-                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?, method=?, is_sbp=?, request_key=?, account_token=?
+                    SET user_id=?, order_id=?, payment_id=?, amount=?, months=?, status=?, method=?, is_sbp=?, request_key=?, account_token=?, customer_key=?, rebill_id=?
                     WHERE id=?
                     """,
                     (
@@ -782,6 +880,8 @@ class DB:
                         sbp_flag,
                         request_value,
                         account_value,
+                        customer_value,
+                        rebill_value,
                         row["id"],
                     ),
                 )
@@ -789,8 +889,8 @@ class DB:
                 created_at = int(time.time())
                 await db.execute(
                     """
-                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at, method, is_sbp, request_key, account_token)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO payments (user_id, order_id, payment_id, amount, months, status, created_at, method, is_sbp, request_key, account_token, customer_key, rebill_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id,
@@ -804,6 +904,8 @@ class DB:
                         sbp_flag,
                         request_value,
                         account_value,
+                        customer_value,
+                        rebill_value,
                     ),
                 )
             await db.commit()
@@ -1140,6 +1242,9 @@ class DB:
                     u.invite_issued,
                     u.trial_start,
                     u.trial_end,
+                    u.email,
+                    u.customer_key,
+                    u.rebill_id,
                     s.end_at AS subscription_end_at,
                     s.updated_at AS subscription_updated_at
                 FROM users AS u

@@ -51,14 +51,108 @@ def _normalize_amount_inputs(
 
     # Сумма из базы хранится в рублях, но API T-Bank принимает копейки,
     # поэтому всегда переводим в минорные единицы независимо от источника.
-    amount_minor = resolved_amount * 100
+    amount_minor = int(resolved_amount * 100)
     return resolved_months, resolved_amount, amount_minor
+
+
+def _normalize_contact(contact_value: str | None) -> tuple[str | None, str | None]:
+    """Нормализовать контакт пользователя и вернуть email или телефон."""
+
+    if not contact_value:
+        return None, None
+    cleaned = str(contact_value).strip()
+    if not cleaned:
+        return None, None
+    if "@" in cleaned:
+        return cleaned, None
+    phone_value = cleaned.lstrip("+")
+    if phone_value.isdigit():
+        return None, phone_value
+    return None, None
 
 
 def _build_order_id(prefix: str, user_id: int, months: int) -> str:
     """Сформировать order_id с учётом пользователя и срока."""
 
     return f"{prefix}_{user_id}_{months}_{int(time.time())}"
+
+
+async def create_card_payment(user_id: int, months: int, price: int) -> str:
+    """Создать платёж по карте и вернуть ссылку PaymentURL."""
+
+    if user_id <= 0:
+        raise ValueError("Некорректный идентификатор пользователя")
+    if months <= 0 or price <= 0:
+        raise ValueError("Некорректные параметры оплаты")
+
+    resolved_db = _get_db()
+    user_row = await resolved_db.get_user(user_id)
+    contact_value = None
+    if user_row is not None and hasattr(user_row, "keys") and "email" in user_row.keys():
+        contact_value = str(user_row["email"] or "").strip() or None
+    email_value, phone_value = _normalize_contact(contact_value)
+    if not email_value and not phone_value:
+        raise ValueError("Не указан телефон или email пользователя для чека")
+
+    resolved_months, _, amount_minor = _normalize_amount_inputs(
+        months, price, explicit_db=True
+    )
+    order_id = _build_order_id("card", user_id, resolved_months)
+    receipt = {
+        "FfdVersion": "1.05",
+        "Taxation": "usn_income",
+        "Items": [
+            {
+                "Name": "Подписка",
+                "Price": amount_minor,
+                "Quantity": 1,
+                "Amount": amount_minor,
+                "PaymentMethod": "full_prepayment",
+                "PaymentObject": "service",
+                "Tax": "none",
+            }
+        ],
+        "Payments": {"Electronic": amount_minor},
+    }
+    extra_data: dict[str, str] = {}
+    if email_value:
+        receipt["Email"] = email_value
+        extra_data["Email"] = email_value
+    if phone_value:
+        receipt["Phone"] = phone_value
+        extra_data["Phone"] = phone_value
+    response = await init_payment(
+        amount=amount_minor,
+        order_id=order_id,
+        description="Подписка",
+        customer_key=str(user_id),
+        pay_type="O",
+        recurrent="Y",
+        receipt=receipt,
+        email=email_value,
+        phone=phone_value,
+        extra=extra_data or None,
+    )
+
+    payment_id = str(response.get("PaymentId") or "")
+    if not payment_id:
+        raise RuntimeError("Init не вернул идентификатор платежа")
+
+    await resolved_db.add_payment(
+        user_id=user_id,
+        payment_id=payment_id,
+        order_id=order_id,
+        amount=amount_minor,
+        months=resolved_months,
+        status="PENDING",
+        method="card",
+        customer_key=str(user_id),
+    )
+
+    payment_url = response.get("PaymentURL")
+    if not payment_url:
+        raise RuntimeError("Init не вернул ссылку оплаты")
+    return str(payment_url)
 
 
 def _value_contains_sbp(value: Any) -> bool:
@@ -147,11 +241,18 @@ async def init_sbp_payment(
     phone_value: Optional[str] = None
     normalized_contact = (contact_type or "").strip().lower()
     if normalized_contact == "email":
-        email_value = contact_value
+        email_value, _ = _normalize_contact(contact_value)
     elif normalized_contact == "phone":
-        phone_value = contact_value
+        _, phone_value = _normalize_contact(contact_value)
     else:
         raise ValueError("Не указан тип контакта для чека")
+    if not email_value and not phone_value:
+        raise ValueError("Не указан контакт для чека")
+    extra_data = {"QR": "true"}
+    if email_value:
+        extra_data["Email"] = email_value
+    if phone_value:
+        extra_data["Phone"] = phone_value
 
     try:
         response = await init_payment(
@@ -160,7 +261,7 @@ async def init_sbp_payment(
             description=description,
             recurrent="Y",
             pay_type="O",
-            extra={"QR": "true"},
+            extra=extra_data,
             notification_url=config.TINKOFF_NOTIFY_URL or None,
             email=email_value,
             phone=phone_value,
@@ -317,13 +418,7 @@ async def charge_sbp_autopayment(
             raw_contact = str(user_row["email"] or "").strip()
         except (KeyError, TypeError, ValueError):
             raw_contact = ""
-    contact_email: Optional[str] = None
-    contact_phone: Optional[str] = None
-    if raw_contact:
-        if raw_contact.startswith("+7") and len(raw_contact) == 12:
-            contact_phone = raw_contact
-        elif "@" in raw_contact:
-            contact_email = raw_contact
+    contact_email, contact_phone = _normalize_contact(raw_contact)
     if not contact_email and not contact_phone:
         raise RuntimeError("Для отправки чека не указан контакт пользователя")
     resolved_months, _, amount_minor = _normalize_amount_inputs(
@@ -332,13 +427,18 @@ async def charge_sbp_autopayment(
     order_id = _build_order_id("sbp_auto", user_id, resolved_months)
     description = f"Автопродление подписки (СБП) на {resolved_months} мес."
 
+    extra_data = {"QR": "true"}
+    if contact_email:
+        extra_data["Email"] = contact_email
+    if contact_phone:
+        extra_data["Phone"] = contact_phone
     init_response = await init_payment(
         amount=amount_minor,
         order_id=order_id,
         description=description,
         recurrent="Y",
         pay_type="O",
-        extra={"QR": "true"},
+        extra=extra_data,
         notification_url=config.TINKOFF_NOTIFY_URL or None,
         email=contact_email,
         phone=contact_phone,

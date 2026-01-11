@@ -1,25 +1,35 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta
 import json
 from typing import NamedTuple
 
+import aiohttp
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import pytz
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import config
 from db import DB
 from logger import logger
 from payments import charge_sbp_autopayment
-from t_pay import TBankApiError, TBankHttpError
+from t_pay import TBankApiError, TBankHttpError, finalize_rebill, init_rebill_payment
 
 DEFAULT_RECURRENT_IP = "127.0.0.1"
 RETRY_PAYMENT_CALLBACK = "payment:retry"
+MAX_EXPIRED_BATCH = 100
+REMOVAL_RETRIES = 3
+REMOVAL_RETRY_DELAY = 2
+REMOVAL_THROTTLE_DELAY = 0.3
+REMOVAL_CHUNK_SIZE = 25
+REMOVAL_PARALLELISM = 5
+CARD_RENEW_ATTEMPTS = 3
 
 
 FAILURE_MESSAGE = "Не удалось списать, автопродление отключено."
@@ -33,6 +43,31 @@ class AutoRenewResult(NamedTuple):
     attempted: bool
     amount: int
     user_notified: bool = False
+
+
+def _load_admin_ids() -> list[int]:
+    """Загрузить идентификаторы администраторов из файла авторизации."""
+
+    path = (config.ADMIN_AUTH_FILE or "").strip()
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return []
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Не удалось прочитать файл администраторов", exc_info=err)
+        return []
+    raw_ids = payload.get("admins", [])
+    result: list[int] = []
+    for raw in raw_ids:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        result.append(value)
+    return result
 
 def _retry_markup() -> InlineKeyboardMarkup:
     """Построить клавиатуру для повторного списания."""
@@ -72,6 +107,103 @@ async def _was_last_payment_sbp(db: DB, user_id: int) -> bool:
     return method == "sbp"
 
 
+def _has_active_subscription(row) -> bool:
+    """Понять, есть ли у пользователя платная подписка в истории."""
+
+    if row is None:
+        return False
+    try:
+        subscription_end = int(row.get("subscription_end_at") or 0)
+    except (TypeError, ValueError, KeyError):
+        subscription_end = 0
+    return subscription_end > 0
+
+
+async def _try_card_autorenew(bot: Bot, db: DB, row) -> bool:
+    """Попытаться продлить подписку по карте через RebillId."""
+
+    row_data = dict(row)
+    user_id = int(row_data.get("user_id") or 0)
+    if user_id <= 0:
+        return False
+    rebill_id = str(row_data.get("rebill_id") or "").strip()
+    if not rebill_id:
+        return False
+    if not _has_active_subscription(row_data):
+        return False
+
+    try:
+        last_payment = await db.get_latest_payment(user_id)
+    except Exception:  # noqa: BLE001
+        last_payment = None
+    if not last_payment:
+        return False
+    try:
+        months = int(last_payment.get("months") or 0)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001
+        months = 0
+    try:
+        amount = int(last_payment.get("amount") or 0)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001
+        amount = 0
+    if months <= 0 or amount <= 0:
+        return False
+
+    last_error: str | None = None
+    for attempt in range(1, CARD_RENEW_ATTEMPTS + 1):
+        try:
+            payment_id = await init_rebill_payment(row_data, amount, months)
+            state = await finalize_rebill(payment_id)
+        except Exception as err:  # noqa: BLE001
+            last_error = str(err)
+            logger.exception(
+                "Не удалось выполнить автосписание по карте (попытка %s/%s)",
+                attempt,
+                CARD_RENEW_ATTEMPTS,
+                exc_info=err,
+            )
+            continue
+
+        status = str(state.get("Status") or "").upper()
+        if status == "CONFIRMED":
+            await db.extend_subscription(user_id, months)
+            await db.set_paid_only(user_id, False)
+            await db.add_payment(
+                user_id=user_id,
+                payment_id=payment_id,
+                order_id=f"card_rebill_{user_id}_{months}_{int(datetime.utcnow().timestamp())}",
+                amount=amount,
+                months=months,
+                status="CONFIRMED",
+                method="card",
+                customer_key=str(row_data.get("customer_key") or ""),
+            )
+            await db.set_auto_renew(user_id, True)
+            await bot.send_message(
+                user_id,
+                "✅ Списание по карте прошло успешно, подписка продлена.",
+            )
+            return True
+        if status == "REJECTED":
+            last_error = "REJECTED"
+            continue
+        last_error = status or "UNKNOWN"
+
+    await db.set_auto_renew(user_id, False)
+    await bot.send_message(
+        user_id,
+        "⚠️ Не удалось списать оплату по карте. Автопродление отключено.",
+    )
+    if last_error:
+        await db.log_payment_attempt(
+            user_id,
+            "FAILED",
+            f"card: {last_error}",
+            payment_type="card",
+        )
+    return False
+
+
 async def try_auto_renew(
     bot: Bot,
     db: DB,
@@ -88,7 +220,7 @@ async def try_auto_renew(
     row_dict = dict(user_row)
     user_id = int(row_dict.get("user_id", 0))
     auto_renew_flag = bool(row_dict.get("auto_renew"))
-    test_interval = config.SBP_TEST_INTERVAL_MINUTES or config.TEST_RENEW_INTERVAL_MINUTES
+    test_interval = config.TEST_RENEW_INTERVAL_MINUTES
     account_token = (row_dict.get("account_token") or "").strip()
     if not account_token:
         account_token = (await db.get_account_token(user_id)) or ""
@@ -236,8 +368,43 @@ async def try_auto_renew(
     return AutoRenewResult(True, True, max(0, parent_amount), success_notified)
 
 
+async def _kick_user_with_retry(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+) -> tuple[bool, str | None]:
+    """Исключить пользователя из чата с повторными попытками при сетевых сбоях."""
+
+    for attempt in range(REMOVAL_RETRIES):
+        try:
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id)
+            return True, None
+        except (TelegramForbiddenError, TelegramBadRequest) as err:
+            logger.warning(
+                "Ошибка Telegram API при удалении пользователя %s: %s",
+                user_id,
+                err,
+            )
+            return False, str(err)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            if attempt + 1 >= REMOVAL_RETRIES:
+                logger.warning(
+                    "Сетевая ошибка при удалении пользователя %s: %s",
+                    user_id,
+                    err,
+                )
+                return False, None
+            await asyncio.sleep(REMOVAL_RETRY_DELAY)
+        except Exception as err:  # noqa: BLE001
+            logger.debug("Не удалось удалить пользователя %s из канала", user_id, exc_info=err)
+            return False, None
+    return False, None
+
+
 async def daily_check(bot: Bot, db: DB):
     try:
+        started_at = time.monotonic()
         now_ts = int(datetime.utcnow().timestamp())
         target_chat_id = await db.get_target_chat_id()
         if target_chat_id is None:
@@ -245,69 +412,131 @@ async def daily_check(bot: Bot, db: DB):
             return
 
         expired = await db.list_expired(now_ts)
+        if len(expired) > MAX_EXPIRED_BATCH:
+            logger.info(
+                "Ограничение батча истёкших подписок: %s из %s",
+                MAX_EXPIRED_BATCH,
+                len(expired),
+            )
+            expired = expired[:MAX_EXPIRED_BATCH]
         auto_success_count = 0
         auto_fail_count = 0
         auto_success_amount = 0
-        for row in expired:
+        removed_count = 0
+        skipped_count = 0
+        error_count = 0
+        removal_errors: list[tuple[int, str]] = []
+        semaphore = asyncio.Semaphore(REMOVAL_PARALLELISM)
+        admin_ids = set(_load_admin_ids())
+        should_throttle = len(expired) > REMOVAL_PARALLELISM
+
+        async def _process_row(row) -> None:
+            nonlocal auto_success_count, auto_fail_count, auto_success_amount
+            nonlocal removed_count, skipped_count, error_count
             user_id = int(row["user_id"])
+            async with semaphore:
+                if user_id in admin_ids:
+                    skipped_count += 1
+                    return
+                renew_result = await try_auto_renew(bot, db, row, now_ts)
+                if renew_result.success:
+                    auto_success_count += 1
+                    auto_success_amount += max(0, renew_result.amount)
+                    skipped_count += 1
+                    return
+                if renew_result.attempted:
+                    auto_fail_count += 1
 
-            renew_result = await try_auto_renew(bot, db, row, now_ts)
-            if renew_result.success:
-                auto_success_count += 1
-                auto_success_amount += max(0, renew_result.amount)
-                continue
-            if renew_result.attempted:
-                auto_fail_count += 1
-
-            row_dict = dict(row)
-            auto_flag = bool(row_dict.get("auto_renew"))
-            if auto_flag:
-                await db.set_auto_renew(user_id, False)
-
-            sbp_recent = False
-            if not renew_result.attempted and not auto_flag:
-                sbp_recent = await _was_last_payment_sbp(db, user_id)
-
-            try:
-                await db.log_payment_attempt(
-                    user_id,
-                    "EXPIRED",
-                    "Подписка неактивна, пользователь будет удалён",
-                    payment_type="sbp" if sbp_recent else "card",
-                )
-            except Exception:
-                logger.debug("Не удалось записать лог об удалении пользователя %s", user_id)
-
-            try:
-                await bot.ban_chat_member(target_chat_id, user_id)
-                await bot.unban_chat_member(target_chat_id, user_id)
-            except Exception:
-                logger.debug("Не удалось удалить пользователя %s из канала", user_id)
-            notify_text = None
-            notify_markup = None
-            if renew_result.attempted:
-                notify_text = FAILURE_MESSAGE
-                notify_markup = _retry_markup()
-                if renew_result.user_notified:
-                    notify_text = None
-            else:
+                row_dict = dict(row)
+                auto_flag = bool(row_dict.get("auto_renew"))
                 if auto_flag:
-                    notify_text = FAILURE_MESSAGE
-                    notify_markup = _retry_markup()
-                else:
-                    notify_text = EXPIRED_MESSAGE
-            if notify_text:
+                    await db.set_auto_renew(user_id, False)
+
+                card_renewed = False
+                card_attempted = False
+                if auto_flag and row_dict.get("rebill_id"):
+                    card_attempted = True
+                    try:
+                        card_renewed = await _try_card_autorenew(bot, db, row_dict)
+                    except Exception:  # noqa: BLE001
+                        card_renewed = False
+                if card_renewed:
+                    skipped_count += 1
+                    return
+
+                sbp_recent = False
+                if not renew_result.attempted and not auto_flag:
+                    sbp_recent = await _was_last_payment_sbp(db, user_id)
+
                 try:
-                    await bot.send_message(
+                    await db.log_payment_attempt(
                         user_id,
-                        notify_text,
-                        reply_markup=notify_markup,
+                        "EXPIRED",
+                        "Подписка неактивна, пользователь будет удалён",
+                        payment_type="sbp" if sbp_recent else "card",
                     )
                 except Exception:
-                    logger.debug(
-                        "Не удалось уведомить пользователя %s об окончании подписки",
+                    logger.debug("Не удалось записать лог об удалении пользователя %s", user_id)
+
+                try:
+                    removed, removal_error = await _kick_user_with_retry(
+                        bot,
+                        target_chat_id,
                         user_id,
                     )
+                except Exception as err:  # noqa: BLE001
+                    logger.debug("Не удалось удалить пользователя %s из канала", user_id, exc_info=err)
+                    removed = False
+                    removal_error = None
+
+                if removed:
+                    removed_count += 1
+                else:
+                    error_count += 1
+
+                try:
+                    await db.set_pending_removal(user_id, not removed)
+                except Exception as err:  # noqa: BLE001
+                    logger.debug(
+                        "Не удалось обновить признак pending_removal для пользователя %s",
+                        user_id,
+                        exc_info=err,
+                    )
+                if removal_error:
+                    removal_errors.append((user_id, removal_error))
+                notify_text = None
+                notify_markup = None
+                if renew_result.attempted:
+                    notify_text = FAILURE_MESSAGE
+                    notify_markup = _retry_markup()
+                    if renew_result.user_notified:
+                        notify_text = None
+                else:
+                    if auto_flag:
+                        notify_text = FAILURE_MESSAGE
+                        notify_markup = _retry_markup()
+                    else:
+                        notify_text = EXPIRED_MESSAGE
+                if card_attempted:
+                    notify_text = None
+                if notify_text and (auto_flag or renew_result.attempted):
+                    try:
+                        await bot.send_message(
+                            user_id,
+                            notify_text,
+                            reply_markup=notify_markup,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Не удалось уведомить пользователя %s об окончании подписки",
+                            user_id,
+                        )
+                if should_throttle:
+                    await asyncio.sleep(REMOVAL_THROTTLE_DELAY)
+
+        for start in range(0, len(expired), REMOVAL_CHUNK_SIZE):
+            chunk = expired[start : start + REMOVAL_CHUNK_SIZE]
+            await asyncio.gather(*(_process_row(row) for row in chunk))
 
         if auto_success_count or auto_fail_count:
             summary_lines = [
@@ -318,7 +547,7 @@ async def daily_check(bot: Bot, db: DB):
             if auto_success_amount > 0:
                 summary_lines.append(f"💰 Сумма: {auto_success_amount / 100:.2f} ₽")
             summary_text = "\n".join(summary_lines)
-            for admin_id in config.SUPER_ADMIN_IDS:
+            for admin_id in _load_admin_ids():
                 try:
                     await bot.send_message(admin_id, summary_text)
                 except Exception:
@@ -326,13 +555,44 @@ async def daily_check(bot: Bot, db: DB):
                         "Не удалось отправить администратору %s сводку автосписаний",
                         admin_id,
                     )
+        if removal_errors:
+            error_count_value = len(removal_errors)
+            preview = removal_errors[:5]
+            lines = [
+                "⚠️ Бот не смог удалить пользователей из канала.",
+                f"chat_id: {target_chat_id}",
+                f"Ошибок: {error_count_value}",
+                "Проверьте право «Бан пользователей» у бота.",
+            ]
+            lines.append("Примеры:")
+            for user_id, err in preview:
+                lines.append(f"• user_id {user_id}: {err}")
+            if error_count_value > len(preview):
+                lines.append(f"…и ещё {error_count_value - len(preview)}")
+            summary_text = "\n".join(lines)
+            for admin_id in admin_ids:
+                try:
+                    await bot.send_message(admin_id, summary_text)
+                except Exception:
+                    logger.debug(
+                        "Не удалось отправить администратору %s уведомление об ошибках удаления",
+                        admin_id,
+                    )
+        logger.info(
+            "Итог проверки подписок: удалено=%s пропущено=%s ошибок=%s",
+            removed_count,
+            skipped_count,
+            error_count,
+        )
+        duration = time.monotonic() - started_at
+        logger.info("Проверка подписок завершена за %.2f сек.", duration)
     except asyncio.CancelledError:
         return
 
 
 def setup_scheduler(bot: Bot, db: DB, tz_name: str = "Europe/Moscow") -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=pytz.timezone(tz_name))
-    interval_minutes = config.SBP_TEST_INTERVAL_MINUTES or config.TEST_RENEW_INTERVAL_MINUTES
+    interval_minutes = config.TEST_RENEW_INTERVAL_MINUTES
     if interval_minutes:
         scheduler.add_job(
             daily_check,
