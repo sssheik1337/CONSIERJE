@@ -2353,7 +2353,7 @@ async def _show_broadcast_preview(message: Message, state: FSMContext) -> None:
     builder.button(text="❌ Отмена", callback_data="admin:broadcast:cancel")
     builder.adjust(1)
     await message.answer(
-        "Предпросмотр сообщения ниже. Отправить рассылку?",
+        "Предпросмотр сообщения выше. Отправить рассылку?",
         reply_markup=builder.as_markup(),
     )
 
@@ -2697,7 +2697,7 @@ async def _show_broadcast_preview(message: Message, state: FSMContext) -> None:
     builder.button(text="❌ Отмена", callback_data="admin:broadcast:cancel")
     builder.adjust(1)
     await message.answer(
-        "Предпросмотр сообщения ниже. Отправить рассылку?",
+        "Предпросмотр сообщения выше. Отправить рассылку?",
         reply_markup=builder.as_markup(),
     )
 
