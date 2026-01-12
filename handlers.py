@@ -2435,9 +2435,14 @@ async def admin_broadcast_buttons_payment(callback: CallbackQuery, state: FSMCon
     updated_buttons, enabled = _toggle_broadcast_payment_button(buttons)
     await state.update_data(broadcast_buttons=updated_buttons)
     if callback.message:
-        await callback.message.edit_reply_markup(
-            reply_markup=build_broadcast_buttons_menu(payment_enabled=enabled),
-        )
+        new_markup = build_broadcast_buttons_menu(payment_enabled=enabled)
+        if (
+            callback.message.reply_markup
+            and callback.message.reply_markup.model_dump() == new_markup.model_dump()
+        ):
+            await callback.answer("Кнопка оплаты уже в этом состоянии.")
+            return
+        await callback.message.edit_reply_markup(reply_markup=new_markup)
     await callback.answer("Кнопка оплаты включена." if enabled else "Кнопка оплаты отключена.")
 
 
