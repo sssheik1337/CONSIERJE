@@ -1898,6 +1898,7 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
             disable_web_page_preview=True,
         )
         await refresh_user_menu(callback.message, db, user_id)
+    await send_auto_invite(callback.bot, db, user_id)
     await callback.answer("Оплата подтверждена.")
 
 
@@ -2136,6 +2137,135 @@ async def handle_invite(callback: CallbackQuery, bot: Bot, db: DB) -> None:
         await callback.answer("Не удалось создать ссылку.", show_alert=True)
 
 
+async def send_auto_invite(bot: Bot, db: DB, user_id: int) -> None:
+    """Автоматически отправить пользователю одноразовую ссылку в канал."""
+
+    if not await db.has_accepted_legal(user_id):
+        return
+
+    user = await db.get_user(user_id)
+
+    async def send_invite_failure(info_text: str, hint_text: str | None) -> None:
+        """Отправить пользователю сообщение о невозможности выдать ссылку."""
+
+        hint_value = hint_text or ""
+        hint_lower = hint_value.lower()
+        hint_is_link = hint_lower.startswith("http://") or hint_lower.startswith("https://")
+        lines: list[str] = []
+        if info_text:
+            lines.append(escape_md(info_text))
+        if hint_text and not hint_is_link:
+            lines.append(escape_md(hint_value))
+        combined_lower = " ".join(lines).lower()
+        expired_line = escape_md("Ссылка устарела, запросите новую")
+        if "устарел" not in combined_lower:
+            lines.append(expired_line)
+        text = "\n".join(lines) if lines else expired_line
+        reply_markup = (
+            invite_button_markup(hint_value, permanent=True) if hint_is_link else main_menu_markup()
+        )
+        await bot.send_message(
+            user_id,
+            text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+
+    now_ts = int(datetime.utcnow().timestamp())
+    subscription_end = await db.get_subscription_end(user_id) or 0
+    trial_end = 0
+    if user and hasattr(user, "keys") and "trial_end" in user.keys():
+        try:
+            trial_end = int(user["trial_end"] or 0)
+        except (TypeError, ValueError):
+            trial_end = 0
+    has_active_subscription = subscription_end > now_ts
+    has_active_trial = trial_end > now_ts
+    if not has_active_subscription and not has_active_trial:
+        return
+
+    chat_id = await db.get_target_chat_id()
+    if chat_id is None:
+        ok, info, hint = await make_one_time_invite(bot, db)
+        await send_invite_failure(info, hint)
+        return
+
+    member: ChatMember | None = None
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+    except TelegramForbiddenError as err:
+        logger.warning("Не удалось проверить участие пользователя %s: %s", user_id, err)
+        ok, info, hint = await make_one_time_invite(bot, db)
+        await send_invite_failure(info, hint)
+        return
+    except TelegramBadRequest as err:
+        logger.warning(
+            "Ошибка Telegram при проверке участия пользователя %s: %s",
+            user_id,
+            err,
+        )
+        ok, info, hint = await make_one_time_invite(bot, db)
+        await send_invite_failure(info, hint)
+        return
+    except Exception as err:  # noqa: BLE001
+        logger.exception("Сбой при проверке участия пользователя %s в канале", user_id, exc_info=err)
+        await bot.send_message(
+            user_id,
+            escape_md(
+                "Не удалось проверить участие в канале. Попробуйте позже или обратитесь к администратору."
+            ),
+            reply_markup=main_menu_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
+    status_raw = getattr(member, "status", "") if member else ""
+    status_value = status_raw.value if hasattr(status_raw, "value") else str(status_raw)
+    if status_value.lower() in {"member", "administrator", "creator", "owner"}:
+        await bot.send_message(
+            user_id,
+            escape_md("Вы уже являетесь участником канала, пригласительная ссылка вам не нужна."),
+            reply_markup=main_menu_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
+    invite_flag = 0
+    if user and hasattr(user, "keys") and "invite_issued" in user.keys():
+        try:
+            invite_flag = int(user["invite_issued"] or 0)
+        except (TypeError, ValueError):
+            invite_flag = 0
+    if invite_flag:
+        await bot.send_message(
+            user_id,
+            escape_md(
+                "Вы уже использовали свою одноразовую ссылку. Если вы вышли из канала, свяжитесь с администратором"
+                " для восстановления доступа."
+            ),
+            reply_markup=main_menu_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+
+    ok, info, hint = await make_one_time_invite(bot, db)
+    if ok:
+        logger.info("Автоматически выдана одноразовая ссылка пользователю %s", user_id)
+        await bot.send_message(
+            user_id,
+            escape_md("Ваша ссылка (действует 24ч, одноразовая)."),
+            reply_markup=invite_button_markup(info),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+    await send_invite_failure(info, hint)
+
+
 @router.chat_member()
 async def handle_chat_member_update(event: ChatMemberUpdated, db: DB) -> None:
     """Отметить использование одноразовой ссылки при вступлении пользователя."""
@@ -2353,7 +2483,7 @@ async def _show_broadcast_preview(message: Message, state: FSMContext) -> None:
     builder.button(text="❌ Отмена", callback_data="admin:broadcast:cancel")
     builder.adjust(1)
     await message.answer(
-        "Предпросмотр сообщения ниже. Отправить рассылку?",
+        "Предпросмотр сообщения выше. Отправить рассылку?",
         reply_markup=builder.as_markup(),
     )
 
@@ -2435,9 +2565,14 @@ async def admin_broadcast_buttons_payment(callback: CallbackQuery, state: FSMCon
     updated_buttons, enabled = _toggle_broadcast_payment_button(buttons)
     await state.update_data(broadcast_buttons=updated_buttons)
     if callback.message:
-        await callback.message.edit_reply_markup(
-            reply_markup=build_broadcast_buttons_menu(payment_enabled=enabled),
-        )
+        new_markup = build_broadcast_buttons_menu(payment_enabled=enabled)
+        if (
+            callback.message.reply_markup
+            and callback.message.reply_markup.model_dump() == new_markup.model_dump()
+        ):
+            await callback.answer("Кнопка оплаты уже в этом состоянии.")
+            return
+        await callback.message.edit_reply_markup(reply_markup=new_markup)
     await callback.answer("Кнопка оплаты включена." if enabled else "Кнопка оплаты отключена.")
 
 
@@ -2692,7 +2827,7 @@ async def _show_broadcast_preview(message: Message, state: FSMContext) -> None:
     builder.button(text="❌ Отмена", callback_data="admin:broadcast:cancel")
     builder.adjust(1)
     await message.answer(
-        "Предпросмотр сообщения ниже. Отправить рассылку?",
+        "Предпросмотр сообщения выше. Отправить рассылку?",
         reply_markup=builder.as_markup(),
     )
 
