@@ -303,18 +303,36 @@ def inline_emoji(flag: bool) -> str:
     return "✅" if flag else "❌"
 
 
-def build_broadcast_buttons_menu() -> ReplyKeyboardMarkup:
-    """Собрать клавиатуру управления кнопками для рассылки."""
+def build_broadcast_buttons_menu(payment_enabled: bool) -> InlineKeyboardMarkup:
+    """Собрать инлайн-клавиатуру управления кнопками для рассылки."""
 
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="➕ Добавить кнопку")],
-            [KeyboardButton(text="➕ Кнопка оплаты")],
-            [KeyboardButton(text="Пропустить")],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Добавить кнопку", callback_data="admin:broadcast:buttons:add")
+    builder.button(
+        text=f"💳 Оплата: {inline_emoji(payment_enabled)}",
+        callback_data="admin:broadcast:buttons:payment",
     )
+    builder.button(text="👀 Предпросмотр", callback_data="admin:broadcast:buttons:preview")
+    builder.button(text="❌ Отмена", callback_data="admin:broadcast:buttons:cancel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _broadcast_payment_enabled(buttons: list[dict[str, str]]) -> bool:
+    """Проверить, включена ли кнопка оплаты в рассылке."""
+
+    return any(entry.get("kind") == "payment" for entry in buttons)
+
+
+def _toggle_broadcast_payment_button(buttons: list[dict[str, str]]) -> tuple[list[dict[str, str]], bool]:
+    """Переключить кнопку оплаты в списке кнопок."""
+
+    enabled = _broadcast_payment_enabled(buttons)
+    filtered = [entry for entry in buttons if entry.get("kind") != "payment"]
+    if enabled:
+        return filtered, False
+    filtered.append({"kind": "payment"})
+    return filtered, True
 
 
 def _normalize_control_text(text: str | None) -> str:
@@ -2287,11 +2305,15 @@ def _build_broadcast_inline_markup(buttons: list[dict[str, str]]) -> InlineKeybo
         return None
     builder = InlineKeyboardBuilder()
     added = False
+    payment_added = False
     for entry in buttons:
         kind = entry.get("kind")
         if kind == "payment":
+            if payment_added:
+                continue
             builder.button(text="💳 Купить подписку", callback_data="buy:open")
             added = True
+            payment_added = True
             continue
         text = entry.get("text", "")
         url = entry.get("url", "")
@@ -2356,8 +2378,8 @@ async def admin_broadcast_message(message: Message, state: FSMContext) -> None:
     )
     await state.set_state(AdminBroadcast.WaitButtonsMenu)
     await message.answer(
-        "Добавьте кнопку для поста или пропустите этот шаг.",
-        reply_markup=build_broadcast_buttons_menu(),
+        "Добавьте кнопку для поста или продолжите к предпросмотру.",
+        reply_markup=build_broadcast_buttons_menu(payment_enabled=False),
     )
 
 
@@ -2372,33 +2394,80 @@ async def admin_broadcast_buttons_menu(message: Message, state: FSMContext) -> N
     choice = (message.text or "").strip()
     if is_cancel(choice):
         await state.clear()
-        await message.answer("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Рассылка отменена.")
         return
-    if choice == "➕ Добавить кнопку":
-        await state.set_state(AdminBroadcast.WaitButtonText)
-        await message.answer(
+    data = await state.get_data()
+    buttons = list(data.get("broadcast_buttons") or [])
+    await message.answer(
+        "Используйте кнопки под сообщением, чтобы управлять постом.",
+        reply_markup=build_broadcast_buttons_menu(
+            payment_enabled=_broadcast_payment_enabled(buttons),
+        ),
+    )
+
+
+@router.callback_query(AdminBroadcast.WaitButtonsMenu, F.data == "admin:broadcast:buttons:add")
+async def admin_broadcast_buttons_add(callback: CallbackQuery, state: FSMContext) -> None:
+    """Перейти к вводу текста кнопки рассылки."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        await state.clear()
+        return
+    await state.set_state(AdminBroadcast.WaitButtonText)
+    if callback.message:
+        await callback.message.answer(
             "Отправьте текст для кнопки. Ссылка будет запрошена следующим сообщением.",
         )
+    await callback.answer()
+
+
+@router.callback_query(AdminBroadcast.WaitButtonsMenu, F.data == "admin:broadcast:buttons:payment")
+async def admin_broadcast_buttons_payment(callback: CallbackQuery, state: FSMContext) -> None:
+    """Включить или выключить кнопку оплаты."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        await state.clear()
         return
-    if choice == "➕ Кнопка оплаты":
-        data = await state.get_data()
-        buttons = list(data.get("broadcast_buttons") or [])
-        buttons.append({"kind": "payment"})
-        await state.update_data(broadcast_buttons=buttons)
-        await message.answer(
-            "Кнопка оплаты добавлена. Добавим ещё кнопку?",
-            reply_markup=build_broadcast_buttons_menu(),
+    data = await state.get_data()
+    buttons = list(data.get("broadcast_buttons") or [])
+    updated_buttons, enabled = _toggle_broadcast_payment_button(buttons)
+    await state.update_data(broadcast_buttons=updated_buttons)
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=build_broadcast_buttons_menu(payment_enabled=enabled),
         )
+    await callback.answer("Кнопка оплаты включена." if enabled else "Кнопка оплаты отключена.")
+
+
+@router.callback_query(AdminBroadcast.WaitButtonsMenu, F.data == "admin:broadcast:buttons:preview")
+async def admin_broadcast_buttons_preview(callback: CallbackQuery, state: FSMContext) -> None:
+    """Показать предпросмотр рассылки."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        await state.clear()
         return
-    if choice == "Пропустить":
-        await state.set_state(AdminBroadcast.WaitConfirm)
-        await message.answer("Готовлю предпросмотр.", reply_markup=ReplyKeyboardRemove())
-        await _show_broadcast_preview(message, state)
+    await state.set_state(AdminBroadcast.WaitConfirm)
+    if callback.message:
+        await callback.message.answer("Готовлю предпросмотр.")
+        await _show_broadcast_preview(callback.message, state)
+    await callback.answer()
+
+
+@router.callback_query(AdminBroadcast.WaitButtonsMenu, F.data == "admin:broadcast:buttons:cancel")
+async def admin_broadcast_buttons_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отменить рассылку до предпросмотра."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        await state.clear()
         return
-    await message.answer(
-        "Выберите действие кнопками ниже.",
-        reply_markup=build_broadcast_buttons_menu(),
-    )
+    await state.clear()
+    if callback.message:
+        await callback.message.answer("Рассылка отменена.")
+    await callback.answer()
 
 
 @router.message(AdminBroadcast.WaitButtonText)
@@ -2452,7 +2521,9 @@ async def admin_broadcast_button_url(message: Message, state: FSMContext) -> Non
     await state.set_state(AdminBroadcast.WaitButtonsMenu)
     await message.answer(
         "Кнопка добавлена. Добавим ещё?",
-        reply_markup=build_broadcast_buttons_menu(),
+        reply_markup=build_broadcast_buttons_menu(
+            payment_enabled=_broadcast_payment_enabled(buttons),
+        ),
     )
 
 
@@ -2573,11 +2644,15 @@ def _build_broadcast_inline_markup(buttons: list[dict[str, str]]) -> InlineKeybo
         return None
     builder = InlineKeyboardBuilder()
     added = False
+    payment_added = False
     for entry in buttons:
         kind = entry.get("kind")
         if kind == "payment":
+            if payment_added:
+                continue
             builder.button(text="💳 Купить подписку", callback_data="buy:open")
             added = True
+            payment_added = True
             continue
         text = entry.get("text", "")
         url = entry.get("url", "")
@@ -2642,8 +2717,8 @@ async def admin_broadcast_message(message: Message, state: FSMContext) -> None:
     )
     await state.set_state(AdminBroadcast.WaitButtonsMenu)
     await message.answer(
-        "Добавьте кнопку для поста или пропустите этот шаг.",
-        reply_markup=build_broadcast_buttons_menu(),
+        "Добавьте кнопку для поста или продолжите к предпросмотру.",
+        reply_markup=build_broadcast_buttons_menu(payment_enabled=False),
     )
 
 
@@ -2658,33 +2733,80 @@ async def admin_broadcast_buttons_menu(message: Message, state: FSMContext) -> N
     choice = (message.text or "").strip()
     if is_cancel(choice):
         await state.clear()
-        await message.answer("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Рассылка отменена.")
         return
-    if choice == "➕ Добавить кнопку":
-        await state.set_state(AdminBroadcast.WaitButtonText)
-        await message.answer(
+    data = await state.get_data()
+    buttons = list(data.get("broadcast_buttons") or [])
+    await message.answer(
+        "Используйте кнопки под сообщением, чтобы управлять постом.",
+        reply_markup=build_broadcast_buttons_menu(
+            payment_enabled=_broadcast_payment_enabled(buttons),
+        ),
+    )
+
+
+@router.callback_query(AdminBroadcast.WaitButtonsMenu, F.data == "admin:broadcast:buttons:add")
+async def admin_broadcast_buttons_add(callback: CallbackQuery, state: FSMContext) -> None:
+    """Перейти к вводу текста кнопки рассылки."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        await state.clear()
+        return
+    await state.set_state(AdminBroadcast.WaitButtonText)
+    if callback.message:
+        await callback.message.answer(
             "Отправьте текст для кнопки. Ссылка будет запрошена следующим сообщением.",
         )
+    await callback.answer()
+
+
+@router.callback_query(AdminBroadcast.WaitButtonsMenu, F.data == "admin:broadcast:buttons:payment")
+async def admin_broadcast_buttons_payment(callback: CallbackQuery, state: FSMContext) -> None:
+    """Включить или выключить кнопку оплаты."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        await state.clear()
         return
-    if choice == "➕ Кнопка оплаты":
-        data = await state.get_data()
-        buttons = list(data.get("broadcast_buttons") or [])
-        buttons.append({"kind": "payment"})
-        await state.update_data(broadcast_buttons=buttons)
-        await message.answer(
-            "Кнопка оплаты добавлена. Добавим ещё кнопку?",
-            reply_markup=build_broadcast_buttons_menu(),
+    data = await state.get_data()
+    buttons = list(data.get("broadcast_buttons") or [])
+    updated_buttons, enabled = _toggle_broadcast_payment_button(buttons)
+    await state.update_data(broadcast_buttons=updated_buttons)
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=build_broadcast_buttons_menu(payment_enabled=enabled),
         )
+    await callback.answer("Кнопка оплаты включена." if enabled else "Кнопка оплаты отключена.")
+
+
+@router.callback_query(AdminBroadcast.WaitButtonsMenu, F.data == "admin:broadcast:buttons:preview")
+async def admin_broadcast_buttons_preview(callback: CallbackQuery, state: FSMContext) -> None:
+    """Показать предпросмотр рассылки."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        await state.clear()
         return
-    if choice == "Пропустить":
-        await state.set_state(AdminBroadcast.WaitConfirm)
-        await message.answer("Готовлю предпросмотр.", reply_markup=ReplyKeyboardRemove())
-        await _show_broadcast_preview(message, state)
+    await state.set_state(AdminBroadcast.WaitConfirm)
+    if callback.message:
+        await callback.message.answer("Готовлю предпросмотр.")
+        await _show_broadcast_preview(callback.message, state)
+    await callback.answer()
+
+
+@router.callback_query(AdminBroadcast.WaitButtonsMenu, F.data == "admin:broadcast:buttons:cancel")
+async def admin_broadcast_buttons_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отменить рассылку до предпросмотра."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        await state.clear()
         return
-    await message.answer(
-        "Выберите действие кнопками ниже.",
-        reply_markup=build_broadcast_buttons_menu(),
-    )
+    await state.clear()
+    if callback.message:
+        await callback.message.answer("Рассылка отменена.")
+    await callback.answer()
 
 
 @router.message(AdminBroadcast.WaitButtonText)
@@ -2738,7 +2860,9 @@ async def admin_broadcast_button_url(message: Message, state: FSMContext) -> Non
     await state.set_state(AdminBroadcast.WaitButtonsMenu)
     await message.answer(
         "Кнопка добавлена. Добавим ещё?",
-        reply_markup=build_broadcast_buttons_menu(),
+        reply_markup=build_broadcast_buttons_menu(
+            payment_enabled=_broadcast_payment_enabled(buttons),
+        ),
     )
 
 
