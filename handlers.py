@@ -1560,7 +1560,7 @@ async def _request_contact_details(
             one_time_keyboard=True,
         )
         await callback.message.answer(
-            "Укажи телефон в формате +7XXXXXXXXXX или email, чтобы получить чек.",
+            "Нажмите «📱 Поделиться телефоном» или отправьте email, чтобы получить чек.",
             reply_markup=contact_keyboard,
         )
     await callback.answer("Ожидаю контакт для чека.")
@@ -3622,7 +3622,7 @@ async def price_add(callback: CallbackQuery, state: FSMContext) -> None:
         )
         await callback.message.answer(
             escape_md("Введите длительность в месяцах (целое, ≥1)."),
-            reply_markup=CANCEL_REPLY,
+            reply_markup=ADMIN_CANCEL_REPLY,
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True,
         )
@@ -3671,7 +3671,7 @@ async def price_add_months(message: Message, state: FSMContext, db: DB, bot: Bot
         escape_md("Введите цену в ₽ (целое, ≥10)."),
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
-        reply_markup=CANCEL_REPLY,
+        reply_markup=ADMIN_CANCEL_REPLY,
     )
 
 
