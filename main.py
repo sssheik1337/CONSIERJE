@@ -22,7 +22,12 @@ import payments
 import t_pay
 from config import config
 from db import DB
-from handlers import get_user_menu, handle_sbp_notification_payload, router
+from handlers import (
+    get_user_menu,
+    handle_sbp_notification_payload,
+    router,
+    send_auto_invite,
+)
 from logger import logger
 from scheduler import setup_scheduler
 
@@ -285,6 +290,7 @@ async def tbank_notify(request: web.Request) -> web.Response:
                     await _notify_user_payment_confirmed(
                         bot, db, user_id, months, sbp_hint=is_sbp_payment
                     )
+                    await send_auto_invite(bot, db, user_id)
                 if user_id > 0:
                     try:
                         await db.set_payment_method(target_payment_id, payment_type)
