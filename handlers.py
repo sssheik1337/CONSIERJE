@@ -196,6 +196,12 @@ class AdminDocs(StatesGroup):
     WaitUrl = State()
 
 
+class AdminWelcome(StatesGroup):
+    """Состояния администратора для настройки приветствия."""
+
+    WaitMessage = State()
+
+
 class AdminBroadcast(StatesGroup):
     """Состояния администратора для рассылки сообщений."""
 
@@ -630,6 +636,16 @@ async def build_docs_message(db: DB) -> tuple[str, str]:
     return text, "Markdown"
 
 
+async def get_welcome_message(db: DB) -> str:
+    """Получить приветствие из настроек или взять значение по умолчанию."""
+
+    stored = await db.get_welcome_message()
+    value = (stored or "").strip()
+    if value:
+        return value
+    return config.WELCOME_MESSAGE_DEFAULT
+
+
 async def build_welcome_with_legal(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     """Подготовить приветствие с обязательным согласием и клавиатурой."""
 
@@ -763,6 +779,16 @@ async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]
     trial_days = await db.get_trial_days_global(DEFAULT_TRIAL_DAYS)
     auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
     prices = await db.get_all_prices()
+    welcome_raw = await db.get_welcome_message()
+    welcome_value = (welcome_raw or "").strip()
+    if welcome_value:
+        welcome_source = "кастомное"
+        welcome_preview = welcome_value
+    else:
+        welcome_source = "по умолчанию"
+        welcome_preview = config.WELCOME_MESSAGE_DEFAULT
+    if len(welcome_preview) > 60:
+        welcome_preview = f"{welcome_preview[:57]}…"
     if prices:
         parts = [f"{months} мес — {price}₽" for months, price in prices]
         price_text = ", ".join(parts)
@@ -774,6 +800,7 @@ async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]
         f"• Пробный период: {trial_days} дн.",
         f"• Автопродление по умолчанию: {inline_emoji(auto_default)}",
         f"• Прайс-лист: {price_text}",
+        f"• Приветствие ({welcome_source}): {welcome_preview}",
     ]
     text = "\n".join(escape_md(line) for line in lines)
 
@@ -787,9 +814,10 @@ async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]
     )
     builder.button(text="🏷️ Создать пробный промокод", callback_data="admin:create_coupon")
     builder.button(text="📄 Ссылки на документы", callback_data="admin:docs")
+    builder.button(text="✏️ Приветствие", callback_data="admin:welcome")
     builder.button(text="🛡️ Проверить права бота", callback_data="admin:check_rights")
     builder.button(text="⬅️ Назад", callback_data="admin:open")
-    builder.adjust(2, 2, 1, 1, 1, 1, 1)
+    builder.adjust(2, 2, 1, 1, 1, 1, 1, 1)
 
     return text, builder.as_markup()
 
@@ -1371,6 +1399,25 @@ async def legal_accept(callback: CallbackQuery, bot: Bot, state: FSMContext, db:
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
+    welcome_text = await get_welcome_message(db)
+    if callback.message:
+        try:
+            await callback.message.answer(
+                welcome_text,
+                disable_web_page_preview=True,
+            )
+        except TelegramBadRequest:
+            await bot.send_message(
+                callback.message.chat.id,
+                welcome_text,
+                disable_web_page_preview=True,
+            )
+    else:
+        await bot.send_message(
+            user_id,
+            welcome_text,
+            disable_web_page_preview=True,
+        )
     menu = await get_user_menu(db, user_id)
     main_text = await compose_main_menu_text(db, user_id)
     if callback.message:
@@ -3251,6 +3298,86 @@ async def admin_docs_save(message: Message, state: FSMContext, db: DB) -> None:
     await db.set_setting(setting_key, value)
     await message.answer(
         escape_md(f"Ссылка для «{title}» обновлена."),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    await state.clear()
+
+
+@router.callback_query(F.data == "admin:welcome")
+async def admin_welcome_menu(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
+    """Показать меню настройки приветствия."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.clear()
+    welcome_raw = await db.get_welcome_message()
+    welcome_value = (welcome_raw or "").strip()
+    if welcome_value:
+        source = "кастомное"
+        welcome_text = welcome_value
+    else:
+        source = "по умолчанию"
+        welcome_text = config.WELCOME_MESSAGE_DEFAULT
+    lines = [
+        "✏️ Приветствие",
+        f"Источник: {source}",
+        "",
+        "Текущий текст:",
+        welcome_text,
+    ]
+    text = escape_md("\n".join(lines))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить", callback_data="admin:welcome:edit")
+    builder.button(text="⬅️ Назад", callback_data="admin:settings")
+    builder.adjust(1)
+    if callback.message:
+        await callback.message.answer(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:welcome:edit")
+async def admin_welcome_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    """Запросить новый текст приветствия."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.set_state(AdminWelcome.WaitMessage)
+    if callback.message:
+        await callback.message.answer(
+            escape_md(
+                "Отправьте новый текст приветствия.\n"
+                "Чтобы вернуть значение по умолчанию, отправьте «-»."
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.message(AdminWelcome.WaitMessage)
+async def admin_welcome_save(message: Message, state: FSMContext, db: DB) -> None:
+    """Сохранить приветственное сообщение."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer("Текст приветствия не должен быть пустым.")
+        return
+    value = "" if raw == "-" else raw
+    await db.set_welcome_message(value)
+    await message.answer(
+        escape_md("Приветствие обновлено."),
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
