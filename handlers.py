@@ -22,6 +22,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
+    MessageEntity,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
@@ -658,14 +659,50 @@ async def build_docs_message(db: DB) -> tuple[str, str]:
     return text, "Markdown"
 
 
-async def get_welcome_message(db: DB) -> str:
+def _deserialize_welcome_payload(raw: str | None) -> tuple[str, list[MessageEntity]]:
+    """Разобрать сохранённое приветствие и вернуть текст с сущностями."""
+
+    value = (raw or "").strip()
+    if not value:
+        return config.WELCOME_MESSAGE_DEFAULT, []
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return value, []
+    if not isinstance(payload, dict):
+        return value, []
+    text = payload.get("text")
+    entities_raw = payload.get("entities") or []
+    if not isinstance(text, str):
+        return value, []
+    entities: list[MessageEntity] = []
+    for item in entities_raw:
+        try:
+            entities.append(MessageEntity.model_validate(item))
+        except Exception:
+            continue
+    if not text.strip():
+        return config.WELCOME_MESSAGE_DEFAULT, []
+    return text, entities
+
+
+def _serialize_welcome_payload(text: str, entities: Sequence[MessageEntity]) -> str:
+    """Сохранить приветствие как JSON, если есть форматирование."""
+
+    if not entities:
+        return text
+    payload = {
+        "text": text,
+        "entities": [entity.model_dump() for entity in entities],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def get_welcome_message(db: DB) -> tuple[str, list[MessageEntity]]:
     """Получить приветствие из настроек или взять значение по умолчанию."""
 
     stored = await db.get_welcome_message()
-    value = (stored or "").strip()
-    if value:
-        return value
-    return config.WELCOME_MESSAGE_DEFAULT
+    return _deserialize_welcome_payload(stored)
 
 
 async def build_welcome_with_legal(db: DB) -> tuple[str, InlineKeyboardMarkup]:
@@ -803,8 +840,9 @@ async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]
     support_line = f"• Техподдержка: {support_link}" if support_link else "• Техподдержка: не указана"
     prices = await db.get_all_prices()
     welcome_raw = await db.get_welcome_message()
-    welcome_value = (welcome_raw or "").strip()
-    if welcome_value:
+    welcome_text, _ = _deserialize_welcome_payload(welcome_raw)
+    welcome_value = welcome_text.strip()
+    if welcome_raw and welcome_value:
         welcome_source = "кастомное"
         welcome_preview = welcome_value
     else:
@@ -1424,25 +1462,48 @@ async def legal_accept(callback: CallbackQuery, bot: Bot, state: FSMContext, db:
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
-    welcome_text = await get_welcome_message(db)
+    welcome_text, welcome_entities = await get_welcome_message(db)
     if callback.message:
         try:
-            await callback.message.answer(
-                welcome_text,
-                disable_web_page_preview=True,
-            )
+            if welcome_entities:
+                await callback.message.answer(
+                    welcome_text,
+                    entities=welcome_entities,
+                    disable_web_page_preview=True,
+                )
+            else:
+                await callback.message.answer(
+                    welcome_text,
+                    disable_web_page_preview=True,
+                )
         except TelegramBadRequest:
+            if welcome_entities:
+                await bot.send_message(
+                    callback.message.chat.id,
+                    welcome_text,
+                    entities=welcome_entities,
+                    disable_web_page_preview=True,
+                )
+            else:
+                await bot.send_message(
+                    callback.message.chat.id,
+                    welcome_text,
+                    disable_web_page_preview=True,
+                )
+    else:
+        if welcome_entities:
             await bot.send_message(
-                callback.message.chat.id,
+                user_id,
+                welcome_text,
+                entities=welcome_entities,
+                disable_web_page_preview=True,
+            )
+        else:
+            await bot.send_message(
+                user_id,
                 welcome_text,
                 disable_web_page_preview=True,
             )
-    else:
-        await bot.send_message(
-            user_id,
-            welcome_text,
-            disable_web_page_preview=True,
-        )
     menu = await get_user_menu(db, user_id)
     main_text = await compose_main_menu_text(db, user_id)
     if callback.message:
@@ -3401,13 +3462,11 @@ async def admin_welcome_menu(callback: CallbackQuery, db: DB, state: FSMContext)
         return
     await state.clear()
     welcome_raw = await db.get_welcome_message()
-    welcome_value = (welcome_raw or "").strip()
-    if welcome_value:
+    welcome_text, _ = _deserialize_welcome_payload(welcome_raw)
+    if welcome_raw and welcome_text.strip():
         source = "кастомное"
-        welcome_text = welcome_value
     else:
         source = "по умолчанию"
-        welcome_text = config.WELCOME_MESSAGE_DEFAULT
     lines = [
         "✏️ Приветствие",
         f"Источник: {source}",
@@ -3463,7 +3522,9 @@ async def admin_welcome_save(message: Message, state: FSMContext, db: DB) -> Non
         await message.answer("Текст приветствия не должен быть пустым.")
         return
     value = "" if raw == "-" else raw
-    await db.set_welcome_message(value)
+    entities = message.entities or []
+    stored = _serialize_welcome_payload(value, entities) if value else ""
+    await db.set_welcome_message(stored)
     await message.answer(
         escape_md("Приветствие обновлено."),
         parse_mode=ParseMode.MARKDOWN_V2,
