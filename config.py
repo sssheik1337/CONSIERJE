@@ -9,6 +9,10 @@ load_dotenv(override=True)
 
 # URL для уведомлений от T-Bank
 TINKOFF_NOTIFY_URL: str = os.getenv("TINKOFF_NOTIFY_URL", "")
+WELCOME_MESSAGE_DEFAULT: str = os.getenv(
+    "WELCOME_MESSAGE_DEFAULT",
+    "👋 Добро пожаловать! Мы рады видеть вас здесь.",
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -68,6 +72,7 @@ class Config:
     BROADCAST_DELAY_SECONDS: float = field(
         default_factory=lambda: _env_float("BROADCAST_DELAY_SECONDS", 0.1)
     )
+    WELCOME_MESSAGE_DEFAULT: str = WELCOME_MESSAGE_DEFAULT
 
     TINKOFF_NOTIFY_URL: str = TINKOFF_NOTIFY_URL
     WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "0.0.0.0")

@@ -121,6 +121,7 @@ CREATE INDEX IF NOT EXISTS idx_sbp_links_request_key ON sbp_links(request_key);
 
 COUPON_CODE_PATTERN = re.compile(r"^[A-Z0-9\-]{4,32}$")
 CUSTOMER_REGISTERED_PREFIX = "customer_registered:"
+WELCOME_MESSAGE_KEY = "welcome_message"
 
 
 class DB:
@@ -703,6 +704,16 @@ class DB:
         if row is None:
             return None
         return row["value"]
+
+    async def set_welcome_message(self, text: str) -> None:
+        """Сохранить приветственное сообщение в настройках."""
+
+        await self.set_setting(WELCOME_MESSAGE_KEY, text)
+
+    async def get_welcome_message(self) -> Optional[str]:
+        """Получить приветственное сообщение из настроек."""
+
+        return await self.get_setting(WELCOME_MESSAGE_KEY)
 
     async def set_customer_registered(self, user_id: int, flag: bool) -> None:
         """Зафиксировать информацию о регистрации клиента в T-Bank."""
