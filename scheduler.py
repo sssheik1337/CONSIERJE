@@ -34,7 +34,7 @@ CARD_RENEW_ATTEMPTS = 3
 
 
 
-FAILURE_MESSAGE = "Не удалось списать, автопродление отключено."
+FAILURE_MESSAGE = "Не удалось списать, автопродление остаётся включённым."
 EXPIRED_MESSAGE = "Срок подписки истёк. Продлите, чтобы восстановить доступ."
 
 
@@ -192,10 +192,9 @@ async def _try_card_autorenew(bot: Bot, db: DB, row) -> bool:
             continue
         last_error = status or "UNKNOWN"
 
-    await db.set_auto_renew(user_id, False)
     await bot.send_message(
         user_id,
-        "⚠️ Не удалось списать оплату по карте. Автопродление отключено.",
+        "⚠️ Не удалось списать оплату по карте. Автопродление остаётся включённым.",
     )
     if last_error:
         await db.log_payment_attempt(
@@ -297,7 +296,6 @@ async def try_auto_renew(
         )
     except (TBankHttpError, TBankApiError) as err:
         logger.warning("Автосписание через СБП отклонено: user=%s | %s", user_id, err)
-        await db.set_auto_renew(user_id, False)
         await db.log_payment_attempt(user_id, "FAILED", str(err), payment_type="sbp")
         notified = await _notify_failure()
         return AutoRenewResult(False, True, 0, notified)
@@ -307,7 +305,6 @@ async def try_auto_renew(
             user_id,
             exc_info=err,
         )
-        await db.set_auto_renew(user_id, False)
         await db.log_payment_attempt(user_id, "ERROR", str(err), payment_type="sbp")
         notified = await _notify_failure()
         return AutoRenewResult(False, True, 0, notified)
@@ -318,7 +315,6 @@ async def try_auto_renew(
     if not success_flag:
         info = json.dumps(charge_response or response, ensure_ascii=False)[:500]
         logger.warning("Автосписание через СБП неуспешно: user=%s | %s", user_id, info)
-        await db.set_auto_renew(user_id, False)
         await db.log_payment_attempt(user_id, "FAILED", info, payment_type="sbp")
         notified = await _notify_failure()
         return AutoRenewResult(False, True, 0, notified)
@@ -453,9 +449,6 @@ async def daily_check(bot: Bot, db: DB):
 
                 row_dict = dict(row)
                 auto_flag = bool(row_dict.get("auto_renew"))
-                if auto_flag:
-                    await db.set_auto_renew(user_id, False)
-
                 card_renewed = False
                 card_attempted = False
                 if auto_flag and row_dict.get("rebill_id"):

@@ -188,34 +188,6 @@ def detect_payment_type(payload: Mapping[str, Any] | None) -> str:
     return "card"
 
 
-async def disable_auto_renew_for_sbp(
-    db: DB, user_id: int, note: str | None = None
-) -> None:
-    """Отключить автопродление после оплаты через СБП и записать лог."""
-
-    if user_id <= 0:
-        return
-    message = note or "Оплата через СБП подтверждена, автопродление отключено."
-    had_auto = False
-    try:
-        user_row = await db.get_user(user_id)
-    except Exception:  # noqa: BLE001
-        user_row = None
-    if user_row is not None and hasattr(user_row, "keys"):
-        try:
-            had_auto = bool(user_row["auto_renew"])
-        except (KeyError, TypeError, ValueError):
-            had_auto = False
-    await db.set_auto_renew(user_id, False)
-    if had_auto:
-        await db.log_payment_attempt(
-            user_id,
-            "SBP_CONFIRMED",
-            message,
-            payment_type="sbp",
-        )
-
-
 async def init_sbp_payment(
     user_id: int,
     months: int,
@@ -509,18 +481,13 @@ async def apply_successful_payment(payment_id: str, db: DB) -> bool:
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
     try:
-        account_token = await db.get_account_token(user_id)
-    except Exception:  # noqa: BLE001
-        account_token = None
-    if account_token:
-        try:
-            await db.set_auto_renew(user_id, True)
-        except Exception as err:  # noqa: BLE001
-            logger.debug(
-                "Не удалось автоматически включить автопродление для пользователя %s: %s",
-                user_id,
-                err,
-            )
+        await db.set_auto_renew(user_id, True)
+    except Exception as err:  # noqa: BLE001
+        logger.debug(
+            "Не удалось автоматически включить автопродление для пользователя %s: %s",
+            user_id,
+            err,
+        )
     return True
 
 
@@ -573,12 +540,7 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
                 err,
             )
         if user_id > 0:
-            try:
-                account_token = await db_instance.get_account_token(user_id)
-            except Exception:  # noqa: BLE001
-                account_token = None
-            if account_token:
-                await db_instance.set_auto_renew(user_id, True)
+            await db_instance.set_auto_renew(user_id, True)
     return status == "CONFIRMED"
 
 
@@ -587,7 +549,6 @@ __all__ = [
     "check_payment_status",
     "charge_sbp_autopayment",
     "detect_payment_type",
-    "disable_auto_renew_for_sbp",
     "form_sbp_qr",
     "get_sbp_link_status",
     "init_sbp_payment",

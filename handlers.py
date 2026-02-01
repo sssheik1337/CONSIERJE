@@ -122,17 +122,17 @@ def _build_consent_text(months: int, price: int, method: str) -> str:
         details = [
             "",
             "Оплата проходит через СБП.",
-            "Автопродление работает при привязанном счёте и включённом тумблере в личном меню бота.",
+            "Автопродление включается автоматически и не отключается.",
             "",
             "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
         ]
     else:
         details = [
             "",
-            "При оплате картой автопродление будет доступно после подтверждения оплаты и получения RebillId.",
-            "Вы сможете управлять автопродлением в личном меню бота (кнопка «Автопродление»).",
+            "При оплате картой автопродление включается автоматически после подтверждения платежа.",
+            "Автопродление работает постоянно и не отключается.",
             "",
-            "Списания будут происходить автоматически, если автопродление активно.",
+            "Списания будут происходить автоматически после каждой оплаты.",
             "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
         ]
     return "\n".join(base + details)
@@ -647,17 +647,11 @@ async def build_welcome_with_legal(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     return text, builder.as_markup()
 
 
-def build_user_menu_keyboard(
-    auto_on: bool, is_admin: bool, price_months: list[int]
-) -> InlineKeyboardMarkup:
+def build_user_menu_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
     """Собрать пользовательскую inline-клавиатуру."""
 
     builder = InlineKeyboardBuilder()
     builder.button(text="💳 Купить подписку", callback_data="buy:open")
-    builder.button(
-        text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
-        callback_data="ar:toggle",
-    )
     builder.button(text="🔗 Получить ссылку", callback_data="invite:once")
     builder.button(text="🏷️ Ввести промокод", callback_data="promo:enter")
     builder.button(text="📄 Документы", callback_data="docs:open")
@@ -686,9 +680,7 @@ async def get_user_menu(
     """Получить клавиатуру пользователя с актуальными данными."""
 
     user = cached_user or await db.get_user(user_id)
-    auto_flag = bool(user and user["auto_renew"])
-    price_months = [months for months, _ in await db.get_all_prices()]
-    return build_user_menu_keyboard(auto_flag, is_super_admin(user_id), price_months)
+    return build_user_menu_keyboard(is_super_admin(user_id))
 
 
 async def compose_main_menu_text(
@@ -761,7 +753,6 @@ async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]
         else:
             chat_line = f"• Чат: id {chat_id}"
     trial_days = await db.get_trial_days_global(DEFAULT_TRIAL_DAYS)
-    auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
     prices = await db.get_all_prices()
     if prices:
         parts = [f"{months} мес — {price}₽" for months, price in prices]
@@ -772,7 +763,6 @@ async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]
         "⚙️ Настройки бота:",
         chat_line,
         f"• Пробный период: {trial_days} дн.",
-        f"• Автопродление по умолчанию: {inline_emoji(auto_default)}",
         f"• Прайс-лист: {price_text}",
     ]
     text = "\n".join(escape_md(line) for line in lines)
@@ -781,15 +771,11 @@ async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]
     builder.button(text="🔗 Привязать чат", callback_data="admin:bind_chat")
     builder.button(text="💰 Тарифы и цены", callback_data="admin:prices")
     builder.button(text="🗓️ Пробный период", callback_data="admin:trial_days")
-    builder.button(
-        text=f"🔁 Автопродление по умолчанию: {inline_emoji(auto_default)}",
-        callback_data="admin:auto_default",
-    )
     builder.button(text="🏷️ Создать пробный промокод", callback_data="admin:create_coupon")
     builder.button(text="📄 Ссылки на документы", callback_data="admin:docs")
     builder.button(text="🛡️ Проверить права бота", callback_data="admin:check_rights")
     builder.button(text="⬅️ Назад", callback_data="admin:open")
-    builder.adjust(2, 2, 1, 1, 1, 1, 1)
+    builder.adjust(2, 2, 1, 1, 1)
 
     return text, builder.as_markup()
 
@@ -1058,8 +1044,7 @@ async def apply_trial_coupon(db: DB, user_id: int) -> tuple[bool, str]:
             trial_end_existing = 0
 
     if user is None:
-        auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
-        await db.upsert_user(user_id, now_ts, trial_days, auto_default, False)
+        await db.upsert_user(user_id, now_ts, trial_days, True, False)
         end_ts = now_ts + trial_seconds
         async with aiosqlite.connect(db.path) as conn:
             await conn.execute(
@@ -1160,14 +1145,13 @@ async def cmd_start(message: Message, state: FSMContext, db: DB) -> None:
         await show_admin_panel(message, db)
         return
     now_ts = int(datetime.utcnow().timestamp())
-    auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
     trial_days = await db.get_trial_days_global(DEFAULT_TRIAL_DAYS)
     existing_user = await db.get_user(user_id)
     paid_only = True
     if await has_trial_coupon(db, user_id):
         paid_only = False
     if existing_user is None:
-        await db.upsert_user(user_id, now_ts, trial_days, auto_default, paid_only)
+        await db.upsert_user(user_id, now_ts, trial_days, True, paid_only)
         user = await db.get_user(user_id)
     else:
         user = existing_user
@@ -1870,15 +1854,14 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
     await db.set_payment_status(payment_id, "CONFIRMED")
-    if not is_sbp_payment:
-        try:
-            await db.set_auto_renew(user_id, True)
-        except Exception as err:  # noqa: BLE001
-            logger.debug(
-                "Не удалось включить автопродление после подтверждения платежа %s: %s",
-                payment_id,
-                err,
-            )
+    try:
+        await db.set_auto_renew(user_id, True)
+    except Exception as err:  # noqa: BLE001
+        logger.debug(
+            "Не удалось включить автопродление после подтверждения платежа %s: %s",
+            payment_id,
+            err,
+        )
 
     subscription_end = await db.get_subscription_end(user_id) or 0
     formatted_expiry = format_expiry(subscription_end) if subscription_end else None
@@ -1954,24 +1937,6 @@ async def handle_retry_payment(callback: CallbackQuery, db: DB) -> None:
         return
 
     await callback.answer("Не удалось выполнить списание. Попробуйте позже.", show_alert=True)
-
-
-@router.callback_query(F.data == "ar:toggle")
-async def handle_toggle_autorenew(callback: CallbackQuery, db: DB) -> None:
-    """Переключить автопродление пользователя."""
-
-    user_id = callback.from_user.id
-    user = await db.get_user(user_id)
-    if user is None:
-        await callback.answer("Сначала выполните /start.", show_alert=True)
-        return
-    current = bool(user["auto_renew"])
-    new_flag = not current
-    await db.set_auto_renew(user_id, new_flag)
-    if callback.message:
-        await refresh_user_menu(callback.message, db, user_id)
-    message = "Автопродление включено." if new_flag else "Автопродление отключено."
-    await callback.answer(message)
 
 
 @router.callback_query(F.data == "invite:once")
@@ -4072,20 +4037,6 @@ async def admin_set_trial_days(message: Message, state: FSMContext, db: DB, bot:
     )
     await refresh_admin_settings_by_state(bot, state, db)
     await state.clear()
-
-
-@router.callback_query(F.data == "admin:auto_default")
-async def admin_toggle_auto_default(callback: CallbackQuery, db: DB) -> None:
-    """Переключить автопродление по умолчанию."""
-
-    if not is_super_admin(callback.from_user.id):
-        await callback.answer("Недостаточно прав.", show_alert=True)
-        return
-    current = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
-    await db.set_auto_renew_default(not current)
-    if callback.message:
-        await render_admin_settings_panel(callback.message, db)
-    await callback.answer("Настройки обновлены.")
 
 
 @router.callback_query(F.data == "admin:create_coupon")
