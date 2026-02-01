@@ -680,7 +680,6 @@ async def build_welcome_with_legal(db: DB) -> tuple[str, InlineKeyboardMarkup]:
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Продолжить", callback_data="legal:accept")
-    builder.button(text="📄 Открыть документы", callback_data="legal:docs")
     builder.adjust(1)
     return text, builder.as_markup()
 
