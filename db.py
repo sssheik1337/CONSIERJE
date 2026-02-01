@@ -770,6 +770,16 @@ class DB:
         except ValueError:
             return None
 
+    async def set_support_link(self, link: str) -> None:
+        """Сохранить ссылку на техподдержку."""
+
+        await self.set_setting("support_link", link)
+
+    async def get_support_link(self) -> Optional[str]:
+        """Получить ссылку на техподдержку."""
+
+        return await self.get_setting("support_link")
+
     async def get_all_prices(self) -> List[Tuple[int, int]]:
         """Получить все тарифы, выполняя мягкую миграцию из настроек при необходимости."""
 

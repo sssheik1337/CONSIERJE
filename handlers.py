@@ -99,6 +99,21 @@ def _format_method_hint(method: str) -> str:
     return "через СБП"
 
 
+def _normalize_support_link(raw: str) -> tuple[str | None, str | None]:
+    """Проверить и нормализовать ссылку на техподдержку."""
+
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        return None, "Ссылка не указана."
+    at_match = re.fullmatch(r"@([A-Za-z0-9_]{5,32})", cleaned)
+    if at_match:
+        return f"https://t.me/{at_match.group(1)}", None
+    link_match = re.fullmatch(r"(?:https?://)?t\\.me/([A-Za-z0-9_]{5,32})", cleaned)
+    if link_match:
+        return f"https://t.me/{link_match.group(1)}", None
+    return None, "Ссылка должна быть вида t.me/username или @username."
+
+
 def _validate_contact_value(value: str) -> tuple[str | None, str | None]:
     """Проверить контакт пользователя и определить тип (телефон или email)."""
 
@@ -122,15 +137,16 @@ def _build_consent_text(months: int, price: int, method: str) -> str:
         details = [
             "",
             "Оплата проходит через СБП.",
-            "Автопродление работает при привязанном счёте и включённом тумблере в личном меню бота.",
+            "Автопродление включается автоматически после первой успешной оплаты.",
+            "Отключить автопродление нельзя.",
             "",
             "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
         ]
     else:
         details = [
             "",
-            "При оплате картой автопродление будет доступно после подтверждения оплаты и получения RebillId.",
-            "Вы сможете управлять автопродлением в личном меню бота (кнопка «Автопродление»).",
+            "При оплате картой автопродление включается автоматически после подтверждения оплаты.",
+            "Отключить автопродление нельзя.",
             "",
             "Списания будут происходить автоматически, если автопродление активно.",
             "Нажимая кнопку «Я согласен», пользователь подтверждает согласие с условиями подписки.",
@@ -200,6 +216,12 @@ class AdminWelcome(StatesGroup):
     """Состояния администратора для настройки приветствия."""
 
     WaitMessage = State()
+
+
+class AdminSupport(StatesGroup):
+    """Состояния администратора для настройки техподдержки."""
+
+    WaitLink = State()
 
 
 class AdminBroadcast(StatesGroup):
@@ -664,19 +686,19 @@ async def build_welcome_with_legal(db: DB) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def build_user_menu_keyboard(
-    auto_on: bool, is_admin: bool, price_months: list[int]
+    is_admin: bool,
+    price_months: list[int],
+    support_link: str | None,
 ) -> InlineKeyboardMarkup:
     """Собрать пользовательскую inline-клавиатуру."""
 
     builder = InlineKeyboardBuilder()
     builder.button(text="💳 Купить подписку", callback_data="buy:open")
-    builder.button(
-        text=f"🔁 Автопродление: {inline_emoji(auto_on)}",
-        callback_data="ar:toggle",
-    )
     builder.button(text="🔗 Получить ссылку", callback_data="invite:once")
     builder.button(text="🏷️ Ввести промокод", callback_data="promo:enter")
     builder.button(text="📄 Документы", callback_data="docs:open")
+    if support_link:
+        builder.button(text="🆘 Техподдержка", url=support_link)
     if is_admin:
         builder.button(text="🛠️ Админ-панель", callback_data="admin:open")
     builder.adjust(1)
@@ -702,9 +724,9 @@ async def get_user_menu(
     """Получить клавиатуру пользователя с актуальными данными."""
 
     user = cached_user or await db.get_user(user_id)
-    auto_flag = bool(user and user["auto_renew"])
     price_months = [months for months, _ in await db.get_all_prices()]
-    return build_user_menu_keyboard(auto_flag, is_super_admin(user_id), price_months)
+    support_link = await db.get_support_link()
+    return build_user_menu_keyboard(is_super_admin(user_id), price_months, support_link)
 
 
 async def compose_main_menu_text(
@@ -778,6 +800,8 @@ async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]
             chat_line = f"• Чат: id {chat_id}"
     trial_days = await db.get_trial_days_global(DEFAULT_TRIAL_DAYS)
     auto_default = await db.get_auto_renew_default(DEFAULT_AUTO_RENEW)
+    support_link = (await db.get_support_link() or "").strip()
+    support_line = f"• Техподдержка: {support_link}" if support_link else "• Техподдержка: не указана"
     prices = await db.get_all_prices()
     welcome_raw = await db.get_welcome_message()
     welcome_value = (welcome_raw or "").strip()
@@ -801,6 +825,7 @@ async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]
         f"• Автопродление по умолчанию: {inline_emoji(auto_default)}",
         f"• Прайс-лист: {price_text}",
         f"• Приветствие ({welcome_source}): {welcome_preview}",
+        support_line,
     ]
     text = "\n".join(escape_md(line) for line in lines)
 
@@ -812,12 +837,13 @@ async def build_admin_settings_panel(db: DB) -> tuple[str, InlineKeyboardMarkup]
         text=f"🔁 Автопродление по умолчанию: {inline_emoji(auto_default)}",
         callback_data="admin:auto_default",
     )
+    builder.button(text="🆘 Техподдержка", callback_data="admin:support")
     builder.button(text="🏷️ Создать пробный промокод", callback_data="admin:create_coupon")
     builder.button(text="📄 Ссылки на документы", callback_data="admin:docs")
     builder.button(text="✏️ Приветствие", callback_data="admin:welcome")
     builder.button(text="🛡️ Проверить права бота", callback_data="admin:check_rights")
     builder.button(text="⬅️ Назад", callback_data="admin:open")
-    builder.adjust(2, 2, 1, 1, 1, 1, 1, 1)
+    builder.adjust(2, 2, 1, 1, 1, 1, 1, 1, 1)
 
     return text, builder.as_markup()
 
@@ -1564,10 +1590,12 @@ async def _send_payment_consent(
     months: int,
     price: int,
     user_row: aiosqlite.Row | None,
+    db: DB,
 ) -> None:
     """Показать пользователю текст согласия перед созданием платежа."""
 
     consent_text = _build_consent_text(months, price, method)
+    docs_text, _ = await build_docs_message(db)
     builder = InlineKeyboardBuilder()
     builder.button(text="✔ Я согласен", callback_data=f"buy:confirm:{method}:{months}")
     builder.button(text="❌ Отмена", callback_data="buy:cancel")
@@ -1575,8 +1603,9 @@ async def _send_payment_consent(
     if callback.message:
         hint = _format_method_hint(method)
         await callback.message.answer(
-            f"{consent_text}\n\nСпособ оплаты: {hint}.",
+            f"{consent_text}\n\n{docs_text}\n\nСпособ оплаты: {hint}.",
             reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
     await callback.answer()
@@ -1644,7 +1673,7 @@ async def _handle_buy_callback(callback: CallbackQuery, db: DB, state: FSMContex
         return
     user_row = await db.get_user(user_id)
     if not confirmed:
-        await _send_payment_consent(callback, method, months, price, user_row)
+        await _send_payment_consent(callback, method, months, price, user_row, db)
         return
     await _request_contact_details(callback, state, method, months, price)
     return
@@ -1897,12 +1926,6 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
         return
 
     try:
-        payment_method = str(payment["method"] or "")
-    except (KeyError, TypeError, ValueError):
-        payment_method = ""
-    is_sbp_payment = payment_method.strip().lower() == "sbp"
-
-    try:
         confirmed = await check_payment_status(payment_id)
     except RuntimeError as err:
         await callback.answer(str(err), show_alert=True)
@@ -1917,15 +1940,14 @@ async def handle_payment_check(callback: CallbackQuery, db: DB) -> None:
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
     await db.set_payment_status(payment_id, "CONFIRMED")
-    if not is_sbp_payment:
-        try:
-            await db.set_auto_renew(user_id, True)
-        except Exception as err:  # noqa: BLE001
-            logger.debug(
-                "Не удалось включить автопродление после подтверждения платежа %s: %s",
-                payment_id,
-                err,
-            )
+    try:
+        await db.set_auto_renew(user_id, True)
+    except Exception as err:  # noqa: BLE001
+        logger.debug(
+            "Не удалось включить автопродление после подтверждения платежа %s: %s",
+            payment_id,
+            err,
+        )
 
     subscription_end = await db.get_subscription_end(user_id) or 0
     formatted_expiry = format_expiry(subscription_end) if subscription_end else None
@@ -2001,24 +2023,6 @@ async def handle_retry_payment(callback: CallbackQuery, db: DB) -> None:
         return
 
     await callback.answer("Не удалось выполнить списание. Попробуйте позже.", show_alert=True)
-
-
-@router.callback_query(F.data == "ar:toggle")
-async def handle_toggle_autorenew(callback: CallbackQuery, db: DB) -> None:
-    """Переключить автопродление пользователя."""
-
-    user_id = callback.from_user.id
-    user = await db.get_user(user_id)
-    if user is None:
-        await callback.answer("Сначала выполните /start.", show_alert=True)
-        return
-    current = bool(user["auto_renew"])
-    new_flag = not current
-    await db.set_auto_renew(user_id, new_flag)
-    if callback.message:
-        await refresh_user_menu(callback.message, db, user_id)
-    message = "Автопродление включено." if new_flag else "Автопродление отключено."
-    await callback.answer(message)
 
 
 @router.callback_query(F.data == "invite:once")
@@ -3298,6 +3302,91 @@ async def admin_docs_save(message: Message, state: FSMContext, db: DB) -> None:
     await db.set_setting(setting_key, value)
     await message.answer(
         escape_md(f"Ссылка для «{title}» обновлена."),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
+    await state.clear()
+
+
+@router.callback_query(F.data == "admin:support")
+async def admin_support_menu(callback: CallbackQuery, db: DB, state: FSMContext) -> None:
+    """Показать меню настройки техподдержки."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.clear()
+    support_link = (await db.get_support_link() or "").strip()
+    lines = [
+        "🆘 Техподдержка",
+        "",
+        "Текущая ссылка:",
+        support_link or "не указана",
+    ]
+    text = escape_md("\n".join(lines))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить", callback_data="admin:support:edit")
+    builder.button(text="⬅️ Назад", callback_data="admin:settings")
+    builder.adjust(1)
+    if callback.message:
+        await callback.message.answer(
+            text,
+            reply_markup=builder.as_markup(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:support:edit")
+async def admin_support_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    """Запросить новую ссылку техподдержки."""
+
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.set_state(AdminSupport.WaitLink)
+    if callback.message:
+        await callback.message.answer(
+            escape_md(
+                "Отправьте ссылку на техподдержку в формате t.me/username или @username.\n"
+                "Чтобы очистить, отправьте «-»."
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+    await callback.answer()
+
+
+@router.message(AdminSupport.WaitLink)
+async def admin_support_save(message: Message, state: FSMContext, db: DB) -> None:
+    """Сохранить ссылку на техподдержку."""
+
+    if not is_super_admin(message.from_user.id):
+        await message.answer("Недостаточно прав.")
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if raw == "-":
+        await db.set_support_link("")
+        await message.answer(
+            escape_md("Ссылка на техподдержку очищена."),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        await state.clear()
+        return
+    normalized, error = _normalize_support_link(raw)
+    if error:
+        await message.answer(
+            escape_md(error),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True,
+        )
+        return
+    await db.set_support_link(normalized or "")
+    await message.answer(
+        escape_md("Ссылка на техподдержку обновлена."),
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True,
     )
