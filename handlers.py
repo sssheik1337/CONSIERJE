@@ -108,7 +108,7 @@ def _normalize_support_link(raw: str) -> tuple[str | None, str | None]:
     at_match = re.fullmatch(r"@([A-Za-z0-9_]{5,32})", cleaned)
     if at_match:
         return f"https://t.me/{at_match.group(1)}", None
-    link_match = re.fullmatch(r"(?:https?://)?t\\.me/([A-Za-z0-9_]{5,32})", cleaned)
+    link_match = re.fullmatch(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,32})", cleaned)
     if link_match:
         return f"https://t.me/{link_match.group(1)}", None
     return None, "Ссылка должна быть вида t.me/username или @username."
