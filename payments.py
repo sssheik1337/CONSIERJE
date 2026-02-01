@@ -492,10 +492,6 @@ async def apply_successful_payment(payment_id: str, db: DB) -> bool:
 
     user_id = int(payment["user_id"] or 0)
     months = int(payment["months"] or 0)
-    try:
-        method = str(payment["method"] or "")
-    except Exception:  # noqa: BLE001
-        method = ""
     if user_id <= 0 or months <= 0:
         logger.warning(
             "Пропущено применение платежа %s: неверные данные user_id=%s, months=%s",
@@ -509,18 +505,13 @@ async def apply_successful_payment(payment_id: str, db: DB) -> bool:
     await db.extend_subscription(user_id, months)
     await db.set_paid_only(user_id, False)
     try:
-        account_token = await db.get_account_token(user_id)
-    except Exception:  # noqa: BLE001
-        account_token = None
-    if account_token:
-        try:
-            await db.set_auto_renew(user_id, True)
-        except Exception as err:  # noqa: BLE001
-            logger.debug(
-                "Не удалось автоматически включить автопродление для пользователя %s: %s",
-                user_id,
-                err,
-            )
+        await db.set_auto_renew(user_id, True)
+    except Exception as err:  # noqa: BLE001
+        logger.debug(
+            "Не удалось автоматически включить автопродление для пользователя %s: %s",
+            user_id,
+            err,
+        )
     return True
 
 
@@ -551,13 +542,8 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
         await db_instance.set_payment_status(payment_id, status)
     if status == "CONFIRMED":
         payment_row = await db_instance.get_payment_by_payment_id(payment_id)
-        stored_method = ""
         user_id = 0
         if payment_row is not None:
-            try:
-                stored_method = str(payment_row["method"] or "").strip().lower()
-            except (KeyError, TypeError, ValueError):
-                stored_method = ""
             try:
                 user_id = int(payment_row["user_id"] or 0)
             except (KeyError, TypeError, ValueError):
@@ -573,12 +559,7 @@ async def check_payment_status(payment_id: str, db: Optional[DB] = None) -> bool
                 err,
             )
         if user_id > 0:
-            try:
-                account_token = await db_instance.get_account_token(user_id)
-            except Exception:  # noqa: BLE001
-                account_token = None
-            if account_token:
-                await db_instance.set_auto_renew(user_id, True)
+            await db_instance.set_auto_renew(user_id, True)
     return status == "CONFIRMED"
 
 
